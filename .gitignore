@@ -1,0 +1,7 @@
+/target
+.mach/
+.vscode/
+.cursorrules
+.DS_Store
+*.prof
+.claude/
