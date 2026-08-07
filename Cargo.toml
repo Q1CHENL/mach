@@ -1,6 +1,6 @@
 [package]
 name = "mach-tui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A powerful yet easy-to-use todo TUI"
@@ -26,6 +26,8 @@ chrono = "0.4.45"
 clap = { version = "4.6.5", features = ["derive"] }
 dirs = "6.0.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# image → zune-jpeg: empty warn! stubs break release builds unless `log` is on.
+zune-jpeg = { version = "0.5.15", features = ["log"] }
 ratatui = "0.30.0"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 regex = "1.13.1"
