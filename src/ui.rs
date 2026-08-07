@@ -1,0 +1,1991 @@
+//! All drawing: a Categories panel on the left, a Tasks panel on the
+//! right, and a status line along the bottom. Each panel is a rounded
+//! block whose border lights up when it holds focus.
+
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Text;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{
+    Block, BorderType, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Table,
+};
+use ratatui_image::{Resize, StatefulImage};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::app::{App, Focus, MessageKind, Mode, SETTINGS_ITEMS};
+use crate::banner;
+use crate::due;
+use crate::form::Field;
+use crate::theme::{self, Theme};
+
+/// Outer width of the sidebar, borders and padding included.
+pub const SIDEBAR_WIDTH: u16 = 26;
+/// `[ ]` / `[✓]` in the task list and body subtasks.
+pub const DONE_MARK_WIDTH: u16 = 3;
+/// Right column shorter than this → no bottom preview (list only).
+const PREVIEW_SPLIT_MIN: u16 = 16;
+/// Minimum height of the list half when the preview is below.
+const LIST_MIN: u16 = 6;
+/// Minimum height of the preview / docked editor half (bottom layout).
+const PREVIEW_MIN: u16 = 8;
+/// Minimum list width when the preview sits to the right.
+const LIST_WIDTH_MIN: u16 = 24;
+/// Minimum preview width when docked on the right.
+const PREVIEW_WIDTH_MIN: u16 = 28;
+/// Whole right column narrower than this → no side preview.
+const PREVIEW_SIDE_MIN: u16 = LIST_WIDTH_MIN + PREVIEW_WIDTH_MIN + 1;
+
+pub fn draw(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    if area.width < 30 || area.height < 8 {
+        let p = Paragraph::new("terminal too small").centered();
+        f.render_widget(p, area);
+        return;
+    }
+
+    let theme = app.theme();
+    let [content, status] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(area);
+    // The panels sit against each other: two borders is already a
+    // divider, a gap on top of that is just slack.
+    // A column of air between the panels keeps each one's focus colour
+    // unambiguous.
+    let [sidebar, right] =
+        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(20)])
+            .spacing(1)
+            .areas(content);
+
+    draw_sidebar(f, app, &theme, sidebar);
+    if let Some((list, preview_rect)) =
+        split_tasks_and_preview(right, &app.settings.preview_position)
+    {
+        app.areas.preview = preview_rect;
+        draw_tasks(f, app, &theme, list);
+        match app.mode {
+            Mode::TaskForm => draw_task_form(f, app, &theme, preview_rect, true),
+            _ => draw_task_preview(f, app, &theme, preview_rect),
+        }
+    } else {
+        app.areas.preview = Rect::ZERO;
+        draw_tasks(f, app, &theme, right);
+        if app.mode == Mode::TaskForm {
+            // Short window: fall back to the centered modal editor.
+            draw_task_form(f, app, &theme, area, false);
+        }
+    }
+    draw_status(f, app, &theme, status);
+    // Palette floats above the status bar.
+    if app.mode == Mode::Slash {
+        draw_slash_palette(f, app, &theme, status);
+    }
+
+    match app.mode {
+        Mode::Help => draw_help(f, &theme, area),
+        Mode::Settings => draw_settings(f, app, &theme, area),
+        Mode::Welcome => draw_welcome(f, &theme, area),
+        Mode::CategoryForm => draw_category_form(f, app, &theme, area),
+        Mode::TaskForm => {
+            // Already drawn in the preview pane (or as a modal above).
+        }
+        _ => {}
+    }
+}
+
+/// Split the right column into task list + preview when there is room.
+/// `position` is `"bottom"` (default) or `"right"`. Falls back to bottom
+/// when a side-by-side split will not fit, then to no preview.
+fn split_tasks_and_preview(right: Rect, position: &str) -> Option<(Rect, Rect)> {
+    if position == "right"
+        && let Some(pair) = split_preview_right(right)
+    {
+        return Some(pair);
+    }
+    split_preview_bottom(right)
+}
+
+fn split_preview_bottom(right: Rect) -> Option<(Rect, Rect)> {
+    if right.height < PREVIEW_SPLIT_MIN {
+        return None;
+    }
+    let [list, preview] = Layout::vertical([
+        Constraint::Min(LIST_MIN),
+        Constraint::Length((right.height / 2).max(PREVIEW_MIN)),
+    ])
+    .spacing(0)
+    .areas(right);
+    if list.height < LIST_MIN || preview.height < PREVIEW_MIN {
+        return None;
+    }
+    Some((list, preview))
+}
+
+fn split_preview_right(right: Rect) -> Option<(Rect, Rect)> {
+    if right.width < PREVIEW_SIDE_MIN || right.height < PREVIEW_MIN {
+        return None;
+    }
+    let preview_w = (right.width / 2).max(PREVIEW_WIDTH_MIN);
+    let [list, preview] = Layout::horizontal([
+        Constraint::Min(LIST_WIDTH_MIN),
+        Constraint::Length(preview_w),
+    ])
+    .spacing(1)
+    .areas(right);
+    if list.width < LIST_WIDTH_MIN || preview.width < PREVIEW_WIDTH_MIN {
+        return None;
+    }
+    Some((list, preview))
+}
+
+// --------------------------------------------------------- task dialog
+
+/// Title and due date on one row, then the body: a free stack of prose,
+/// to-dos and pictures with a `/` menu for making new ones.
+///
+/// `docked` fills `area` (the permanent preview pane). Otherwise the
+/// form is a centered modal for short terminals.
+fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docked: bool) {
+    // Disjoint borrows: the form owns the fields, the store owns the
+    // decoded images.
+    let App {
+        form,
+        images: store,
+        ..
+    } = app;
+    let Some(form) = form.as_mut() else { return };
+
+    // Borders (2), top boxes (3), hint (1).
+    const CHROME: u16 = 6;
+    let rect = if docked {
+        area
+    } else {
+        let width = 92.min(area.width.saturating_sub(4));
+        let body_height = area.height.saturating_sub(CHROME).clamp(3, 22);
+        centered(area, width, (CHROME + body_height).min(area.height))
+    };
+    let h_pad = if docked { 1 } else { 2 };
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text())
+        .title(Span::styled(
+            format!(" {} ", form.title_text()),
+            theme.accent_text().bold(),
+        ))
+        .padding(Padding::new(h_pad, h_pad, 0, 0));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+
+    let [top_box, body_box, hint] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    // Title takes the rest; Due fits a formatted date+time; Flags fits ⚑⚑⚑.
+    let [title_box, due_box, importance_box] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(20),
+        Constraint::Length(9),
+    ])
+    .spacing(1)
+    .areas(top_box);
+
+    // --- title ----------------------------------------------------------
+    let focused = form.field == Field::Title;
+    let box_inner = render_field_box(f, field_block("Title", focused, None, theme), title_box);
+    form.areas.title = box_inner;
+    let view = form.title.visible(box_inner.width as usize);
+    if view.text.is_empty() {
+        render_or_placeholder(f, box_inner, "", "what needs doing?");
+    } else {
+        f.render_widget(
+            Paragraph::new(line_with_selection(
+                &view.text,
+                view.sel_cols,
+                Style::new(),
+                theme,
+            )),
+            box_inner,
+        );
+    }
+    if focused {
+        f.set_cursor_position((box_inner.x + view.cursor_col, box_inner.y));
+    }
+
+    // --- due -------------------------------------------------------------
+    // Picker-only: show the value, no text cursor (Enter / click opens UI).
+    // Store the outer box so the calendar left-aligns with the Due border.
+    let focused = form.field == Field::Due;
+    let box_inner = render_field_box(f, field_block("Due", focused, None, theme), due_box);
+    form.areas.due = due_box;
+    let view = form.due.visible(box_inner.width as usize);
+    render_or_placeholder(f, box_inner, &view.text, "↵ Enter");
+
+    // --- importance ---------------------------------------------------------
+    let focused = form.field == Field::Importance;
+    let box_inner = render_field_box(
+        f,
+        field_block("Flags", focused, None, theme),
+        importance_box,
+    );
+    form.areas.importance = box_inner;
+    let marks = crate::model::importance_marks(form.importance);
+    if marks.is_empty() {
+        render_or_placeholder(f, box_inner, "", "→");
+    } else {
+        f.render_widget(
+            Paragraph::new(Line::styled(marks, Style::new().fg(theme::RED))),
+            box_inner,
+        );
+    }
+
+    // --- body --------------------------------------------------------------
+    let focused = form.field == Field::Body;
+    let (done, total) = form.body.progress();
+    let progress = (total > 0).then(|| format!("{done}/{total}"));
+    let box_inner = render_field_box(f, field_block("Body", focused, progress, theme), body_box);
+    form.areas.body = box_inner;
+    draw_body(f, form, store, theme, box_inner, focused);
+    field_scrollbar(
+        f,
+        theme,
+        body_box,
+        form.body.content_height() as usize,
+        box_inner.height as usize,
+        form.body.scroll() as usize,
+        focused,
+    );
+
+    // --- error or key hints ---------------------------------------------
+    let footer = match &form.error {
+        Some(error) => Line::styled(
+            truncate(error, hint.width as usize),
+            Style::new().fg(theme::RED).add_modifier(Modifier::BOLD),
+        ),
+        None => Line::styled(
+            if docked {
+                "/ commands · Ctrl+Z undo · Ctrl+S save · Esc list"
+            } else {
+                "/ commands · Ctrl+Z undo · Ctrl+S save · Esc cancel"
+            },
+            Style::new().fg(theme::GREY),
+        ),
+    };
+    f.render_widget(Paragraph::new(footer), hint);
+
+    // Drawn last so it sits over the body box below it.
+    // Picker/image lightbox use the full frame so they are not clipped.
+    let overlay = f.area();
+    if let Some(picker) = form.picker.as_mut() {
+        draw_due_picker(f, theme, picker, form.areas.due, overlay);
+    }
+
+    // Preview the picture the cursor is on, or the first one otherwise.
+    if form.preview
+        && let Some(path) = form
+            .body
+            .selected_image()
+            .or_else(|| form.body.images().first().cloned())
+    {
+        draw_image_preview(f, store, form, theme, &path, overlay);
+    }
+}
+
+/// Read-only view of the selected task in the permanent preview pane.
+fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let focused = false;
+    let block = panel("Preview", focused, theme);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let Some(task_id) = app.selected_task().map(|t| t.id.clone()) else {
+        app.invalidate_preview();
+        let style = Style::new().fg(theme::GREY);
+        draw_box(f, inner, "Select a task · Enter to edit", style);
+        return;
+    };
+
+    // Snapshot fields we need before borrowing the preview form mutably.
+    let (title, done, due_s, importance, body_empty, image_paths, todo) = {
+        let task = app.selected_task().expect("id present");
+        let paths: Vec<_> = task
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                crate::model::Block::Image { path } => Some(crate::image::expand(path)),
+                _ => None,
+            })
+            .collect();
+        (
+            task.title.clone(),
+            task.done,
+            due::display(&task.due, &app.settings.date_format),
+            task.importance,
+            task.body.is_empty(),
+            paths,
+            crate::model::todo_progress(task),
+        )
+    };
+
+    // Prefetch body pictures so they appear on the next frames.
+    app.images.prefetch(image_paths);
+
+    let flags = crate::model::importance_marks(importance);
+    let mut meta = String::new();
+    if !due_s.is_empty() {
+        meta.push_str(&due_s);
+    }
+    if !flags.is_empty() {
+        if !meta.is_empty() {
+            meta.push_str("  ");
+        }
+        meta.push_str(&flags);
+    }
+    if let Some((d, t)) = todo {
+        if !meta.is_empty() {
+            meta.push_str("  ");
+        }
+        meta.push_str(&format!("{d}/{t}"));
+    }
+
+    let title_style = if done {
+        Style::new()
+            .fg(theme::GREY)
+            .add_modifier(Modifier::CROSSED_OUT | Modifier::BOLD)
+    } else {
+        Style::new().add_modifier(Modifier::BOLD)
+    };
+
+    let (title_row, meta_row, body_area) = if meta.is_empty() {
+        let [t, b] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+        (t, None, b)
+    } else {
+        let [t, m, b] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .areas(inner);
+        (t, Some(m), b)
+    };
+
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            truncate(&title, title_row.width as usize),
+            title_style,
+        )),
+        title_row,
+    );
+    if let Some(meta_row) = meta_row {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                truncate(&meta, meta_row.width as usize),
+                Style::new().fg(theme::GREY),
+            )),
+            meta_row,
+        );
+    }
+
+    if body_area.height == 0 {
+        return;
+    }
+    if body_empty {
+        f.render_widget(
+            Paragraph::new(Line::styled("Enter to edit", Style::new().fg(theme::GREY))),
+            body_area,
+        );
+        return;
+    }
+
+    app.ensure_preview();
+    let App {
+        images: store,
+        preview_form,
+        ..
+    } = app;
+    if let Some(paint) = preview_form.as_mut() {
+        draw_body(f, paint, store, theme, body_area, false);
+    }
+    let _ = task_id;
+}
+
+/// One field of a dialog: a rounded box with its name on the border.
+fn field_block<'a>(
+    label: &'a str,
+    focused: bool,
+    note: Option<String>,
+    theme: &Theme,
+) -> Block<'a> {
+    // Thick glyphs (┃/━) — terminal bold barely changes box lines.
+    let (border, label_style) = if focused {
+        (theme.accent_text(), theme.accent_text().bold())
+    } else {
+        (
+            Style::new().fg(theme::GREY),
+            Style::new().fg(theme::GREY).add_modifier(Modifier::BOLD),
+        )
+    };
+    let mut block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(border)
+        .title(Span::styled(format!(" {label} "), label_style))
+        .padding(Padding::horizontal(1));
+    if let Some(note) = note {
+        block = block.title_top(
+            Line::styled(format!(" {note} "), Style::new().fg(theme::GREY)).right_aligned(),
+        );
+    }
+    block
+}
+
+/// The category dialog: the same shape as a task's, with a name and a
+/// note about what the category is for.
+fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let Some(form) = &mut app.category_form else {
+        return;
+    };
+    // Borders (2), top pad under title (1), name box (3), gap (1), hint (1).
+    const CHROME: u16 = 8;
+    let text_height = area.height.saturating_sub(CHROME).clamp(3, 12);
+    let width = 72.min(area.width.saturating_sub(4));
+    let rect = centered(area, width, (CHROME + text_height).min(area.height));
+
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text())
+        .title(Span::styled(
+            format!(" {} ", form.title_text()),
+            theme.accent_text().bold(),
+        ))
+        // One blank row under "Edit category" / "New category".
+        .padding(Padding::new(2, 2, 1, 0));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+
+    let [name_box, _gap, text_box, hint] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(text_height),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let focused = !form.on_description;
+    let box_inner = render_field_box(f, field_block("Name", focused, None, theme), name_box);
+    form.name_area = box_inner;
+    let view = form.name.visible(box_inner.width as usize);
+    if view.text.is_empty() {
+        render_or_placeholder(f, box_inner, "", "What to call it");
+    } else {
+        f.render_widget(
+            Paragraph::new(line_with_selection(
+                &view.text,
+                view.sel_cols,
+                Style::new(),
+                theme,
+            )),
+            box_inner,
+        );
+    }
+    if focused {
+        f.set_cursor_position((box_inner.x + view.cursor_col, box_inner.y));
+    }
+
+    let focused = form.on_description;
+    let box_inner = render_field_box(
+        f,
+        field_block("Description", focused, None, theme),
+        text_box,
+    );
+    form.description_area = box_inner;
+    let (lines, cursor) = form
+        .description
+        .layout(box_inner.width as usize, box_inner.height);
+    if form.description.is_empty() && form.description.menu.is_none() {
+        render_or_placeholder(f, box_inner, "", "Press / for commands");
+    }
+    for placed in lines {
+        if matches!(placed.block, crate::body::Painted::Text { .. }) {
+            draw_placed_text(f, theme, box_inner, &placed);
+        }
+    }
+    if let (true, Some((row, col))) = (focused, cursor) {
+        f.set_cursor_position((box_inner.x + col, box_inner.y + row));
+    }
+    if focused {
+        draw_slash_menu(f, &form.description, theme, box_inner, cursor);
+    }
+    field_scrollbar(
+        f,
+        theme,
+        text_box,
+        form.description.content_height() as usize,
+        box_inner.height as usize,
+        form.description.scroll() as usize,
+        focused,
+    );
+
+    let footer = match &form.error {
+        Some(error) => Line::styled(
+            truncate(error, hint.width as usize),
+            Style::new().fg(theme::RED).add_modifier(Modifier::BOLD),
+        ),
+        None => Line::styled(
+            "/ commands · Ctrl+Z undo · Ctrl+S save · Esc cancel",
+            Style::new().fg(theme::GREY),
+        ),
+    };
+    f.render_widget(Paragraph::new(footer), hint);
+}
+
+/// The stack of blocks, plus the `/` menu when it is open.
+fn draw_body(
+    f: &mut Frame,
+    form: &mut crate::form::TaskForm,
+    store: &mut crate::image::ImageStore,
+    theme: &Theme,
+    area: Rect,
+    focused: bool,
+) {
+    let menu_open = form.body.menu.is_some();
+    if form.body.is_empty() && form.body.menu.is_none() {
+        render_or_placeholder(f, area, "", "Press / for commands");
+    }
+    let (blocks, cursor) = form.body.layout(area.width as usize, area.height);
+    let scroll = form.body.scroll();
+    // Graphics protocols ignore cell Clear. Drop placements when the `/`
+    // menu closes or the body scrolls (pictures shrink/move) so the next
+    // get re-emits cleanly. Pixels stay in RAM — encode only.
+    if (form.menu_was_open && !menu_open) || form.body_scroll != scroll {
+        store.clear_cache();
+        f.render_widget(Clear, area);
+    }
+    form.menu_was_open = menu_open;
+    form.body_scroll = scroll;
+    // Only hide images the dropdown actually covers. Graphics protocols
+    // cannot be "punched" cleanly, so an overlapping image becomes a
+    // compact marker; anything the menu does not touch stays real.
+    let menu_rect = slash_menu_rect(&form.body, area, cursor);
+    form.body_menu_area = menu_rect;
+    form.image_hits.clear();
+    for placed in blocks {
+        match &placed.block {
+            crate::body::Painted::Image(path) => {
+                let row = Rect {
+                    y: area.y + placed.y,
+                    height: placed.rows,
+                    ..area
+                };
+                let covered = menu_rect.is_some_and(|m| rects_overlap(m, row));
+                // Frame + type label only while the body field owns focus
+                // and the cursor is on this picture — not when the dialog
+                // opens on Title with the cursor still sitting on line 0.
+                let show_frame = focused && placed.selected;
+                if covered {
+                    f.render_widget(Clear, row);
+                    let hit = letterbox_rect(row, 4, 3);
+                    draw_image_placeholder(f, theme, hit, show_frame);
+                    form.image_hits.push((placed.line, hit));
+                } else if let Some(hit) = draw_image(f, store, theme, path, row, show_frame) {
+                    form.image_hits.push((placed.line, hit));
+                }
+            }
+            crate::body::Painted::Text { .. } => {
+                draw_placed_text(f, theme, area, &placed);
+            }
+        }
+    }
+    if focused && let Some((row, col)) = cursor {
+        f.set_cursor_position((area.x + col, area.y + row));
+    }
+
+    draw_slash_menu(f, &form.body, theme, area, cursor);
+}
+
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+}
+
+/// Screen rect of the open `/` dropdown, if any.
+fn slash_menu_rect(
+    body: &crate::body::BodyEditor,
+    area: Rect,
+    cursor: Option<(u16, u16)>,
+) -> Option<Rect> {
+    body.menu.as_ref()?;
+    let commands = body.menu_commands();
+    if commands.is_empty() {
+        return None;
+    }
+    let width = 48.min(area.width);
+    let height = commands.len() as u16 + 2;
+    let cursor_row = cursor.map(|(row, _)| row).unwrap_or(0);
+    let below = area.y + cursor_row + 1;
+    let y = if below + height <= area.bottom() {
+        below
+    } else {
+        (area.y + cursor_row).saturating_sub(height)
+    };
+    Some(Rect {
+        x: area.x
+            + cursor
+                .map(|(_, col)| col)
+                .unwrap_or(0)
+                .min(area.width.saturating_sub(width)),
+        y,
+        width,
+        height,
+    })
+}
+
+/// Soft-wrapped text / list / link block (body and category description).
+fn draw_placed_text(f: &mut Frame, theme: &Theme, area: Rect, placed: &crate::body::Placed) {
+    let crate::body::Painted::Text { rows, kind } = &placed.block else {
+        return;
+    };
+    let indent = kind.indent();
+    let max_rows = placed.rows as usize;
+    for (i, wr) in rows.iter().enumerate().take(max_rows) {
+        let y = area.y + placed.y + i as u16;
+        if y >= area.bottom() {
+            break;
+        }
+        let row = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        };
+        let base = match kind {
+            crate::body::TextKind::Link => Style::new()
+                .fg(theme.accent)
+                .add_modifier(Modifier::UNDERLINED),
+            crate::body::TextKind::Todo { done: true } => Style::new()
+                .fg(theme::GREY)
+                .add_modifier(Modifier::CROSSED_OUT),
+            _ => Style::new(),
+        };
+        let body = line_with_selection(&wr.text, wr.sel, base, theme);
+        let line = if i == 0 {
+            match kind {
+                crate::body::TextKind::Todo { done: true } => Line::from(
+                    [
+                        vec![Span::styled("[✓] ", Style::new().fg(theme::GREEN))],
+                        body.spans,
+                    ]
+                    .concat(),
+                ),
+                crate::body::TextKind::Todo { done: false } => Line::from(
+                    [
+                        vec![Span::styled("[ ] ", Style::new().fg(theme::GREY))],
+                        body.spans,
+                    ]
+                    .concat(),
+                ),
+                crate::body::TextKind::Bullet => Line::from(
+                    [
+                        vec![Span::styled("• ", Style::new().fg(theme::GREY))],
+                        body.spans,
+                    ]
+                    .concat(),
+                ),
+                crate::body::TextKind::Number(n) => Line::from(
+                    [
+                        vec![Span::styled(format!("{n}. "), Style::new().fg(theme::GREY))],
+                        body.spans,
+                    ]
+                    .concat(),
+                ),
+                crate::body::TextKind::Link => Line::from(
+                    [
+                        vec![Span::styled("↗ ", Style::new().fg(theme::GREY))],
+                        body.spans,
+                    ]
+                    .concat(),
+                ),
+                crate::body::TextKind::Plain => body,
+            }
+        } else if indent > 0 {
+            // Continuation rows line up under the text, past the prefix.
+            Line::from([vec![Span::raw(" ".repeat(indent))], body.spans].concat())
+        } else {
+            body
+        };
+        f.render_widget(Paragraph::new(line), row);
+    }
+}
+
+/// Compact cell stand-in when the `/` menu covers an image slot.
+fn draw_image_placeholder(f: &mut Frame, theme: &Theme, area: Rect, selected: bool) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let rect = Rect { height: 1, ..area };
+    let style = if selected {
+        theme.accent_text()
+    } else {
+        Style::new().fg(theme::GREY)
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(Line::styled(" [image] ", style)), rect);
+}
+
+/// Full-size stand-in while a body/preview image is loading or failed.
+enum ImageSlotKind<'a> {
+    Loading,
+    Broken { detail: &'a str },
+}
+
+/// Letterbox a content box into `area` (after a 1-cell frame margin),
+/// matching how real pictures are laid out. `aspect_w` / `aspect_h` are
+/// relative; unknown images use 4×3.
+fn letterbox_rect(area: Rect, aspect_w: u16, aspect_h: u16) -> Rect {
+    if area.width < 3 || area.height < 3 {
+        return area;
+    }
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let aw = u32::from(aspect_w.max(1));
+    let ah = u32::from(aspect_h.max(1));
+    let iw = u32::from(inner.width);
+    let ih = u32::from(inner.height);
+    let (pw, ph) = if iw * ah <= ih * aw {
+        let pw = iw;
+        let ph = (iw * ah / aw).clamp(1, ih);
+        (pw as u16, ph as u16)
+    } else {
+        let ph = ih;
+        let pw = (ih * aw / ah).clamp(1, iw);
+        (pw as u16, ph as u16)
+    };
+    centered(inner, pw, ph)
+}
+
+/// Outer area used by preview stand-ins (inner content + 1-cell frame).
+fn preview_slot_area(inner: Rect) -> Rect {
+    Rect {
+        x: inner.x.saturating_sub(1),
+        y: inner.y.saturating_sub(1),
+        width: inner.width.saturating_add(2),
+        height: inner.height.saturating_add(2),
+    }
+}
+
+fn draw_image_slot(
+    f: &mut Frame,
+    theme: &Theme,
+    area: Rect,
+    kind: ImageSlotKind<'_>,
+    selected: bool,
+) {
+    if area.width < 3 || area.height < 2 {
+        return;
+    }
+    let border = if selected {
+        theme.accent_text()
+    } else {
+        Style::new().fg(theme::GREY)
+    };
+    let (icon, title, title_style, detail) = match kind {
+        ImageSlotKind::Loading => ("▢", "loading", Style::new().fg(theme::GREY), None),
+        ImageSlotKind::Broken { detail } => (
+            "✕",
+            "broken image",
+            Style::new().fg(theme::RED),
+            Some(detail),
+        ),
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border);
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    // Vertical centre: pad, icon, title, optional detail.
+    let content_rows: u16 = if detail.is_some() { 3 } else { 2 };
+    let pad = inner.height.saturating_sub(content_rows) / 2;
+    for _ in 0..pad {
+        lines.push(Line::raw(""));
+    }
+    lines.push(
+        Line::from(Span::styled(
+            truncate(icon, inner.width as usize),
+            title_style,
+        ))
+        .centered(),
+    );
+    lines.push(
+        Line::from(Span::styled(
+            truncate(title, inner.width as usize),
+            title_style,
+        ))
+        .centered(),
+    );
+    if let Some(d) = detail {
+        let d = d.trim();
+        if !d.is_empty() {
+            lines.push(
+                Line::from(Span::styled(
+                    truncate(d, inner.width as usize),
+                    Style::new().fg(theme::GREY),
+                ))
+                .centered(),
+            );
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The `/` menu floats under the line being typed on.
+fn draw_slash_menu(
+    f: &mut Frame,
+    body: &crate::body::BodyEditor,
+    theme: &Theme,
+    area: Rect,
+    cursor: Option<(u16, u16)>,
+) {
+    let Some(menu) = &body.menu else { return };
+    let Some(rect) = slash_menu_rect(body, area, cursor) else {
+        return;
+    };
+    let commands = body.menu_commands();
+    // Inner width of a bordered block (no horizontal padding).
+    let row_width = rect.width.saturating_sub(2) as usize;
+    let lines: Vec<Line> = commands
+        .iter()
+        .enumerate()
+        .map(|(i, command)| {
+            let selected = i == menu.index.min(commands.len() - 1);
+            dropdown_row(
+                theme,
+                selected,
+                &format!("{:<14}", command.label()),
+                command.hint(),
+                row_width,
+            )
+        })
+        .collect();
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text())
+        .title(Span::styled(
+            format!(" /{} ", menu.query),
+            Style::new().fg(theme::GREY),
+        ));
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// Calendar + clock, dropped under the due field. Date and time are both
+/// set here — the Due field itself is not typed into.
+fn draw_due_picker(
+    f: &mut Frame,
+    theme: &Theme,
+    picker: &mut crate::duepicker::DuePicker,
+    field: Rect,
+    area: Rect,
+) {
+    use crate::duepicker::{PickerFocus, PickerLayout};
+
+    let Some(day) = crate::duepicker::to_time_date(picker.day) else {
+        return;
+    };
+    let mut events =
+        ratatui::widgets::calendar::CalendarEventStore::today(Style::new().fg(theme::GREEN));
+    // Underlined rather than filled, to match the task list.
+    events.add(day, theme.selection().add_modifier(Modifier::UNDERLINED));
+
+    // Monthly needs 21 columns (` Su Mo …` / 7×3-wide day cells). Borders
+    // add 2; keep the panel at least that wide so headers and days line up,
+    // even when the Due field itself is narrower.
+    const CAL_COLS: u16 = 21;
+    let width = (CAL_COLS + 2).max(field.width).min(area.width);
+    // Borders (2) + calendar (8) + blank (1) + clock (1) + title_bottom row.
+    let height = 13;
+    let below = field.bottom(); // flush under Due — field already includes its border
+    let rect = Rect {
+        // Left-align with the Due field's outer box.
+        x: field.x.min(area.right().saturating_sub(width)),
+        y: if below + height <= area.bottom() {
+            below
+        } else {
+            field.y.saturating_sub(height)
+        },
+        width,
+        height,
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text())
+        .title_bottom(
+            Line::styled(" Tab · clear(x) ", Style::new().fg(theme::GREY)).left_aligned(),
+        );
+    f.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    // Calendar (8) + blank gap (1) + clock (1).
+    let [cal_area, _gap, time_area] = Layout::vertical([
+        Constraint::Length(8),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    let cal_area = Rect {
+        width: CAL_COLS.min(cal_area.width),
+        ..cal_area
+    };
+    let time_area = Rect {
+        width: CAL_COLS.min(time_area.width),
+        ..time_area
+    };
+
+    // Month header (1) + weekdays (1) + day grid — matches Monthly's layout.
+    let days = Rect {
+        x: cal_area.x,
+        y: cal_area.y + 2,
+        width: cal_area.width,
+        height: cal_area.height.saturating_sub(2),
+    };
+
+    let calendar = ratatui::widgets::calendar::Monthly::new(day, events)
+        .show_month_header(theme.accent_text().add_modifier(Modifier::BOLD))
+        .show_weekdays_header(Style::new().fg(theme::GREY))
+        .show_surrounding(Style::new().fg(theme::GREY).add_modifier(Modifier::DIM));
+    f.render_widget(calendar, cal_area);
+
+    // Clock only — no "Time" label — centered under the calendar.
+    let hour = format!("{:02}", picker.hour);
+    let minute = format!("{:02}", picker.minute);
+    let unit = |label: &str, on: bool| {
+        if on {
+            Span::styled(
+                label.to_string(),
+                theme.selection().add_modifier(Modifier::UNDERLINED),
+            )
+        } else {
+            Span::styled(label.to_string(), Style::new())
+        }
+    };
+    let time_line = Line::from(vec![
+        unit(&hour, picker.focus == PickerFocus::Hour),
+        Span::styled(":", Style::new().fg(theme::GREY)),
+        unit(&minute, picker.focus == PickerFocus::Minute),
+    ])
+    .centered();
+    f.render_widget(Paragraph::new(time_line), time_area);
+
+    // Hit targets for "HH" and "MM" within the centered "HH:MM" (5 cells).
+    let clock_w = 5u16;
+    let clock_x = time_area.x + time_area.width.saturating_sub(clock_w) / 2;
+    picker.layout = PickerLayout {
+        frame: rect,
+        days,
+        hour: Rect {
+            x: clock_x,
+            y: time_area.y,
+            width: 2,
+            height: 1,
+        },
+        minute: Rect {
+            x: clock_x + 3,
+            y: time_area.y,
+            width: 2,
+            height: 1,
+        },
+        time_row: time_area,
+    };
+}
+
+/// A body image at whatever size the screen allows.
+fn draw_image_preview(
+    f: &mut Frame,
+    store: &mut crate::image::ImageStore,
+    form: &mut crate::form::TaskForm,
+    theme: &Theme,
+    path: &std::path::Path,
+    area: Rect,
+) {
+    let rect = centered(area, area.width * 9 / 10, area.height * 9 / 10);
+    let title = truncate(
+        &path.file_name().unwrap_or_default().to_string_lossy(),
+        rect.width.saturating_sub(10) as usize,
+    );
+    let kind = crate::image::type_label(path);
+    let anim_note = form
+        .gif
+        .as_ref()
+        .map(|(_, g)| g)
+        .filter(|g| g.is_animated())
+        .map(|g| format!(" · {}/{}", g.frame_number(), g.frame_count()))
+        .unwrap_or_default();
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text())
+        .title(Span::styled(
+            format!(" {title} "),
+            theme.accent_text().bold(),
+        ))
+        .title_top(
+            Line::styled(format!(" {kind}{anim_note} "), Style::new().fg(theme::GREY))
+                .right_aligned(),
+        )
+        .title_bottom(
+            Line::styled(
+                match form.gif.as_ref().map(|(_, g)| g) {
+                    Some(g) if g.is_animated() && g.is_paused() => {
+                        " Esc closes · click/space resume "
+                    }
+                    Some(g) if g.is_animated() => " Esc closes · click/space pause ",
+                    _ => " Esc closes ",
+                },
+                Style::new().fg(theme::GREY),
+            )
+            .right_aligned(),
+        );
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+
+    // Preview has its own chrome; no selection frame margin.
+    if let Some((_, gif)) = form.gif.as_ref() {
+        match store.preview_frame(gif) {
+            Ok(protocol) => {
+                let _ = render_protocol(f, protocol, inner, None);
+            }
+            Err(err) => {
+                let slot = letterbox_rect(preview_slot_area(inner), 4, 3);
+                draw_image_slot(
+                    f,
+                    theme,
+                    slot,
+                    ImageSlotKind::Broken { detail: &err },
+                    false,
+                );
+            }
+        }
+    } else {
+        match store.get_preview(path) {
+            crate::image::ImageReady::Ready(protocol) => {
+                let _ = render_protocol(f, protocol, inner, None);
+            }
+            crate::image::ImageReady::Loading => {
+                // Loading means not cached yet — aspect unknown.
+                let slot = letterbox_rect(preview_slot_area(inner), 4, 3);
+                draw_image_slot(f, theme, slot, ImageSlotKind::Loading, false);
+            }
+            crate::image::ImageReady::Failed(err) => {
+                let slot = letterbox_rect(preview_slot_area(inner), 4, 3);
+                draw_image_slot(
+                    f,
+                    theme,
+                    slot,
+                    ImageSlotKind::Broken { detail: &err },
+                    false,
+                );
+            }
+        }
+    }
+}
+
+/// Draws a decoded image, or a loading / broken stand-in sized like the
+/// picture. Returns the screen rect of the picture (hit target).
+fn draw_image(
+    f: &mut Frame,
+    store: &mut crate::image::ImageStore,
+    theme: &Theme,
+    path: &std::path::Path,
+    area: Rect,
+    selected: bool,
+) -> Option<Rect> {
+    if area.width < 3 || area.height < 3 {
+        return None;
+    }
+    // Room for the frame is always left, so selecting a picture does not
+    // change its size.
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    match store.get(path) {
+        crate::image::ImageReady::Ready(protocol) => Some(render_protocol(
+            f,
+            protocol,
+            inner,
+            selected.then_some((theme, path)),
+        )),
+        crate::image::ImageReady::Loading => {
+            // Not in cache yet — aspect unknown until decode finishes.
+            let slot = letterbox_rect(area, 4, 3);
+            draw_image_slot(f, theme, slot, ImageSlotKind::Loading, selected);
+            Some(slot)
+        }
+        crate::image::ImageReady::Failed(err) => {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(err.as_str());
+            let slot = letterbox_rect(area, 4, 3);
+            draw_image_slot(
+                f,
+                theme,
+                slot,
+                ImageSlotKind::Broken { detail: name },
+                selected,
+            );
+            Some(slot)
+        }
+    }
+}
+
+/// Paints the protocol and returns the interactive rect (frame when
+/// selected, otherwise the picture itself).
+fn render_protocol(
+    f: &mut Frame,
+    protocol: &mut ratatui_image::protocol::StatefulProtocol,
+    inner: Rect,
+    frame: Option<(&Theme, &std::path::Path)>,
+) -> Rect {
+    // Scale (not Fit): Fit never grows past the source pixel size, so a
+    // 1920px image on a large terminal only fills part of the preview.
+    // Scale keeps aspect ratio and uses the full cell area.
+    let size = protocol.size_for(Resize::Scale(None), inner.as_size());
+    let picture = centered(
+        inner,
+        size.width.min(inner.width),
+        size.height.min(inner.height),
+    );
+    f.render_stateful_widget(
+        StatefulImage::default().resize(Resize::Scale(None)),
+        picture,
+        protocol,
+    );
+    let hit = if let Some((theme, path)) = frame {
+        let border = Rect {
+            x: picture.x.saturating_sub(1),
+            y: picture.y.saturating_sub(1),
+            width: picture.width.saturating_add(2),
+            height: picture.height.saturating_add(2),
+        };
+        let kind = crate::image::type_label(path);
+        f.render_widget(
+            Block::bordered()
+                .border_type(BorderType::Thick)
+                .border_style(theme.accent_text())
+                .title_top(
+                    Line::styled(format!(" {kind} "), Style::new().fg(theme::GREY)).right_aligned(),
+                ),
+            border,
+        );
+        border
+    } else {
+        picture
+    };
+    if let Some(Err(err)) = protocol.last_encoding_result() {
+        let line = Line::styled(
+            truncate(&format!("image: {err}"), inner.width as usize),
+            Style::new().fg(theme::RED),
+        );
+        f.render_widget(Paragraph::new(line), inner);
+    }
+    hit
+}
+
+fn render_field_box(f: &mut Frame, block: Block, area: Rect) -> Rect {
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    inner
+}
+
+/// Draws `text`, or a dim hint at what belongs there when it is empty.
+/// Split `text` into spans, washing the selection with the theme accent.
+fn line_with_selection(
+    text: &str,
+    sel: Option<(u16, u16)>,
+    base: Style,
+    theme: &Theme,
+) -> Line<'static> {
+    let Some((a, b)) = sel else {
+        return Line::from(Span::styled(text.to_string(), base));
+    };
+    let a = a as usize;
+    let b = b as usize;
+    if a >= b {
+        return Line::from(Span::styled(text.to_string(), base));
+    }
+    let sel_style = theme.selection();
+    let mut spans = Vec::new();
+    let mut col = 0usize;
+    let mut chunk = String::new();
+    let mut chunk_in_sel = false;
+    let flush = |spans: &mut Vec<Span<'static>>, chunk: &mut String, in_sel: bool| {
+        if chunk.is_empty() {
+            return;
+        }
+        let style = if in_sel { sel_style } else { base };
+        spans.push(Span::styled(std::mem::take(chunk), style));
+    };
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        let in_sel = col >= a && col < b;
+        if !chunk.is_empty() && in_sel != chunk_in_sel {
+            flush(&mut spans, &mut chunk, chunk_in_sel);
+        }
+        chunk_in_sel = in_sel;
+        chunk.push(c);
+        col += w;
+    }
+    flush(&mut spans, &mut chunk, chunk_in_sel);
+    Line::from(spans)
+}
+
+fn render_or_placeholder(f: &mut Frame, area: Rect, text: &str, placeholder: &str) {
+    let line = if text.is_empty() {
+        Line::styled(
+            truncate(placeholder, area.width as usize),
+            Style::new().fg(theme::GREY).add_modifier(Modifier::DIM),
+        )
+    } else {
+        Line::raw(text.to_string())
+    };
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// A panel: thick border glyphs, title in the top-left, accent colour
+/// while focused. (Terminal bold barely thickens box-drawing chars.)
+fn panel<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
+    let (border, title_style) = if focused {
+        (theme.accent_text(), theme.accent_text().bold())
+    } else {
+        (
+            Style::new().fg(theme::GREY),
+            Style::new().fg(theme::GREY).add_modifier(Modifier::BOLD),
+        )
+    };
+    Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(border)
+        .title(Span::styled(format!(" {title} "), title_style))
+        .padding(Padding::horizontal(1))
+}
+
+/// Panel scrollbar (right border). Accent when focused, grey otherwise.
+fn scrollbar(
+    f: &mut Frame,
+    theme: &Theme,
+    area: Rect,
+    total: usize,
+    visible: usize,
+    offset: usize,
+    focused: bool,
+) {
+    paint_scrollbar(f, theme, area, total, visible, offset, focused, 1);
+}
+
+/// Scrollbar on a field box (Body / Description), same rules as panels.
+fn field_scrollbar(
+    f: &mut Frame,
+    theme: &Theme,
+    area: Rect,
+    total: usize,
+    visible: usize,
+    offset: usize,
+    focused: bool,
+) {
+    paint_scrollbar(f, theme, area, total, visible, offset, focused, 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_scrollbar(
+    f: &mut Frame,
+    theme: &Theme,
+    area: Rect,
+    total: usize,
+    visible: usize,
+    offset: usize,
+    focused: bool,
+    vertical_margin: u16,
+) {
+    // Ratatui's thumb hits the end only when `position == content_length - 1`.
+    // List/table `offset` runs 0..=(total - visible), so content_length must
+    // be that range's size (max_offset + 1), not the raw row count — otherwise
+    // the thumb stops short when you are already on the last row.
+    let max_offset = total.saturating_sub(visible);
+    if max_offset == 0 || area.height <= vertical_margin.saturating_mul(2) {
+        return;
+    }
+    let mut state = ScrollbarState::new(max_offset + 1).position(offset.min(max_offset));
+    let style = if focused {
+        theme.accent_text()
+    } else {
+        Style::new().fg(theme::GREY)
+    };
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .symbols(ratatui::symbols::scrollbar::VERTICAL)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .thumb_style(style)
+            .track_style(style),
+        area.inner(Margin {
+            horizontal: 0,
+            vertical: vertical_margin,
+        }),
+        &mut state,
+    );
+}
+
+// --------------------------------------------------------------- sidebar
+
+fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let focused = app.focus == Focus::Sidebar;
+    let block = panel("Categories", focused, theme);
+    let inner = block.inner(area);
+    app.areas.sidebar = inner;
+    if inner.height == 0 || inner.width == 0 {
+        f.render_widget(block, area);
+        return;
+    }
+
+    let width = inner.width as usize;
+    // `done/total` per category, right-aligned to the widest score.
+    let scores: Vec<String> = app
+        .categories
+        .iter()
+        .map(|cat| {
+            let (done, total) = app.category_progress(&cat.id);
+            format!("{done}/{total}")
+        })
+        .collect();
+    let count_width = scores.iter().map(|s| s.width()).max().unwrap_or(3).max(3);
+    let name_field = width.saturating_sub(count_width + 1);
+    let items: Vec<ListItem> = app
+        .categories
+        .iter()
+        .zip(scores.iter())
+        .map(|(cat, score)| {
+            let count = format!("{score:>count_width$}");
+            let name = truncate(&cat.name, name_field);
+            let pad = " ".repeat(width.saturating_sub(name.width() + count.width()));
+            ListItem::new(Line::from(vec![
+                Span::raw(name),
+                Span::raw(pad),
+                Span::styled(count, Style::new().fg(theme::GREY)),
+            ]))
+        })
+        .collect();
+    let rows = items.len();
+
+    app.cat_state.select(Some(app.cat_index));
+    let list = List::new(items).block(block).highlight_style(if focused {
+        theme.selection()
+    } else {
+        theme.selection_unfocused()
+    });
+    f.render_stateful_widget(list, area, &mut app.cat_state);
+    scrollbar(
+        f,
+        theme,
+        area,
+        rows,
+        inner.height as usize,
+        app.cat_state.offset(),
+        focused,
+    );
+}
+
+// ----------------------------------------------------------------- tasks
+
+fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let focused = app.focus == Focus::Tasks;
+    // While the task editor is open, dim panel chrome (border / scrollbar)
+    // but keep the selected-row wash so the edited task stays visible.
+    let chrome_focus = focused && app.mode != Mode::TaskForm;
+    // The sidebar already says which category is showing; only a search
+    // needs spelling out up here.
+    let mut block = panel("Tasks", chrome_focus, theme);
+    // Search spells out what matched; category notes stay in the editor.
+    if app.searching {
+        let context = format!(" search: {} · {} found ", app.search_query, app.view.len());
+        block =
+            block.title_top(Line::styled(context, Style::new().fg(theme::GREY)).right_aligned());
+    }
+    let inner = block.inner(area);
+    app.areas.tasks = inner;
+    if inner.height == 0 || inner.width == 0 {
+        f.render_widget(block, area);
+        return;
+    }
+
+    if app.view.is_empty() {
+        f.render_widget(block, area);
+        let text = if app.searching {
+            banner::NO_SEARCH_RESULTS
+        } else {
+            banner::EMPTY_TASKS
+        };
+        let style = if chrome_focus {
+            theme.accent_text()
+        } else {
+            Style::new().fg(theme::GREY)
+        };
+        draw_box(f, inner, text, style);
+        return;
+    }
+
+    // The trailing columns are as wide as their widest entry, so dates
+    // and markers line up down the panel. Category is shown as a section
+    // header row in All Tasks / search, not a per-task suffix.
+    // Always reserve room for three flags so ≡ / due do not shift when
+    // importance changes.
+    let flags_width = crate::model::MAX_IMPORTANCE as usize;
+    let (extras_width, due_width) = app.view.iter().fold((0, 0), |(e, d), i| {
+        let task = &app.tasks[*i];
+        (
+            e.max(extras(task).width()),
+            d.max(due::display(&task.due, &app.settings.date_format).width()),
+        )
+    });
+
+    let columns = Columns {
+        extras: extras_width > 0,
+        due: due_width > 0,
+        flags: true,
+    };
+    // Columns nothing fills are left out entirely — an empty one would
+    // still cost the gap beside it. Flags always take a fixed slot.
+    let mut widths = vec![
+        Constraint::Length(DONE_MARK_WIDTH), // [ ] / [✓]
+        Constraint::Fill(1),                 // title
+    ];
+    for width in [extras_width, due_width] {
+        if width > 0 {
+            widths.push(Constraint::Length(width as u16));
+        }
+    }
+    widths.push(Constraint::Length(flags_width as u16));
+    let rows: Vec<Row> = app
+        .list_rows
+        .iter()
+        .map(|row| match row {
+            // Placeholder — the full-width rule is painted after the table
+            // so column gaps cannot break the line or the title.
+            crate::app::TaskListRow::Separator { .. } => {
+                Row::new(std::iter::repeat_n(Cell::new(""), widths.len()))
+            }
+            crate::app::TaskListRow::Task(view_idx) => task_row(app, theme, *view_idx, columns),
+        })
+        .collect();
+    // Selected-row wash stays on during edit; bold only when the list has chrome focus.
+    let table = Table::new(rows, widths)
+        .block(block)
+        .column_spacing(1)
+        .row_highlight_style(if chrome_focus {
+            theme.selection()
+        } else {
+            theme.selection_unfocused()
+        });
+
+    // Remember where the markers ended up, so a click can find them. The
+    // flags sit at the right edge, the tick at the left.
+    app.areas.done_x = Some(inner.x);
+    app.areas.flag_x = Some(inner.right() - flags_width as u16);
+
+    let vis = app.selected_visual_row();
+    app.task_state.select(vis);
+    // Table does `start = offset.min(selected)`, so scrolling up to the first
+    // task of a group lands on that task and hides the section header above
+    // it. Pull offset back onto the header first so the header stays in view.
+    if let Some(vis) = vis {
+        pin_section_header(app, vis);
+    }
+    f.render_stateful_widget(table, area, &mut app.task_state);
+
+    // Full-width category rules on top of separator placeholder rows.
+    let offset = app.task_state.offset();
+    let rule_style = Style::new().fg(theme::GREY);
+    for (vis_i, row) in app.list_rows.iter().enumerate().skip(offset) {
+        let y = inner.y + (vis_i - offset) as u16;
+        if y >= inner.bottom() {
+            break;
+        }
+        let crate::app::TaskListRow::Separator { title } = row else {
+            continue;
+        };
+        // Align the name with task titles (after `[ ]` + column gap).
+        let title_x = (DONE_MARK_WIDTH + 1) as usize;
+        let line = category_rule(title, inner.width as usize, title_x);
+        f.render_widget(
+            Paragraph::new(Span::styled(line, rule_style)),
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+
+    scrollbar(
+        f,
+        theme,
+        area,
+        app.list_rows.len(),
+        inner.height as usize,
+        app.task_state.offset(),
+        chrome_focus,
+    );
+}
+
+/// If `vis` is the first task under a section header, do not let the table
+/// scroll that header off the top of the viewport.
+fn pin_section_header(app: &mut App, vis: usize) {
+    if vis == 0 {
+        return;
+    }
+    let header = vis - 1;
+    if !matches!(
+        app.list_rows.get(header),
+        Some(crate::app::TaskListRow::Separator { .. })
+    ) {
+        return;
+    }
+    if app.task_state.offset() > header {
+        *app.task_state.offset_mut() = header;
+    }
+}
+
+/// The markers shown between a task's title and its due date.
+fn extras(task: &crate::model::Task) -> String {
+    let notes = if crate::model::has_prose_or_image(task) {
+        "≡"
+    } else {
+        ""
+    };
+    match crate::model::todo_progress(task) {
+        Some((done, total)) => format!("{notes} {done}/{total}").trim_start().to_string(),
+        None => notes.to_string(),
+    }
+}
+
+/// Which of the optional columns the table is laying out this frame.
+#[derive(Clone, Copy)]
+struct Columns {
+    extras: bool,
+    due: bool,
+    flags: bool,
+}
+
+/// Full-width rule with the category name aligned to the title column:
+/// `─── Mach ────────────────` (space before the name, same column as titles).
+fn category_rule(title: &str, width: usize, title_x: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    // One space before the name so it does not touch the rule; the name
+    // still starts at `title_x` like task titles after `[ ] `.
+    let label = format!(" {title} ");
+    let label_w = label.width();
+    let pad = title_x.saturating_sub(1).min(width);
+    if pad + label_w >= width {
+        let head = "─".repeat(pad);
+        return truncate(&format!("{head}{label}"), width);
+    }
+    format!(
+        "{}{label}{}",
+        "─".repeat(pad),
+        "─".repeat(width - pad - label_w)
+    )
+}
+
+fn task_row(app: &App, theme: &Theme, view_idx: usize, columns: Columns) -> Row<'static> {
+    let task = &app.tasks[app.view[view_idx]];
+    let done = task.done;
+    // A finished task is muted — but not on the selected row (even when
+    // Categories has focus), where the tick and strikethrough say enough.
+    let selected = view_idx == app.task_index;
+    let due_str = due::display(&task.due, &app.settings.date_format);
+
+    let title = task.title.clone();
+
+    let title_style = if !task.due.is_empty() {
+        let color = if done && !selected {
+            theme::dimmed(theme.accent)
+        } else {
+            theme.accent
+        };
+        Style::new().fg(color)
+    } else if done && !selected {
+        Style::new().fg(theme::GREY)
+    } else {
+        theme.plain()
+    };
+    let title_style = if done {
+        title_style.add_modifier(Modifier::CROSSED_OUT)
+    } else {
+        title_style
+    };
+
+    let mut cells = Vec::with_capacity(5);
+    let (mark, mark_style) = if done {
+        ("[✓]", Style::new().fg(theme::GREEN))
+    } else {
+        ("[ ]", Style::new().fg(theme::GREY))
+    };
+    cells.push(Cell::new(mark).style(mark_style));
+    cells.push(Cell::new(Span::styled(title, title_style)));
+    // Order: title · ≡ · due · flags
+    if columns.extras {
+        cells.push(Cell::new(Span::styled(
+            extras(task),
+            Style::new().fg(theme::GREY),
+        )));
+    }
+    if columns.due {
+        cells.push(Cell::new(Text::from(
+            Line::from(Span::styled(due_str, title_style)).right_aligned(),
+        )));
+    }
+    if columns.flags {
+        cells.push(Cell::new(Text::from(
+            Line::from(Span::styled(
+                crate::model::importance_marks(task.importance),
+                Style::new().fg(theme::RED),
+            ))
+            .right_aligned(),
+        )));
+    }
+    Row::new(cells)
+}
+
+// ------------------------------------------------------------ status bar
+
+fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    // The bar is a panel like the others, minus the name: while a
+    // command or a search is being typed it is what has focus.
+    let typing = matches!(app.mode, Mode::Slash | Mode::Search);
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(if typing {
+            theme.accent_text()
+        } else {
+            Style::new().fg(theme::GREY)
+        })
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let area = inner;
+
+    let right = Line::from(Span::styled(
+        due::now_string(&app.settings.date_format),
+        Style::new().fg(theme::GREY),
+    ));
+    let right_width = right.width() as u16;
+    let [left_area, right_area] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(right_width.min(area.width)),
+    ])
+    .areas(area);
+    f.render_widget(Paragraph::new(right), right_area);
+
+    let field = left_area.width.saturating_sub(2) as usize;
+    let left = match app.mode {
+        Mode::Slash | Mode::Search => {
+            let view = app.input.visible(field);
+            f.set_cursor_position((left_area.x + 1 + view.cursor_col, left_area.y));
+            let body = line_with_selection(&view.text, view.sel_cols, Style::new(), theme);
+            Line::from([vec![Span::styled("/", theme.accent_text())], body.spans].concat())
+        }
+        _ => match &app.message {
+            Some(m) => {
+                let style = match m.kind {
+                    MessageKind::Error => Style::new().fg(theme::RED).add_modifier(Modifier::BOLD),
+                    MessageKind::Info => theme.accent_text(),
+                };
+                Line::from(Span::styled(truncate(&m.text, field), style))
+            }
+            None => {
+                let hint = if app.searching {
+                    format!("search: {} · Esc clears", app.search_query)
+                } else {
+                    "/ commands".to_string()
+                };
+                if (left_area.width as usize) >= hint.width() + 2 {
+                    Line::from(Span::styled(hint, Style::new().fg(theme::GREY)))
+                } else {
+                    Line::raw("")
+                }
+            }
+        },
+    };
+    f.render_widget(Paragraph::new(left), left_area);
+}
+
+/// Dropdown of `/` commands, drawn upward from the status bar.
+fn draw_slash_palette(f: &mut Frame, app: &App, theme: &Theme, status: Rect) {
+    let query = app.input.value();
+    let commands = crate::slash::matching(&query);
+    if commands.is_empty() {
+        return;
+    }
+    let width = 53.min(status.width.saturating_sub(2)).max(24);
+    let height = (commands.len() as u16 + 2).min(status.y.max(3));
+    let rect = Rect {
+        x: status.x,
+        y: status.y.saturating_sub(height),
+        width,
+        height,
+    };
+    let row_width = width.saturating_sub(2) as usize;
+    let lines: Vec<Line> = commands
+        .iter()
+        .enumerate()
+        .map(|(i, cmd)| {
+            let selected = i == app.slash_index.min(commands.len() - 1);
+            dropdown_row(
+                theme,
+                selected,
+                &format!("/{:<12}", cmd.id()),
+                cmd.hint(),
+                row_width,
+            )
+        })
+        .collect();
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text())
+        .title(Span::styled(
+            format!(" /{} ", query),
+            Style::new().fg(theme::GREY),
+        ));
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// One row of a small dropdown: no leading arrow; selection wash runs
+/// the full inner width so the bar reaches the right border.
+fn dropdown_row(
+    theme: &Theme,
+    selected: bool,
+    label: &str,
+    hint: &str,
+    row_width: usize,
+) -> Line<'static> {
+    let label_part = format!(" {label} ");
+    let hint_part = format!("{hint} ");
+    let used = label_part.width() + hint_part.width();
+    let pad = " ".repeat(row_width.saturating_sub(used));
+
+    let wash = theme::tint(theme.accent);
+    let (label_style, hint_style, pad_style) = if selected {
+        (
+            theme.selection(),
+            Style::new().fg(theme::GREY).bg(wash),
+            Style::new().bg(wash),
+        )
+    } else {
+        (Style::new(), Style::new().fg(theme::GREY), Style::new())
+    };
+    Line::from(vec![
+        Span::styled(label_part, label_style),
+        Span::styled(hint_part, hint_style),
+        Span::styled(pad, pad_style),
+    ])
+}
+
+// -------------------------------------------------------------- overlays
+
+fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
+    let big = area.width >= banner::BANNER_WIDTH + 8;
+    let art: Vec<&str> = if big {
+        banner::BANNER.to_vec()
+    } else {
+        banner::BANNER_SMALL.to_vec()
+    };
+
+    let col_width = 40usize;
+    let inner_width = (col_width * 2 + 3).min(area.width.saturating_sub(4) as usize);
+    let mut lines: Vec<Line> = Vec::new();
+    for row in &art {
+        lines.push(Line::styled((*row).to_string(), theme.accent_text()).centered());
+    }
+    lines.push(Line::raw(""));
+    for banner::HelpRow {
+        left,
+        right,
+        heading,
+    } in banner::HELP_COLUMNS
+    {
+        let style = if heading {
+            theme.accent_text().add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{left:<col_width$}"), style),
+            Span::styled(right.to_string(), style),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(banner::HELP_FOOTER, theme.accent_text()).centered());
+
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let width = (inner_width as u16 + 4).min(area.width);
+    let rect = centered(area, width, height);
+    let title = Line::from(vec![
+        Span::raw(" mach "),
+        Span::styled(
+            format!("v{} ", crate::VERSION),
+            Style::new().fg(theme::GREY),
+        ),
+    ]);
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .title(title)
+        .border_style(theme.accent_text())
+        .padding(ratatui::widgets::Padding::horizontal(1));
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn draw_settings(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, item) in SETTINGS_ITEMS.iter().enumerate() {
+        let selected = i == app.settings_index;
+        let value = app.setting_value(i);
+        let marker = if selected { "❯ " } else { "  " };
+        let name_style = if selected {
+            Style::new().add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, theme.accent_text()),
+            Span::styled(format!("{item:<14}"), name_style),
+            Span::styled(value, theme.accent_text()),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "↑↓ select · ←→ change · Esc close",
+        Style::new().fg(theme::GREY),
+    ));
+
+    let width = 48.min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let rect = centered(area, width, height);
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .title(Line::from(" Settings "))
+        .border_style(theme.accent_text())
+        .padding(ratatui::widgets::Padding::horizontal(2));
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn draw_welcome(f: &mut Frame, theme: &Theme, area: Rect) {
+    let big = area.width >= banner::BANNER_WIDTH + 8;
+    let art: Vec<&str> = if big {
+        banner::BANNER.to_vec()
+    } else {
+        banner::BANNER_SMALL.to_vec()
+    };
+    let mut lines: Vec<Line> = art
+        .iter()
+        .map(|row| Line::styled((*row).to_string(), theme.accent_text()).centered())
+        .collect();
+    lines.push(Line::raw(""));
+    lines.push(
+        Line::styled(
+            format!("Welcome to mach v{}", crate::VERSION),
+            Style::new().add_modifier(Modifier::BOLD),
+        )
+        .centered(),
+    );
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("Written in Rust with ratatui.").centered());
+    lines.push(Line::raw("Your tasks live in ~/.mach as plain JSON.").centered());
+    lines.push(Line::raw(""));
+    lines.push(
+        Line::styled(
+            "Press Enter to start · /help for the key list",
+            Style::new().fg(theme::GREY),
+        )
+        .centered(),
+    );
+
+    let width = (if big {
+        banner::BANNER_WIDTH
+    } else {
+        banner::BANNER_SMALL_WIDTH
+    } + 8)
+        .max(50)
+        .min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let rect = centered(area, width, height);
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text());
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+// ----------------------------------------------------------------- utils
+
+fn draw_box(f: &mut Frame, area: Rect, text: &str, style: Style) {
+    let width = (text.width() as u16 + 8).min(area.width);
+    let rect = centered(area, width, 3);
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(style);
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(Line::styled(text.to_string(), style))
+            .centered()
+            .block(block),
+        rect,
+    );
+}
+
+pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Cut a string to a display width, never splitting a wide character.
+pub fn truncate(s: &str, width: usize) -> String {
+    if s.width() <= width {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out
+}
