@@ -302,7 +302,21 @@ fn minimum_size_keeps_both_primary_panels_visible() {
 }
 
 #[test]
-fn help_is_single_column_and_scrolls_to_every_section() {
+fn wide_help_uses_paired_columns_and_content_height() {
+    let mut app = sample_app();
+    app.mode = Mode::Help;
+    let buffer = draw(&mut app, 120, 40);
+
+    let (_, title_y) = find_cells(&buffer, " mach ");
+    let (_, moving_y) = find_cells(&buffer, "MOVING AROUND");
+    let (_, tasks_y) = find_cells(&buffer, "TASKS & CATEGORIES");
+
+    assert_eq!(moving_y, tasks_y, "wide help sections must share a row");
+    assert!(title_y > 0, "wide help must not fill the terminal height");
+}
+
+#[test]
+fn narrow_help_scrolls_to_every_section() {
     let mut app = sample_app();
     app.mode = Mode::Help;
     let top = render(&mut app, 80, 24);

@@ -2024,38 +2024,68 @@ fn dropdown_row(
 // -------------------------------------------------------------- overlays
 
 fn draw_help(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
-    let mut lines = wordmark_lines(theme, area.width);
+    const COLUMN_WIDTH: usize = 40;
+    const WIDE_WIDTH: u16 = COLUMN_WIDTH as u16 * 2 + 7;
+    const NARROW_WIDTH: u16 = 58;
+
+    let wide = area.width >= WIDE_WIDTH;
+    let width = if wide {
+        WIDE_WIDTH
+    } else {
+        NARROW_WIDTH.min(area.width)
+    };
+    let mut lines = wordmark_lines(theme, width);
     if !lines.is_empty() {
         lines.push(Line::raw(""));
     }
-    // One logical column keeps every shortcut readable on ordinary 80-column
-    // terminals. The two source columns become consecutive sections.
-    for side in 0..2 {
+    let row_style = |heading| {
+        if heading {
+            theme.accent_text().add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        }
+    };
+    if wide {
         for banner::HelpRow {
             left,
             right,
             heading,
         } in banner::HELP_COLUMNS
         {
-            let text = if side == 0 { left } else { right };
-            if text.is_empty() {
-                lines.push(Line::raw(""));
-                continue;
-            }
-            let style = if heading {
-                theme.accent_text().add_modifier(Modifier::BOLD)
-            } else {
-                Style::new()
-            };
-            let prefix = if heading { "" } else { "  " };
-            lines.push(Line::styled(format!("{prefix}{text}"), style));
+            let style = row_style(heading);
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{left:<COLUMN_WIDTH$}"), style),
+                Span::styled(right, style),
+            ]));
         }
         lines.push(Line::raw(""));
+    } else {
+        // Stack the paired sections only when two readable columns do not fit.
+        for side in 0..2 {
+            for banner::HelpRow {
+                left,
+                right,
+                heading,
+            } in banner::HELP_COLUMNS
+            {
+                let text = if side == 0 { left } else { right };
+                if text.is_empty() {
+                    lines.push(Line::raw(""));
+                    continue;
+                }
+                let prefix = if heading { "" } else { "  " };
+                lines.push(Line::styled(format!("{prefix}{text}"), row_style(heading)));
+            }
+            lines.push(Line::raw(""));
+        }
     }
     lines.push(Line::styled(banner::HELP_FOOTER, theme.accent_text()).centered());
 
-    let height = area.height;
-    let width = 58.min(area.width);
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(area.height);
     let rect = centered(area, width, height);
     let viewport = rect.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(viewport);
