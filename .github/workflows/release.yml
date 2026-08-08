@@ -122,7 +122,7 @@ jobs:
 
       - name: Build and smoke-test compatible binary
         run: |
-          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          SOURCE_DATE_EPOCH="$(git -c safe.directory="$GITHUB_WORKSPACE" show -s --format=%ct HEAD)"
           export SOURCE_DATE_EPOCH
           cargo build --release --locked --target "${{ matrix.target }}"
           mkdir -p dist
