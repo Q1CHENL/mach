@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: mach-release
   cancel-in-progress: false
 
 env:
@@ -40,6 +40,8 @@ jobs:
           components: rustfmt, clippy
 
       - name: Verify tag, version, and main ancestry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="$(
             cargo metadata --locked --no-deps --format-version 1 \
@@ -49,6 +51,18 @@ jobs:
           test "${GITHUB_REF_NAME}" = "v${version}"
           git fetch --no-tags origin +main:refs/remotes/origin/main
           git merge-base --is-ancestor HEAD origin/main
+          latest_tag="$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/latest" \
+            --jq '.tag_name')"
+          case "$latest_tag" in
+            v*) published_version=${latest_tag#v} ;;
+            *)
+              printf 'latest GitHub release has an invalid tag: %s\n' \
+                "$latest_tag" >&2
+              exit 1
+              ;;
+          esac
+          scripts/verify-release.sh newer "$version" "$published_version"
 
       - name: Verify source contract
         run: |
@@ -67,12 +81,13 @@ jobs:
           fi
           scripts/e2e-tui.sh target/release/mach
 
-      - name: Verify installer contract
+      - name: Verify shell contracts
         env:
           TEST_SHELL: dash
         run: |
           shellcheck install.sh scripts/*.sh
           scripts/test-install.sh
+          scripts/test-release.sh
 
   build-linux:
     name: ${{ matrix.target }}
@@ -179,12 +194,25 @@ jobs:
     name: publish verified release
     needs: [verify, build-linux, build-macos]
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 30
+    # This name is part of the crates.io trusted-publisher identity.
+    environment: release
     permissions:
       attestations: write
       contents: write
       id-token: write
     steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RELEASE_RUST }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ env.RELEASE_RUST }}
+
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -193,27 +221,203 @@ jobs:
 
       - name: Verify artifact set and generate checksums
         run: |
-          for target in \
-            x86_64-unknown-linux-gnu \
-            aarch64-unknown-linux-gnu \
-            x86_64-apple-darwin \
-            aarch64-apple-darwin
-          do
-            test -f "dist/mach-${target}"
-          done
-          test "$(find dist -maxdepth 1 -type f -name 'mach-*' | wc -l)" -eq 4
-          (cd dist && sha256sum mach-* > SHA256SUMS && sha256sum -c SHA256SUMS)
+          (
+            cd dist
+            sha256sum \
+              mach-x86_64-unknown-linux-gnu \
+              mach-aarch64-unknown-linux-gnu \
+              mach-x86_64-apple-darwin \
+              mach-aarch64-apple-darwin \
+              > SHA256SUMS
+          )
+          scripts/verify-release.sh local dist
 
       - name: Attest binary provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
-        with:
-          files: |
-            dist/mach-*
+      - name: Stage and verify the GitHub draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if release_json="$(gh release view "$TAG_NAME" \
+            --json databaseId,isDraft,isPrerelease 2>/dev/null)"; then
+            if [ "$(jq -r '.isDraft' <<< "$release_json")" != true ]; then
+              printf 'release %s is already published\n' "$TAG_NAME" >&2
+              exit 1
+            fi
+            if [ "$(jq -r '.isPrerelease' <<< "$release_json")" != false ]; then
+              printf 'draft %s is unexpectedly marked as a prerelease\n' \
+                "$TAG_NAME" >&2
+              exit 1
+            fi
+            gh release edit "$TAG_NAME" \
+              --draft \
+              --title "mach $TAG_NAME"
+          else
+            gh release create "$TAG_NAME" \
+              --verify-tag \
+              --fail-on-no-commits \
+              --draft \
+              --generate-notes \
+              --title "mach $TAG_NAME"
+          fi
+
+          gh release upload "$TAG_NAME" \
+            --clobber \
+            dist/mach-x86_64-unknown-linux-gnu \
+            dist/mach-aarch64-unknown-linux-gnu \
+            dist/mach-x86_64-apple-darwin \
+            dist/mach-aarch64-apple-darwin \
             dist/SHA256SUMS
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+
+          release_id="$(gh release view "$TAG_NAME" \
+            --json databaseId \
+            --jq '.databaseId')"
+          case "$release_id" in
+            '' | *[!0-9]*)
+              printf 'GitHub did not return a numeric release ID: %s\n' \
+                "$release_id" >&2
+              exit 1
+              ;;
+          esac
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            > "$RUNNER_TEMP/release.json"
+          scripts/verify-release.sh github dist "$RUNNER_TEMP/release.json"
+          printf 'RELEASE_ID=%s\n' "$release_id" >> "$GITHUB_ENV"
+
+      - name: Prepare the crate release
+        id: crate
+        run: |
+          version="$(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -er '.packages | map(select(.name == "mach-tui")) | if length == 1 then .[0].version else error("expected exactly one mach-tui package") end'
+          )"
+          cargo package --locked
+          crate_path="target/package/mach-tui-${version}.crate"
+          test -f "$crate_path"
+
+          crate_index_json="$RUNNER_TEMP/crate-index.json"
+          index_http_code="$(curl \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --user-agent 'mach-release (https://github.com/Q1CHENL/mach)' \
+            --output "$crate_index_json" \
+            --write-out '%{http_code}' \
+            'https://crates.io/api/v1/crates/mach-tui')"
+          if [ "$index_http_code" != 200 ]; then
+            printf 'crates.io package lookup returned HTTP %s\n' \
+              "$index_http_code" >&2
+            cat "$crate_index_json" >&2
+            exit 1
+          fi
+          published_version="$(jq -er '.crate.max_version' "$crate_index_json")"
+          if [ "$published_version" != "$version" ]; then
+            scripts/verify-release.sh newer "$version" "$published_version"
+          fi
+
+          crate_json="$RUNNER_TEMP/crate-version.json"
+          http_code="$(curl \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --user-agent 'mach-release (https://github.com/Q1CHENL/mach)' \
+            --output "$crate_json" \
+            --write-out '%{http_code}' \
+            "https://crates.io/api/v1/crates/mach-tui/${version}")"
+          case "$http_code" in
+            200)
+              scripts/verify-release.sh crate "$crate_path" "$version" "$crate_json"
+              needs_publish=false
+              ;;
+            404)
+              needs_publish=true
+              ;;
+            *)
+              printf 'crates.io version lookup returned HTTP %s\n' \
+                "$http_code" >&2
+              cat "$crate_json" >&2
+              exit 1
+              ;;
+          esac
+          {
+            printf 'version=%s\n' "$version"
+            printf 'archive=%s\n' "$crate_path"
+            printf 'needs_publish=%s\n' "$needs_publish"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to crates.io
+        if: steps.crate.outputs.needs_publish == 'true'
+        id: crates_io_auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish crate
+        if: steps.crate.outputs.needs_publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
+        run: cargo publish --locked
+
+      - name: Verify the crates.io release
+        env:
+          CRATE_ARCHIVE: ${{ steps.crate.outputs.archive }}
+          CRATE_VERSION: ${{ steps.crate.outputs.version }}
+        run: |
+          crate_json="$RUNNER_TEMP/published-crate.json"
+          attempt=0
+          while [ "$attempt" -lt 30 ]; do
+            http_code="$(curl \
+              --silent \
+              --show-error \
+              --location \
+              --retry 3 \
+              --user-agent 'mach-release (https://github.com/Q1CHENL/mach)' \
+              --output "$crate_json" \
+              --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/mach-tui/${CRATE_VERSION}")"
+            if [ "$http_code" = 200 ]; then
+              scripts/verify-release.sh crate \
+                "$CRATE_ARCHIVE" "$CRATE_VERSION" "$crate_json"
+              exit 0
+            fi
+            if [ "$http_code" != 404 ]; then
+              printf 'crates.io verification returned HTTP %s\n' \
+                "$http_code" >&2
+              cat "$crate_json" >&2
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            sleep 2
+          done
+          printf 'crates.io did not publish mach-tui %s within 60 seconds\n' \
+            "$CRATE_VERSION" >&2
+          exit 1
+
+      - name: Publish the verified GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            > "$RUNNER_TEMP/release-before-publish.json"
+          scripts/verify-release.sh github \
+            dist "$RUNNER_TEMP/release-before-publish.json"
+
+          gh release edit "$TAG_NAME" --draft=false --latest
+          release_json="$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          latest_tag="$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/latest" \
+            --jq '.tag_name')"
+          if ! jq -e \
+            --arg tag "$TAG_NAME" \
+            '.draft == false and .prerelease == false and .tag_name == $tag' \
+            <<< "$release_json" >/dev/null \
+            || [ "$latest_tag" != "$TAG_NAME" ]; then
+            printf 'release %s was not published as latest\n' "$TAG_NAME" >&2
+            exit 1
+          fi

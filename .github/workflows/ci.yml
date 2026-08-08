@@ -109,6 +109,10 @@ jobs:
           TEST_SHELL: ${{ runner.os == 'Linux' && 'dash' || 'sh' }}
         run: scripts/test-install.sh
 
+      - name: Release contract
+        if: matrix.lint
+        run: scripts/test-release.sh
+
       - name: ShellCheck
         if: matrix.lint
         run: shellcheck install.sh scripts/*.sh
