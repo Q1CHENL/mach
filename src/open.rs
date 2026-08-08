@@ -4,14 +4,25 @@ use std::process::{Command, Stdio};
 
 /// Launch `url` with the OS default handler (`open` / `xdg-open` / `start`).
 pub fn open_url(raw: &str) -> Result<(), String> {
-    let url = normalize_url(raw).ok_or_else(|| "empty link".to_string())?;
+    let url = normalize_url(raw).ok_or_else(|| "empty or unsupported link".to_string())?;
     let mut cmd = platform_command(&url);
-    cmd.stdin(Stdio::null())
+    let mut child = cmd
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+        .map_err(|e| format!("could not open {url}: {e}"))?;
+
+    // Dropping a running `Child` does not reap it on Unix. Keep the UI
+    // non-blocking while ensuring the short-lived launcher cannot become a
+    // zombie process.
+    std::thread::Builder::new()
+        .name("mach-open-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        })
         .map(|_| ())
-        .map_err(|e| format!("could not open {url}: {e}"))
+        .map_err(|e| format!("could not monitor link opener: {e}"))
 }
 
 /// Add a scheme when the user typed a bare host (`example.com`).
@@ -20,16 +31,43 @@ pub fn normalize_url(raw: &str) -> Option<String> {
     if url.is_empty() {
         return None;
     }
+    if url.chars().any(char::is_control) {
+        return None;
+    }
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("http://")
         || lower.starts_with("https://")
         || lower.starts_with("mailto:")
         || lower.starts_with("file:")
-        || lower.contains("://")
     {
         return Some(url.to_string());
     }
+    if has_explicit_scheme(url) {
+        return None;
+    }
     Some(format!("https://{url}"))
+}
+
+fn has_explicit_scheme(url: &str) -> bool {
+    let Some(colon) = url.find(':') else {
+        return false;
+    };
+    let scheme = &url[..colon];
+    if !scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return false;
+    }
+
+    // A bare hostname may carry a numeric port. It is not a URI scheme even
+    // though both syntaxes use a colon (`localhost:3000/tasks`).
+    let port = url[colon + 1..]
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    port.is_empty() || !port.chars().all(|c| c.is_ascii_digit())
 }
 
 fn platform_command(url: &str) -> Command {
@@ -63,6 +101,10 @@ mod tests {
             Some("https://x.ai/foo".into())
         );
         assert_eq!(normalize_url("mailto:a@b.c"), Some("mailto:a@b.c".into()));
+        assert_eq!(
+            normalize_url("file:///tmp/task.txt"),
+            Some("file:///tmp/task.txt".into())
+        );
     }
 
     #[test]
@@ -76,5 +118,22 @@ mod tests {
     #[test]
     fn rejects_blank() {
         assert_eq!(normalize_url("  "), None);
+    }
+
+    #[test]
+    fn rejects_terminal_controls_and_unapproved_handlers() {
+        assert_eq!(normalize_url("https://example.com/\u{1b}[31m"), None);
+        assert_eq!(normalize_url("javascript://alert"), None);
+        assert_eq!(normalize_url("javascript:alert(1)"), None);
+        assert_eq!(normalize_url("data:text/html,hello"), None);
+        assert_eq!(normalize_url("ssh://example.com"), None);
+    }
+
+    #[test]
+    fn treats_a_bare_host_with_a_port_as_https() {
+        assert_eq!(
+            normalize_url("localhost:3000/tasks"),
+            Some("https://localhost:3000/tasks".into())
+        );
     }
 }

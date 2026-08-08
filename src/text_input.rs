@@ -1,22 +1,25 @@
 //! A one-line editor. Every text field in mach is built from it —
 //! the title, the due date, category names, the command line, the search
-//! box, and each block of a task's body. It works on chars and reports
-//! columns in display width, so wide (CJK) characters land the cursor
-//! correctly.
+//! box, and each block of a task's body. Cursor and selection indices are
+//! Unicode grapheme clusters; display geometry is still measured in cells.
 //!
 //! Selection follows macOS: Shift extends, Option jumps by word, and
 //! Shift+Option+W selects the word under the cursor.
 
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TextInput {
-    chars: Vec<char>,
+    /// Extended grapheme clusters. A visible user-perceived character is
+    /// never split by cursor movement, selection, or deletion.
+    chars: Vec<String>,
     cursor: usize,
     /// Other end of the selection; `None` means a caret only.
     sel_anchor: Option<usize>,
     scroll: usize,
     max_len: usize,
+    max_bytes: usize,
 }
 
 /// What [`TextInput::visible`] hands the UI: text, caret column, and an
@@ -34,7 +37,7 @@ pub struct View {
 pub struct WrappedLine {
     pub text: String,
     pub sel_cols: Option<(u16, u16)>,
-    /// Char range into the full buffer covered by this row.
+    /// Grapheme range into the full buffer covered by this row.
     pub start: usize,
     pub end: usize,
 }
@@ -48,9 +51,9 @@ pub struct WrappedView {
     pub cursor_col: u16,
 }
 
-/// Soft-wrap `chars` into `(start, end)` char ranges of at most `width`
+/// Soft-wrap graphemes into `(start, end)` ranges of at most `width`
 /// display columns. Prefers breaking after a space; otherwise hard-breaks.
-pub fn wrap_breaks(chars: &[char], width: usize) -> Vec<(usize, usize)> {
+pub fn wrap_breaks(chars: &[String], width: usize) -> Vec<(usize, usize)> {
     if chars.is_empty() {
         return vec![(0, 0)];
     }
@@ -62,7 +65,7 @@ pub fn wrap_breaks(chars: &[char], width: usize) -> Vec<(usize, usize)> {
     let mut i = 0usize;
 
     while i < chars.len() {
-        let w = chars[i].width().unwrap_or(0);
+        let w = chars[i].width();
         if w > width {
             // Lone character wider than the field — own row.
             if i > start {
@@ -84,15 +87,12 @@ pub fn wrap_breaks(chars: &[char], width: usize) -> Vec<(usize, usize)> {
             let end = end.max(start + 1);
             lines.push((start, end));
             start = end;
-            while start < chars.len() && chars[start].is_whitespace() {
-                start += 1;
-            }
             i = start;
             col = 0;
             last_ws = None;
             continue;
         }
-        if chars[i].is_whitespace() {
+        if is_whitespace(&chars[i]) {
             last_ws = Some(i);
         }
         col += w;
@@ -107,9 +107,14 @@ pub fn wrap_breaks(chars: &[char], width: usize) -> Vec<(usize, usize)> {
     lines
 }
 
+fn is_whitespace(grapheme: &str) -> bool {
+    !grapheme.is_empty() && grapheme.chars().all(char::is_whitespace)
+}
+
 impl TextInput {
     pub fn new(initial: &str, max_len: usize) -> Self {
-        let chars: Vec<char> = initial.chars().collect();
+        let max_bytes = crate::model::text_byte_limit(max_len);
+        let chars = bounded_graphemes(initial, max_len, max_bytes);
         let cursor = chars.len();
         Self {
             chars,
@@ -117,11 +122,12 @@ impl TextInput {
             sel_anchor: None,
             scroll: 0,
             max_len,
+            max_bytes,
         }
     }
 
     pub fn value(&self) -> String {
-        self.chars.iter().collect()
+        self.chars.concat()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -134,6 +140,12 @@ impl TextInput {
 
     pub fn len(&self) -> usize {
         self.chars.len()
+    }
+
+    pub fn slice(&self, start: usize, end: usize) -> String {
+        let start = start.min(self.chars.len());
+        let end = end.max(start).min(self.chars.len());
+        self.chars[start..end].concat()
     }
 
     pub fn clear_selection(&mut self) {
@@ -157,7 +169,7 @@ impl TextInput {
 
     pub fn selected_text(&self) -> Option<String> {
         let (lo, hi) = self.selection_range()?;
-        Some(self.chars[lo..hi].iter().collect())
+        Some(self.chars[lo..hi].concat())
     }
 
     /// Removes the selected range. Returns true when something was deleted.
@@ -165,9 +177,7 @@ impl TextInput {
         let Some((lo, hi)) = self.selection_range() else {
             return false;
         };
-        self.chars.drain(lo..hi);
-        self.cursor = lo;
-        self.sel_anchor = None;
+        self.replace_range(lo, hi, "");
         true
     }
 
@@ -181,22 +191,22 @@ impl TextInput {
         let i = self.cursor.min(n);
         // Prefer the word containing the caret; if on a boundary, the
         // word to the left; if mid-whitespace, the next word to the right.
-        if i < n && !self.chars[i].is_whitespace() {
+        if i < n && !is_whitespace(&self.chars[i]) {
             let mut start = i;
-            while start > 0 && !self.chars[start - 1].is_whitespace() {
+            while start > 0 && !is_whitespace(&self.chars[start - 1]) {
                 start -= 1;
             }
             let mut end = i;
-            while end < n && !self.chars[end].is_whitespace() {
+            while end < n && !is_whitespace(&self.chars[end]) {
                 end += 1;
             }
             self.sel_anchor = Some(start);
             self.cursor = end;
             return;
         }
-        if i > 0 && !self.chars[i - 1].is_whitespace() {
+        if i > 0 && !is_whitespace(&self.chars[i - 1]) {
             let mut start = i;
-            while start > 0 && !self.chars[start - 1].is_whitespace() {
+            while start > 0 && !is_whitespace(&self.chars[start - 1]) {
                 start -= 1;
             }
             self.sel_anchor = Some(start);
@@ -205,12 +215,12 @@ impl TextInput {
         }
         // Whitespace: walk forward to the next word.
         let mut start = i;
-        while start < n && self.chars[start].is_whitespace() {
+        while start < n && is_whitespace(&self.chars[start]) {
             start += 1;
         }
         if start < n {
             let mut end = start;
-            while end < n && !self.chars[end].is_whitespace() {
+            while end < n && !is_whitespace(&self.chars[end]) {
                 end += 1;
             }
             self.sel_anchor = Some(start);
@@ -220,11 +230,11 @@ impl TextInput {
         // Trailing whitespace only: word to the left.
         if i > 0 {
             let mut end = i;
-            while end > 0 && self.chars[end - 1].is_whitespace() {
+            while end > 0 && is_whitespace(&self.chars[end - 1]) {
                 end -= 1;
             }
             let mut start = end;
-            while start > 0 && !self.chars[start - 1].is_whitespace() {
+            while start > 0 && !is_whitespace(&self.chars[start - 1]) {
                 start -= 1;
             }
             if start < end {
@@ -249,7 +259,7 @@ impl TextInput {
         let mut used = 0;
         let mut cursor = self.scroll;
         for c in &self.chars[self.scroll.min(self.chars.len())..] {
-            let w = c.width().unwrap_or(0);
+            let w = c.width();
             if used + w > col {
                 break;
             }
@@ -270,53 +280,93 @@ impl TextInput {
     /// Cuts everything after the cursor into a new input.
     pub fn split_off_at_cursor(&mut self) -> Self {
         self.clear_selection();
-        let tail: Vec<char> = self.chars.split_off(self.cursor);
+        let tail: Vec<String> = self.chars.split_off(self.cursor);
         Self {
             chars: tail,
             cursor: 0,
             sel_anchor: None,
             scroll: 0,
             max_len: self.max_len,
+            max_bytes: self.max_bytes,
         }
     }
 
-    /// Appends another input's text, leaving the cursor at the join.
-    pub fn append(&mut self, other: &Self) {
+    /// Appends another input's text, leaving the cursor at the join. Returns
+    /// `false` without changing either input when the full join would exceed
+    /// this field's grapheme or byte limit.
+    pub fn append(&mut self, other: &Self) -> bool {
+        let left = self.value();
+        let cursor = left.graphemes(true).count();
+        let right = other.value();
+        if left.len().saturating_add(right.len()) > self.max_bytes {
+            return false;
+        }
+        let joined = left + &right;
+        let chars: Vec<String> = joined.graphemes(true).map(str::to_string).collect();
+        if chars.len() > self.max_len {
+            return false;
+        }
         self.clear_selection();
-        self.cursor = self.chars.len();
-        self.chars.extend_from_slice(&other.chars);
+        self.chars = chars;
+        self.cursor = cursor.min(self.chars.len());
+        self.scroll = self.scroll.min(self.cursor);
+        true
+    }
+
+    fn replace_range(&mut self, lo: usize, hi: usize, replacement: &str) {
+        let lo = lo.min(self.chars.len());
+        let hi = hi.max(lo).min(self.chars.len());
+        let prefix = self.chars[..lo].concat();
+        let suffix = self.chars[hi..].concat();
+        let before_cursor = format!("{prefix}{replacement}");
+        let cursor = before_cursor.graphemes(true).count();
+        let joined = before_cursor + &suffix;
+        self.chars = joined.graphemes(true).map(str::to_string).collect();
+        self.cursor = cursor.min(self.chars.len());
+        self.sel_anchor = None;
+        self.scroll = self.scroll.min(self.cursor);
     }
 
     pub fn insert(&mut self, c: char) {
-        self.delete_selection();
-        if self.chars.len() >= self.max_len {
-            return;
-        }
-        self.chars.insert(self.cursor, c);
-        self.cursor += 1;
+        self.insert_str(&c.to_string());
     }
 
-    /// Inserts a run of text at the cursor. Newlines are flattened; the
-    /// multi-line editors split on them before calling this.
+    /// Inserts a run of text at the cursor. Tab/newline separators are
+    /// flattened, while terminal control bytes are discarded at the input
+    /// boundary so they can never reach the renderer.
     pub fn insert_str(&mut self, text: &str) {
-        self.delete_selection();
-        let mut buf: Vec<char> = text
-            .chars()
-            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-            .collect();
-        if buf.is_empty() {
+        let (lo, hi) = self.selection_range().unwrap_or((self.cursor, self.cursor));
+        let prefix = self.chars[..lo].concat();
+        let suffix = self.chars[hi..].concat();
+        let available = self
+            .max_bytes
+            .saturating_sub(prefix.len().saturating_add(suffix.len()));
+        let mut flattened = String::with_capacity(text.len().min(available));
+        for character in text.chars().filter_map(|character| match character {
+            '\t' | '\n' | '\r' => Some(' '),
+            character if character.is_control() => None,
+            _ => Some(character),
+        }) {
+            if flattened.len().saturating_add(character.len_utf8()) > available {
+                break;
+            }
+            flattened.push(character);
+        }
+        if flattened.is_empty() {
             return;
         }
-        let room = self.max_len.saturating_sub(self.chars.len());
-        if room == 0 {
-            return;
+        let mut accepted = String::new();
+        for grapheme in flattened.graphemes(true) {
+            let candidate = format!("{prefix}{accepted}{grapheme}{suffix}");
+            if candidate.len() > self.max_bytes || candidate.graphemes(true).count() > self.max_len
+            {
+                break;
+            }
+            accepted.push_str(grapheme);
         }
-        if buf.len() > room {
-            buf.truncate(room);
+        if !accepted.is_empty() {
+            self.replace_range(lo, hi, &accepted);
         }
-        let n = buf.len();
-        self.chars.splice(self.cursor..self.cursor, buf);
-        self.cursor += n;
     }
 
     pub fn backspace(&mut self) {
@@ -324,8 +374,7 @@ impl TextInput {
             return;
         }
         if self.cursor > 0 {
-            self.cursor -= 1;
-            self.chars.remove(self.cursor);
+            self.replace_range(self.cursor - 1, self.cursor, "");
         }
     }
 
@@ -334,7 +383,7 @@ impl TextInput {
             return;
         }
         if self.cursor < self.chars.len() {
-            self.chars.remove(self.cursor);
+            self.replace_range(self.cursor, self.cursor + 1, "");
         }
     }
 
@@ -342,15 +391,14 @@ impl TextInput {
         if self.delete_selection() {
             return;
         }
-        self.chars.drain(..self.cursor);
-        self.cursor = 0;
+        self.replace_range(0, self.cursor, "");
     }
 
     pub fn delete_to_end(&mut self) {
         if self.delete_selection() {
             return;
         }
-        self.chars.truncate(self.cursor);
+        self.replace_range(self.cursor, self.chars.len(), "");
     }
 
     pub fn delete_word_left(&mut self) {
@@ -358,8 +406,7 @@ impl TextInput {
             return;
         }
         let target = self.word_left_index();
-        self.chars.drain(target..self.cursor);
-        self.cursor = target;
+        self.replace_range(target, self.cursor, "");
     }
 
     fn move_to(&mut self, pos: usize, extend: bool) {
@@ -425,10 +472,10 @@ impl TextInput {
     /// this to extend a selection across block boundaries.
     pub fn word_left_index(&self) -> usize {
         let mut i = self.cursor;
-        while i > 0 && self.chars[i - 1].is_whitespace() {
+        while i > 0 && is_whitespace(&self.chars[i - 1]) {
             i -= 1;
         }
-        while i > 0 && !self.chars[i - 1].is_whitespace() {
+        while i > 0 && !is_whitespace(&self.chars[i - 1]) {
             i -= 1;
         }
         i
@@ -438,10 +485,10 @@ impl TextInput {
     pub fn word_right_index(&self) -> usize {
         let mut i = self.cursor;
         let n = self.chars.len();
-        while i < n && self.chars[i].is_whitespace() {
+        while i < n && is_whitespace(&self.chars[i]) {
             i += 1;
         }
-        while i < n && !self.chars[i].is_whitespace() {
+        while i < n && !is_whitespace(&self.chars[i]) {
             i += 1;
         }
         i
@@ -465,7 +512,7 @@ impl TextInput {
             if self.cursor < end || (self.cursor == end && row + 1 == breaks.len()) {
                 let col: usize = self.chars[start..self.cursor.min(end)]
                     .iter()
-                    .map(|c| c.width().unwrap_or(0))
+                    .map(|c| c.width())
                     .sum();
                 // When the caret sits exactly at a soft-break and another
                 // row follows, show it at the start of the next row.
@@ -497,7 +544,7 @@ impl TextInput {
         let mut used = 0usize;
         let mut cursor = start;
         for c in &self.chars[start..end] {
-            let w = c.width().unwrap_or(0);
+            let w = c.width();
             if used + w > col {
                 break;
             }
@@ -545,7 +592,7 @@ impl TextInput {
         self.wrapped_with_sel(width, self.selection_range())
     }
 
-    /// Like [`wrapped`], but uses an explicit char-range selection
+    /// Like [`Self::wrapped`], but uses an explicit grapheme-range selection
     /// (for body-level multi-line selections).
     pub fn wrapped_with_sel(&self, width: usize, sel: Option<(usize, usize)>) -> WrappedView {
         self.wrapped_from_breaks(&self.wrap_breaks(width), sel)
@@ -561,7 +608,7 @@ impl TextInput {
         let lines = breaks
             .iter()
             .map(|&(start, end)| {
-                let text: String = self.chars[start..end].iter().collect();
+                let text = self.chars[start..end].concat();
                 let sel_cols = sel.and_then(|(lo, hi)| {
                     let vis_lo = lo.max(start);
                     let vis_hi = hi.min(end);
@@ -571,7 +618,7 @@ impl TextInput {
                     let col = |idx: usize| -> u16 {
                         self.chars[start..idx]
                             .iter()
-                            .map(|c| c.width().unwrap_or(0))
+                            .map(|c| c.width())
                             .sum::<usize>() as u16
                     };
                     Some((col(vis_lo), col(vis_hi)))
@@ -600,7 +647,7 @@ impl TextInput {
 
     /// Text to draw in a field `width` columns wide, the cursor's column
     /// within that field, and the selection's column span when it overlaps.
-    /// Single-row fields (title, status) use this; body uses [`wrapped`].
+    /// Single-row fields (title, status) use this; body uses [`Self::wrapped`].
     pub fn visible(&mut self, width: usize) -> View {
         if width == 0 {
             return View {
@@ -617,7 +664,7 @@ impl TextInput {
         loop {
             let used: usize = self.chars[self.scroll..self.cursor]
                 .iter()
-                .map(|c| c.width().unwrap_or(0))
+                .map(|c| c.width())
                 .sum();
             if used <= width || self.scroll >= self.cursor {
                 break;
@@ -628,17 +675,17 @@ impl TextInput {
         let mut used = 0usize;
         let mut end_idx = self.scroll;
         for c in &self.chars[self.scroll..] {
-            let w = c.width().unwrap_or(0);
+            let w = c.width();
             if used + w > width {
                 break;
             }
             used += w;
-            text.push(*c);
+            text.push_str(c);
             end_idx += 1;
         }
         let cursor_col: usize = self.chars[self.scroll..self.cursor]
             .iter()
-            .map(|c| c.width().unwrap_or(0))
+            .map(|c| c.width())
             .sum();
 
         let sel_cols = self.selection_range().and_then(|(lo, hi)| {
@@ -650,7 +697,7 @@ impl TextInput {
             let col = |idx: usize| -> u16 {
                 self.chars[self.scroll..idx]
                     .iter()
-                    .map(|c| c.width().unwrap_or(0))
+                    .map(|c| c.width())
                     .sum::<usize>() as u16
             };
             Some((col(vis_lo), col(vis_hi)))
@@ -662,6 +709,19 @@ impl TextInput {
             sel_cols,
         }
     }
+}
+
+fn bounded_graphemes(value: &str, max_len: usize, max_bytes: usize) -> Vec<String> {
+    let mut result = Vec::with_capacity(value.len().min(max_len));
+    let mut bytes = 0usize;
+    for grapheme in value.graphemes(true).take(max_len) {
+        if bytes.saturating_add(grapheme.len()) > max_bytes {
+            break;
+        }
+        bytes += grapheme.len();
+        result.push(grapheme.to_string());
+    }
+    result
 }
 
 #[cfg(test)]
@@ -706,6 +766,28 @@ mod tests {
     }
 
     #[test]
+    fn combining_sequences_cannot_bypass_the_byte_limit() {
+        let mut typed = TextInput::new("", 1);
+        typed.insert('e');
+        for _ in 0..1_000 {
+            typed.insert('\u{301}');
+        }
+        assert_eq!(typed.len(), 1);
+        assert!(typed.value().len() <= crate::model::text_byte_limit(1));
+
+        let pasted = format!("e{}", "\u{301}".repeat(1_000));
+        let pasted = TextInput::new(&pasted, 1);
+        assert!(pasted.value().len() <= crate::model::text_byte_limit(1));
+    }
+
+    #[test]
+    fn appending_inputs_preserves_the_same_limits_as_typing() {
+        let mut input = TextInput::new("a", 1);
+        assert!(!input.append(&TextInput::new("b", 1)));
+        assert_eq!(input.value(), "a");
+    }
+
+    #[test]
     fn scrolls_to_keep_the_cursor_in_view() {
         let mut i = input("abcdefghij");
         let view = i.visible(4);
@@ -723,6 +805,49 @@ mod tests {
         let view = i.visible(4);
         assert_eq!(view.text, "买菜");
         assert_eq!(view.cursor_col, 4);
+    }
+
+    #[test]
+    fn cursor_and_deletion_treat_combining_sequences_as_one_grapheme() {
+        let mut i = input("e\u{301}x");
+        assert_eq!(i.len(), 2);
+        i.left();
+        i.backspace();
+        assert_eq!(i.value(), "x");
+        assert_eq!(i.cursor(), 0);
+    }
+
+    #[test]
+    fn cursor_and_selection_do_not_split_zwj_emoji() {
+        let family = "👨‍👩‍👧‍👦";
+        let mut i = input(&format!("{family}!"));
+        assert_eq!(i.len(), 2);
+        i.home();
+        i.select_right();
+        assert_eq!(i.selected_text().as_deref(), Some(family));
+        i.delete_selection();
+        assert_eq!(i.value(), "!");
+    }
+
+    #[test]
+    fn paste_keeps_graphemes_but_strips_terminal_controls() {
+        let family = "👨‍👩‍👧‍👦";
+        let mut i = TextInput::new("", 64);
+        i.insert_str(&format!("e\u{301}\t{family}\u{1b}\u{7f}\u{85}!"));
+
+        assert_eq!(i.value(), format!("e\u{301} {family}!"));
+        assert_eq!(i.len(), 4);
+        assert!(!i.value().chars().any(char::is_control));
+    }
+
+    #[test]
+    fn separately_typed_combining_marks_merge_with_the_previous_grapheme() {
+        let mut i = TextInput::new("", 1);
+        i.insert('e');
+        i.insert('\u{301}');
+
+        assert_eq!(i.value(), "e\u{301}");
+        assert_eq!(i.len(), 1);
     }
 
     #[test]
@@ -758,16 +883,37 @@ mod tests {
 
     #[test]
     fn wraps_on_spaces_then_hard_breaks() {
-        let s: Vec<char> = "one two three".chars().collect();
-        let breaks = wrap_breaks(&s, 8);
-        let parts: Vec<String> = breaks
-            .iter()
-            .map(|&(a, b)| s[a..b].iter().collect())
+        let s: Vec<String> = "one two three"
+            .graphemes(true)
+            .map(str::to_string)
             .collect();
+        let breaks = wrap_breaks(&s, 8);
+        let parts: Vec<String> = breaks.iter().map(|&(a, b)| s[a..b].concat()).collect();
         // width 8 fits "one two " then "three"
         assert!(parts.len() >= 2);
         assert!(parts[0].starts_with("one"));
         assert!(parts.iter().any(|p| p.contains("three")));
+    }
+
+    #[test]
+    fn wrap_ranges_preserve_every_space_and_accept_every_caret_position() {
+        let mut input = input("word   next");
+        let breaks = input.wrap_breaks(5);
+        assert_eq!(breaks.first().map(|range| range.0), Some(0));
+        assert_eq!(breaks.last().map(|range| range.1), Some(input.len()));
+        assert!(breaks.windows(2).all(|pair| pair[0].1 == pair[1].0));
+        assert_eq!(
+            breaks
+                .iter()
+                .map(|&(start, end)| input.slice(start, end))
+                .collect::<String>(),
+            input.value()
+        );
+
+        for cursor in 0..=input.len() {
+            input.set_cursor(cursor);
+            let _ = input.wrap_cursor_from_breaks(&breaks);
+        }
     }
 
     #[test]

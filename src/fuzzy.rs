@@ -1,5 +1,9 @@
 //! Subsequence fuzzy scoring for type-to-jump navigation.
 
+fn folded(value: &str) -> Vec<char> {
+    crate::model::caseless_key(value).chars().collect()
+}
+
 /// Score how well `query` fuzzy-matches `text` (case-insensitive).
 /// Higher is better. `None` if `query` is not a subsequence of `text`.
 pub fn score(query: &str, text: &str) -> Option<i32> {
@@ -8,7 +12,7 @@ pub fn score(query: &str, text: &str) -> Option<i32> {
     }
 
     // Query is short (typeahead); materialize once. Text is streamed.
-    let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    let q = folded(query);
     let mut qi = 0;
     let mut total = 0i32;
     let mut prev_match: Option<usize> = None;
@@ -16,7 +20,7 @@ pub fn score(query: &str, text: &str) -> Option<i32> {
     let mut prev_char: Option<char> = None;
     let mut t_len = 0usize;
 
-    for (ti, tc) in text.chars().flat_map(char::to_lowercase).enumerate() {
+    for (ti, tc) in folded(text).into_iter().enumerate() {
         t_len = ti + 1;
         if qi < q.len() && tc == q[qi] {
             let mut points = 1;
@@ -92,6 +96,13 @@ mod tests {
     fn case_insensitive() {
         assert!(score("Mi", "milk").is_some());
         assert_eq!(best_index("MI", ["alpha", "Milk", "beta"]), Some(1));
+    }
+
+    #[test]
+    fn case_insensitive_matching_uses_unicode_equivalence() {
+        assert!(score("MASSE", "Maße").is_some());
+        assert!(score("é", "e\u{301}").is_some());
+        assert!(score("strs", "Straße").is_some());
     }
 
     #[test]

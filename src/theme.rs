@@ -82,28 +82,104 @@ fn rgb_of(color: Color) -> (u8, u8, u8) {
 
 pub struct Theme {
     pub accent: Color,
+    high_contrast_selection: bool,
+    colors_disabled: bool,
 }
 
 impl Theme {
     pub fn new(name: &str) -> Self {
+        let colors_disabled = std::env::var_os("NO_COLOR").is_some()
+            || std::env::var("TERM").is_ok_and(|term| term == "dumb");
+        let light = terminal_background_is_light();
+        Self::with_environment(name, colors_disabled, light)
+    }
+
+    pub fn with_environment(name: &str, colors_disabled: bool, light_background: bool) -> Self {
+        let accent = if colors_disabled {
+            Color::Reset
+        } else if light_background {
+            Color::Indexed(match name {
+                "red" => 124,
+                "yellow" => 136,
+                "green" => 28,
+                "cyan" => 30,
+                "blue" => 25,
+                "purple" => 91,
+                "white" => 238,
+                "black" => 16,
+                _ => 25,
+            })
+        } else {
+            color(name)
+        };
         Self {
-            accent: color(name),
+            accent,
+            high_contrast_selection: colors_disabled || light_background,
+            colors_disabled,
+        }
+    }
+
+    pub fn muted_color(&self) -> Color {
+        if self.colors_disabled {
+            Color::Reset
+        } else {
+            GREY
+        }
+    }
+
+    pub fn error_color(&self) -> Color {
+        if self.colors_disabled {
+            Color::Reset
+        } else {
+            RED
+        }
+    }
+
+    pub fn success_color(&self) -> Color {
+        if self.colors_disabled {
+            Color::Reset
+        } else {
+            GREEN
+        }
+    }
+
+    pub fn selection_wash(&self) -> Color {
+        if self.colors_disabled {
+            Color::Reset
+        } else {
+            tint(self.accent)
+        }
+    }
+
+    pub fn dimmed_accent(&self) -> Color {
+        if self.colors_disabled {
+            Color::Reset
+        } else {
+            dimmed(self.accent)
         }
     }
 
     /// Style of the selected row: a wash of the accent behind it, with
     /// the text keeping whatever colour it already had.
     pub fn selection(&self) -> Style {
-        Style::new()
-            .bg(tint(self.accent))
-            .add_modifier(Modifier::BOLD)
+        if self.high_contrast_selection {
+            Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::new()
+                .bg(self.selection_wash())
+                .add_modifier(Modifier::BOLD)
+        }
     }
 
     /// Style of the selected row when its panel does not have focus.
     /// Keeps the accent wash so the active category stays obvious while
     /// the Tasks panel has keyboard focus; bold is reserved for focus.
     pub fn selection_unfocused(&self) -> Style {
-        Style::new().bg(tint(self.accent))
+        if self.high_contrast_selection {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().bg(self.selection_wash())
+        }
     }
 
     pub fn accent_text(&self) -> Style {
@@ -112,5 +188,51 @@ impl Theme {
 
     pub fn plain(&self) -> Style {
         Style::new()
+    }
+}
+
+fn terminal_background_is_light() -> bool {
+    let Ok(value) = std::env::var("COLORFGBG") else {
+        return false;
+    };
+    value
+        .split([';', ':'])
+        .next_back()
+        .and_then(|value| value.parse::<u8>().ok())
+        .is_some_and(|background| matches!(background, 7 | 10..=15))
+}
+
+pub fn reduced_motion() -> bool {
+    std::env::var("MACH_REDUCED_MOTION").is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_color_and_light_terminals_use_contrast_instead_of_rgb_washes() {
+        let no_color = Theme::with_environment("cyan", true, false);
+        assert_eq!(no_color.accent, Color::Reset);
+        assert!(
+            no_color
+                .selection()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(no_color.muted_color(), Color::Reset);
+        assert_eq!(no_color.error_color(), Color::Reset);
+        assert_eq!(no_color.success_color(), Color::Reset);
+        assert_eq!(no_color.selection_wash(), Color::Reset);
+        assert_eq!(no_color.dimmed_accent(), Color::Reset);
+
+        let light = Theme::with_environment("white", false, true);
+        assert_eq!(light.accent, Color::Indexed(238));
+        assert!(light.selection().add_modifier.contains(Modifier::REVERSED));
     }
 }

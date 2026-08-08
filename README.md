@@ -26,23 +26,41 @@ Crate name **`mach-tui`**, binary **`mach`**.
 
 ## CLI
 
-`mach` with no args opens the TUI. Subcommands cover add / list / edit /
-done / delete / categories / subtasks and more, with flags for due dates,
-importance, category, body markup, and `--json` for scripts.
+`mach` with no args opens the TUI. The same store is available through stable
+CLI commands for humans and agents:
 
 ```sh
-mach --help
+mach add "Review release" --due 8-12 --time 16:00 --category Work --importance 2
+mach --json list --open
+mach move TASK_ID --before OTHER_TASK_ID
+mach purge --done --category Work
 ```
 
-Agents work well against the same CLI — stable flags, unique ID prefixes,
-and JSON output when you need it.
+Task arguments accept a full ID or an unambiguous prefix. `move` preserves the
+task's category, and permanent bulk deletion requires the explicit
+`purge --done` interlock. In `--json` mode every invocation writes exactly one
+JSON document to stdout; failures use a non-zero exit status and put no prose
+around that document. Run `mach --help` for the full task, category, body-markup,
+subtask, due-date, and update contract.
 
 ## Data
 
-Lives in **`~/.mach`** as plain JSON. Back it up however you back up
-anything else.
+Tasks, categories, settings, and attachment metadata live in SQLite at
+**`~/.mach/mach.db`**. When an image is added, mach validates it, copies it into
+**`~/.mach/images`**, and stores an immutable SHA-256 attachment ID in the task;
+identical images share one managed file, so the original source can move or be
+deleted afterward. Writes use full-sync WAL transactions and a monotonic
+revision, so concurrent CLI and TUI processes serialize mutations against fresh
+state and the TUI reloads committed changes.
 
-Another folder: `--dir PATH` or `MACH_DIR`.
+The first time a data directory is opened after upgrading, mach transactionally
+imports any legacy `tasks.json`, `categories.json`, and `settings.json` once,
+including copying legacy image references into managed attachments. Those JSON
+files are left untouched after a successful import.
+
+Another folder: `--dir PATH` or `MACH_DIR`; its database is `PATH/mach.db`.
+For a filesystem-level backup, copy the whole data directory while mach is not
+writing, or use a SQLite-aware backup tool so WAL data is included.
 
 ## License
 

@@ -42,7 +42,7 @@ const fn heading(left: &'static str, right: &'static str) -> HelpRow {
 }
 
 /// Two-column key reference. Empty strings are gaps.
-pub const HELP_COLUMNS: [HelpRow; 14] = [
+pub const HELP_COLUMNS: [HelpRow; 16] = [
     heading("MOVING AROUND", "TASKS & CATEGORIES"),
     row(
         "← →          between the two panels",
@@ -52,6 +52,7 @@ pub const HELP_COLUMNS: [HelpRow; 14] = [
         "↑ ↓          within a panel",
         "Enter        edit in the preview",
     ),
+    row("⌥↑ ⌥↓       reorder in manual view", ""),
     row("PgUp PgDn    top / bottom", "Space        tick a task off"),
     row(
         "Tab          the other panel",
@@ -61,11 +62,15 @@ pub const HELP_COLUMNS: [HelpRow; 14] = [
     row("Esc          back out", "Ctrl+C ×2    quit"),
     row("Mouse        click, double-click, scroll", ""),
     row("", ""),
-    heading("COMMANDS  (press /)", "PREVIEW  (Enter · always on)"),
+    heading(
+        "COMMANDS  (press /)",
+        "PREVIEW  (Enter · when space allows)",
+    ),
     row(
         "/search  /settings  /help",
         "Tab ⇧Tab     next / previous field",
     ),
+    row("", "← → Space    choose category / flags"),
     row(
         "/copy  /copytitle · /done",
         "Enter        calendar · new line · open",

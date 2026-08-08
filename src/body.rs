@@ -5,7 +5,9 @@
 //! link, or copies the text out. Backspace at the head of a list item
 //! turns it back into prose.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::model::{
     Block, MAX_BODY_LINES, MAX_CATEGORY_DESC_LINE_LEN, MAX_CATEGORY_DESC_LINES, MAX_NOTES_LINE_LEN,
@@ -177,14 +179,14 @@ impl Line {
         }
     }
 
-    fn height(&self, width: usize, number: Option<usize>) -> u16 {
+    fn height(&self, width: usize, number: Option<usize>) -> usize {
         match self {
-            Self::Image { .. } => IMAGE_ROWS,
+            Self::Image { .. } => usize::from(IMAGE_ROWS),
             line => {
                 let indent = number.map(number_indent).unwrap_or_else(|| line.indent());
                 let field = width.saturating_sub(indent).max(1);
                 line.input_ref()
-                    .map(|t| t.wrap_height(field) as u16)
+                    .map(|t| t.wrap_height(field))
                     .unwrap_or(1)
                     .max(1)
             }
@@ -194,13 +196,13 @@ impl Line {
 
 /// If `text` is an image path once newlines are removed, return the flat
 /// path; otherwise `None` (keep multi-line paste as separate lines).
-fn flatten_if_image_path(text: &str) -> Option<String> {
+fn flatten_if_image_path(text: &str, images_root: &std::path::Path) -> Option<String> {
     if !text.contains('\n') && !text.contains('\r') {
         return None;
     }
     let flat: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
     let flat = flat.trim();
-    crate::image::path_if_image(flat).map(|_| flat.to_string())
+    crate::image::path_if_image_in(flat, images_root).map(|_| flat.to_string())
 }
 
 /// Pull a URL out of a markdown `[label](url)` line, or keep the text.
@@ -265,25 +267,42 @@ fn line_from_block(block: &Block, line_max_len: usize) -> Line {
         Block::Bullet { text } => Line::Bullet(TextInput::new(text, line_max_len)),
         Block::Number { text } => Line::Number(TextInput::new(text, line_max_len)),
         Block::Link { url } => Line::Link(TextInput::new(url, line_max_len)),
-        Block::Image { path } => Line::Image { path: path.clone() },
+        Block::Image { attachment_id } => Line::Image {
+            path: attachment_id.clone(),
+        },
     }
+}
+
+fn resolve_image_reference(
+    reference: &str,
+    image_root: &Path,
+    attachments: &crate::image::AttachmentCatalog,
+) -> PathBuf {
+    attachments.resolve(reference, image_root)
 }
 
 /// Visible slice of a block inside a scrolled viewport: `(y, rows, skip_top)`.
 /// `skip_top` is how many of the block's own rows sit above the viewport
 /// (for trimming wrap lines / shrinking pictures from the top).
-fn visible_band(start: u16, rows: u16, scroll: u16, height: u16) -> Option<(u16, u16, u16)> {
+fn visible_band(
+    start: usize,
+    rows: usize,
+    scroll: usize,
+    height: u16,
+) -> Option<(u16, u16, usize)> {
     if rows == 0 || height == 0 {
         return None;
     }
+    let height = usize::from(height);
     let end = start.saturating_add(rows);
-    if end <= scroll || start >= scroll.saturating_add(height) {
+    let viewport_end = scroll.saturating_add(height);
+    if end <= scroll || start >= viewport_end {
         return None;
     }
     let vis_start = start.max(scroll);
-    let vis_end = end.min(scroll.saturating_add(height));
-    let y = vis_start - scroll;
-    let vis_rows = vis_end - vis_start;
+    let vis_end = end.min(viewport_end);
+    let y = (vis_start - scroll) as u16;
+    let vis_rows = (vis_end - vis_start) as u16;
     let skip = vis_start - start;
     (vis_rows > 0).then_some((y, vis_rows, skip))
 }
@@ -344,23 +363,25 @@ pub struct Placed {
 pub struct BodyEditor {
     lines: Vec<Line>,
     cursor: usize,
-    scroll: u16,
+    scroll: usize,
     pub menu: Option<SlashMenu>,
     /// Prose only: no `/` menu, no pictures. Categories use this.
     plain: bool,
     /// Cap on how many blocks may be added (existing oversize files stay).
     max_lines: usize,
-    /// Cap passed to each line's [`TextInput`].
+    /// Cap passed to each line's [`crate::text_input::TextInput`].
     line_max_len: usize,
     /// Last body width used for layout (for wrap / click / vertical move).
     layout_width: usize,
-    /// Total content rows from the last [`layout`] (for the scrollbar).
-    content_height: u16,
+    /// Total content rows from the last [`Self::layout`] (for the scrollbar).
+    content_height: usize,
     /// Preferred display column when moving up/down across wrap rows.
     prefer_col: u16,
-    /// Body-level selection anchor `(line, char)`. Cursor is the other end.
+    /// Body-level selection anchor `(line, grapheme)`. Cursor is the other end.
     /// Used for Shift(+Option) motions that can span multiple lines.
     sel_anchor: Option<(usize, usize)>,
+    image_root: PathBuf,
+    attachments: crate::image::AttachmentCatalog,
 }
 
 impl BodyEditor {
@@ -406,6 +427,8 @@ impl BodyEditor {
             content_height: 0,
             prefer_col: u16::MAX,
             sel_anchor: None,
+            image_root: crate::image::default_images_root(),
+            attachments: crate::image::AttachmentCatalog::default(),
         };
         // Turn bare image paths in the body into picture blocks.
         if !plain {
@@ -416,6 +439,26 @@ impl BodyEditor {
 
     fn can_add_lines(&self, n: usize) -> bool {
         self.lines.len().saturating_add(n) <= self.max_lines
+    }
+
+    fn line_text_fits(&self, text: &str) -> bool {
+        text.len() <= crate::model::text_byte_limit(self.line_max_len)
+            && text.graphemes(true).count() <= self.line_max_len
+    }
+
+    pub fn set_image_root(&mut self, image_root: PathBuf) {
+        self.image_root = image_root;
+        if !self.plain {
+            self.adopt_pasted_paths();
+        }
+    }
+
+    pub fn set_attachments(&mut self, attachments: &[crate::store::Attachment]) {
+        self.attachments.set(attachments);
+    }
+
+    pub fn image_root(&self) -> &std::path::Path {
+        &self.image_root
     }
 
     fn empty_line(&self) -> Line {
@@ -587,7 +630,11 @@ impl BodyEditor {
             | Line::Bullet(t)
             | Line::Number(t)
             | Line::Link(t) => t.selected_text().map(CopyPayload::Text),
-            Line::Image { path } => Some(CopyPayload::Image(crate::image::expand(path))),
+            Line::Image { path } => Some(CopyPayload::Image(resolve_image_reference(
+                path,
+                &self.image_root,
+                &self.attachments,
+            ))),
         }
     }
 
@@ -650,16 +697,20 @@ impl BodyEditor {
             if self.is_image_line(al) {
                 // Unreachable via ordered_selection (a == b), but keep safe.
                 if let Line::Image { path } = &self.lines[al] {
-                    out.push(CopyLine::Image(crate::image::expand(path)));
+                    out.push(CopyLine::Image(resolve_image_reference(
+                        path,
+                        &self.image_root,
+                        &self.attachments,
+                    )));
                 }
                 return out;
             }
             let s = self.line_text_value(al);
-            let chars: Vec<char> = s.chars().collect();
+            let chars: Vec<&str> = s.graphemes(true).collect();
             let lo = ac.min(chars.len());
             let hi = bc.min(chars.len());
             if lo < hi {
-                out.push(CopyLine::Text(chars[lo..hi].iter().collect()));
+                out.push(CopyLine::Text(chars[lo..hi].concat()));
             }
             return out;
         }
@@ -675,7 +726,11 @@ impl BodyEditor {
         // End line: start through bc. Picture at the caret is included whole.
         if self.is_image_line(bl) {
             if let Line::Image { path } = &self.lines[bl] {
-                out.push(CopyLine::Image(crate::image::expand(path)));
+                out.push(CopyLine::Image(resolve_image_reference(
+                    path,
+                    &self.image_root,
+                    &self.attachments,
+                )));
             }
         } else if let Some(line) = self.copy_line_slice(bl, None, Some(bc)) {
             out.push(line);
@@ -692,20 +747,24 @@ impl BodyEditor {
         to: Option<usize>,
     ) -> Option<CopyLine> {
         match &self.lines[i] {
-            Line::Image { path } => Some(CopyLine::Image(crate::image::expand(path))),
+            Line::Image { path } => Some(CopyLine::Image(resolve_image_reference(
+                path,
+                &self.image_root,
+                &self.attachments,
+            ))),
             Line::Link(t) => {
                 let s = t.value();
-                let chars: Vec<char> = s.chars().collect();
+                let chars: Vec<&str> = s.graphemes(true).collect();
                 let lo = from.unwrap_or(0).min(chars.len());
                 let hi = to.unwrap_or(chars.len()).min(chars.len());
-                (lo < hi).then(|| CopyLine::Link(chars[lo..hi].iter().collect()))
+                (lo < hi).then(|| CopyLine::Link(chars[lo..hi].concat()))
             }
             Line::Text(t) | Line::Bullet(t) | Line::Number(t) | Line::Todo { text: t, .. } => {
                 let s = t.value();
-                let chars: Vec<char> = s.chars().collect();
+                let chars: Vec<&str> = s.graphemes(true).collect();
                 let lo = from.unwrap_or(0).min(chars.len());
                 let hi = to.unwrap_or(chars.len()).min(chars.len());
-                (lo < hi).then(|| CopyLine::Text(chars[lo..hi].iter().collect()))
+                (lo < hi).then(|| CopyLine::Text(chars[lo..hi].concat()))
             }
         }
     }
@@ -757,13 +816,14 @@ impl BodyEditor {
                 // One line: cut the selected range out and rebuild the
                 // line, keeping whatever kind it was.
                 if let Some(input) = self.lines[al].input() {
-                    let mut chars: Vec<char> = input.value().chars().collect();
+                    let value = input.value();
+                    let mut chars: Vec<&str> = value.graphemes(true).collect();
                     let lo = ac.min(bc).min(chars.len());
                     let hi = ac.max(bc).min(chars.len());
                     if lo < hi {
                         chars.drain(lo..hi);
                     }
-                    let text: String = chars.iter().collect();
+                    let text = chars.concat();
                     let len = self.line_max_len;
                     self.lines[al] = self.line_with_text(al, &text, len);
                     if let Some(input) = self.lines[al].input() {
@@ -783,8 +843,8 @@ impl BodyEditor {
                 } else {
                     self.line_text_value(bl)
                 };
-                let sc: Vec<char> = start_s.chars().collect();
-                let ec: Vec<char> = end_s.chars().collect();
+                let sc: Vec<&str> = start_s.graphemes(true).collect();
+                let ec: Vec<&str> = end_s.graphemes(true).collect();
                 let ac = if self.is_image_line(al) {
                     0
                 } else {
@@ -795,8 +855,10 @@ impl BodyEditor {
                 } else {
                     bc.min(ec.len())
                 };
-                let mut merged: String = sc[..ac].iter().collect();
-                merged.extend(ec[bc..].iter());
+                let merged = format!("{}{}", sc[..ac].concat(), ec[bc..].concat());
+                if !self.line_text_fits(&merged) {
+                    return false;
+                }
                 let len = self.line_max_len;
                 self.lines[al] = self.line_with_text(al, &merged, len);
                 // Remove lines al+1 ..= bl
@@ -848,9 +910,50 @@ impl BodyEditor {
         }
     }
 
+    /// URL under a rendered body cell. Padding to the right of a short link
+    /// is deliberately not interactive.
+    pub fn link_url_at_position(&self, row: u16, col: usize) -> Option<String> {
+        use unicode_width::UnicodeWidthStr;
+
+        let width = self.layout_width.max(1);
+        let numbers = number_runs(&self.lines);
+        let target = self.scroll.saturating_add(usize::from(row));
+        let mut at = 0usize;
+        for (index, line) in self.lines.iter().enumerate() {
+            let height = line.height(width, numbers[index]);
+            if target >= at.saturating_add(height) {
+                at = at.saturating_add(height);
+                continue;
+            }
+            let Line::Link(input) = line else {
+                return None;
+            };
+            let row_in = target.saturating_sub(at);
+            let indent = line.indent();
+            let field = width.saturating_sub(indent).max(1);
+            let breaks = input.wrap_breaks(field);
+            let &(start, end) = breaks.get(row_in)?;
+            let text = input.slice(start, end);
+            let text_width = text.width();
+            let on_marker = row_in == 0 && col < indent;
+            let on_text = col >= indent && col < indent.saturating_add(text_width);
+            if !on_marker && !on_text {
+                return None;
+            }
+            let url = input.value();
+            let url = url.trim();
+            return (!url.is_empty()).then(|| url.to_string());
+        }
+        None
+    }
+
     pub fn selected_image(&self) -> Option<PathBuf> {
         match &self.lines[self.cursor] {
-            Line::Image { path } => Some(crate::image::expand(path)),
+            Line::Image { path } => Some(resolve_image_reference(
+                path,
+                &self.image_root,
+                &self.attachments,
+            )),
             _ => None,
         }
     }
@@ -860,7 +963,11 @@ impl BodyEditor {
         self.lines
             .iter()
             .filter_map(|l| match l {
-                Line::Image { path } => Some(crate::image::expand(path)),
+                Line::Image { path } => Some(resolve_image_reference(
+                    path,
+                    &self.image_root,
+                    &self.attachments,
+                )),
                 _ => None,
             })
             .collect()
@@ -901,7 +1008,9 @@ impl BodyEditor {
 
     pub fn insert(&mut self, c: char) {
         // Typing over a selection replaces it.
-        self.delete_body_selection();
+        if self.has_selection() && !self.delete_body_selection() {
+            return;
+        }
         if self.input().is_none() {
             // Typing next to a picture starts a line under it.
             self.insert_block(Block::text(""));
@@ -914,7 +1023,7 @@ impl BodyEditor {
             && let Line::Text(text) = &self.lines[self.cursor]
         {
             let v = text.value();
-            if text.cursor() == v.chars().count() {
+            if text.cursor() == v.graphemes(true).count() {
                 if matches!(v.as_str(), "- " | "* ") {
                     self.lines[self.cursor] = Line::Bullet(TextInput::new("", self.line_max_len));
                     return;
@@ -951,12 +1060,13 @@ impl BodyEditor {
 
     pub fn insert_str(&mut self, text: &str) {
         self.close_menu();
-        let _ = self.delete_body_selection();
+        if self.has_selection() && !self.delete_body_selection() {
+            return;
+        }
         // Paste may wrap a long path across lines; flatten if it is one image path.
-        let text = if let Some(flat) = flatten_if_image_path(text) {
-            flat
-        } else {
-            text.to_string()
+        let text = match flatten_if_image_path(text, &self.image_root) {
+            Some(flat) if self.line_text_fits(&flat) => flat,
+            _ => text.to_string(),
         };
         for (i, part) in text.split('\n').enumerate() {
             if i > 0 && !self.newline() {
@@ -1016,7 +1126,11 @@ impl BodyEditor {
                 menu.index = 0;
             }
         }
+        let had_selection = self.has_selection();
         if self.delete_body_selection() {
+            return;
+        }
+        if had_selection {
             return;
         }
         match self.line() {
@@ -1050,15 +1164,19 @@ impl BodyEditor {
         }
         let current = self.lines.remove(self.cursor);
         self.cursor -= 1;
-        match (self.lines[self.cursor].input(), current) {
-            (Some(previous), Line::Text(text)) => previous.append(&text),
-            // Above is a picture: the emptied line simply goes away.
-            (None, Line::Text(text)) if text.is_empty() => {}
-            (None, line) => {
-                self.cursor += 1;
-                self.lines.insert(self.cursor, line);
+        match current {
+            Line::Text(text) => {
+                let merged = match self.lines[self.cursor].input() {
+                    Some(previous) => previous.append(&text),
+                    // Above is a picture: an empty spacer can disappear.
+                    None => text.is_empty(),
+                };
+                if !merged {
+                    self.cursor += 1;
+                    self.lines.insert(self.cursor, Line::Text(text));
+                }
             }
-            (Some(_), line) => {
+            line => {
                 self.cursor += 1;
                 self.lines.insert(self.cursor, line);
             }
@@ -1066,7 +1184,12 @@ impl BodyEditor {
     }
 
     pub fn delete(&mut self) {
+        self.close_menu();
+        let had_selection = self.has_selection();
         if self.delete_body_selection() {
+            return;
+        }
+        if had_selection {
             return;
         }
         if matches!(self.line(), Line::Image { .. }) {
@@ -1084,16 +1207,14 @@ impl BodyEditor {
             return;
         }
         let next = self.lines.remove(self.cursor + 1);
-        match (self.lines[self.cursor].input(), next) {
-            (
-                Some(current),
-                Line::Text(text)
-                | Line::Todo { text, .. }
-                | Line::Bullet(text)
-                | Line::Number(text)
-                | Line::Link(text),
-            ) => current.append(&text),
-            (_, line) => self.lines.insert(self.cursor + 1, line),
+        let merged = match next.input_ref() {
+            Some(text) => self.lines[self.cursor]
+                .input()
+                .is_some_and(|current| current.append(text)),
+            None => false,
+        };
+        if !merged {
+            self.lines.insert(self.cursor + 1, next);
         }
     }
 
@@ -1128,6 +1249,7 @@ impl BodyEditor {
     }
 
     pub fn up(&mut self) {
+        self.close_menu();
         self.clear_body_selection();
         // Already on a picture: leave it upward (may insert a blank above).
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
@@ -1169,6 +1291,7 @@ impl BodyEditor {
     }
 
     pub fn down(&mut self) {
+        self.close_menu();
         self.clear_body_selection();
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
             self.leave_image_forward();
@@ -1208,6 +1331,7 @@ impl BodyEditor {
     }
 
     pub fn left(&mut self) {
+        self.close_menu();
         self.prefer_col = u16::MAX;
         self.clear_body_selection();
         // On a picture there is no text caret — ← steps into the line above
@@ -1234,6 +1358,7 @@ impl BodyEditor {
     }
 
     pub fn right(&mut self) {
+        self.close_menu();
         self.prefer_col = u16::MAX;
         self.clear_body_selection();
         // On a picture there is no text caret — → steps into a line below
@@ -1301,6 +1426,7 @@ impl BodyEditor {
     }
 
     pub fn home(&mut self) {
+        self.close_menu();
         self.clear_body_selection();
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
             self.leave_image_backward();
@@ -1312,6 +1438,7 @@ impl BodyEditor {
     }
 
     pub fn end(&mut self) {
+        self.close_menu();
         self.clear_body_selection();
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
             self.leave_image_forward();
@@ -1323,6 +1450,7 @@ impl BodyEditor {
     }
 
     pub fn word_left(&mut self) {
+        self.close_menu();
         self.clear_body_selection();
         self.prefer_col = u16::MAX;
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
@@ -1347,6 +1475,7 @@ impl BodyEditor {
     }
 
     pub fn word_right(&mut self) {
+        self.close_menu();
         self.clear_body_selection();
         self.prefer_col = u16::MAX;
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
@@ -1380,6 +1509,7 @@ impl BodyEditor {
     }
 
     pub fn select_word(&mut self) {
+        self.close_menu();
         self.sel_anchor = None;
         if let Some(input) = self.input() {
             input.select_word();
@@ -1387,6 +1517,7 @@ impl BodyEditor {
     }
 
     pub fn select_left(&mut self) {
+        self.close_menu();
         self.prefer_col = u16::MAX;
         self.ensure_sel_anchor();
         if let Some(input) = self.input() {
@@ -1409,6 +1540,7 @@ impl BodyEditor {
     }
 
     pub fn select_right(&mut self) {
+        self.close_menu();
         self.prefer_col = u16::MAX;
         self.ensure_sel_anchor();
         if let Some(input) = self.input() {
@@ -1431,6 +1563,7 @@ impl BodyEditor {
 
     /// Shift+Option+← — extend selection by a word, crossing lines and pictures.
     pub fn select_word_left(&mut self) {
+        self.close_menu();
         self.prefer_col = u16::MAX;
         self.ensure_sel_anchor();
         if let Some(input) = self.input() {
@@ -1469,6 +1602,7 @@ impl BodyEditor {
 
     /// Shift+Option+→ — extend selection by a word, crossing lines and pictures.
     pub fn select_word_right(&mut self) {
+        self.close_menu();
         self.prefer_col = u16::MAX;
         self.ensure_sel_anchor();
         if let Some(input) = self.input() {
@@ -1528,6 +1662,7 @@ impl BodyEditor {
     }
 
     pub fn select_home(&mut self) {
+        self.close_menu();
         self.ensure_sel_anchor();
         if let Some(input) = self.input() {
             input.clear_selection();
@@ -1536,6 +1671,7 @@ impl BodyEditor {
     }
 
     pub fn select_end(&mut self) {
+        self.close_menu();
         self.ensure_sel_anchor();
         if let Some(input) = self.input() {
             input.clear_selection();
@@ -1628,7 +1764,11 @@ impl BodyEditor {
                     let s = text.value();
                     (!s.trim().is_empty()).then_some(CopyLine::Link(s))
                 }
-                Line::Image { path } => Some(CopyLine::Image(crate::image::expand(path))),
+                Line::Image { path } => Some(CopyLine::Image(resolve_image_reference(
+                    path,
+                    &self.image_root,
+                    &self.attachments,
+                ))),
             })
             .collect()
     }
@@ -1637,12 +1777,20 @@ impl BodyEditor {
     pub fn image_for_copy(&self) -> Option<PathBuf> {
         for i in (0..=self.cursor).rev() {
             if let Line::Image { path } = &self.lines[i] {
-                return Some(crate::image::expand(path));
+                return Some(resolve_image_reference(
+                    path,
+                    &self.image_root,
+                    &self.attachments,
+                ));
             }
         }
         for i in (self.cursor + 1)..self.lines.len() {
             if let Line::Image { path } = &self.lines[i] {
-                return Some(crate::image::expand(path));
+                return Some(resolve_image_reference(
+                    path,
+                    &self.image_root,
+                    &self.attachments,
+                ));
             }
         }
         None
@@ -1685,7 +1833,7 @@ impl BodyEditor {
                         let url = link_url_from_line(&text.value());
                         Line::Link(TextInput::new(&url, self.line_max_len))
                     }
-                    Command::Copy | Command::CopyImage | Command::CopyAll => unreachable!(),
+                    Command::Copy | Command::CopyImage | Command::CopyAll => return None,
                 };
                 None
             }
@@ -1743,9 +1891,9 @@ impl BodyEditor {
         if !crate::image::looks_like_image(&value) {
             return;
         }
-        if let Some(path) = crate::image::path_if_image(&value) {
+        if let Some(path) = crate::image::path_if_image_in(&value, &self.image_root) {
             self.lines[i] = Line::Image {
-                path: crate::image::short(&path),
+                path: crate::image::short_in(&path, &self.image_root),
             };
         }
     }
@@ -1759,13 +1907,15 @@ impl BodyEditor {
                 (Line::Text(a), Line::Text(b)) => {
                     let left = a.value();
                     let right = b.value();
+                    let joined = format!("{left}{right}");
                     // Only glue when the first piece looks like a path
                     // fragment (no image ext yet) and the second finishes it.
                     if left.contains('/')
                         && !crate::image::looks_like_image(&left)
-                        && crate::image::path_if_image(&format!("{left}{right}")).is_some()
+                        && self.line_text_fits(&joined)
+                        && crate::image::path_if_image_in(&joined, &self.image_root).is_some()
                     {
-                        Some(format!("{left}{right}"))
+                        Some(joined)
                     } else {
                         None
                     }
@@ -1813,28 +1963,28 @@ impl BodyEditor {
             })
             .collect();
 
-        let heights: Vec<u16> = self
+        let heights: Vec<usize> = self
             .lines
             .iter()
             .enumerate()
             .map(|(i, line)| match line {
-                Line::Image { .. } => IMAGE_ROWS,
+                Line::Image { .. } => usize::from(IMAGE_ROWS),
                 _ => wraps[i]
                     .as_ref()
-                    .map(|b| b.len().max(1) as u16)
+                    .map(|b| b.len().max(1))
                     .unwrap_or(1)
                     .max(1),
             })
             .collect();
-        let starts: Vec<u16> = heights
+        let starts: Vec<usize> = heights
             .iter()
-            .scan(0u16, |row, &h| {
+            .scan(0usize, |row, &h| {
                 let start = *row;
                 *row = row.saturating_add(h);
                 Some(start)
             })
             .collect();
-        let total: u16 = heights.iter().copied().sum();
+        let total = heights.iter().copied().fold(0usize, usize::saturating_add);
         self.content_height = total;
 
         // Keep the caret's visual row on screen (not just the block).
@@ -1843,17 +1993,17 @@ impl BodyEditor {
                 self.lines[self.cursor].input_ref(),
                 wraps[self.cursor].as_ref(),
             ) {
-                (Some(t), Some(b)) => t.wrap_cursor_from_breaks(b).0 as u16,
+                (Some(t), Some(b)) => t.wrap_cursor_from_breaks(b).0,
                 _ => 0,
             };
             starts[self.cursor].saturating_add(row_in_block)
         };
         if cursor_visual < self.scroll {
             self.scroll = cursor_visual;
-        } else if cursor_visual >= self.scroll + height {
-            self.scroll = cursor_visual + 1 - height;
+        } else if cursor_visual >= self.scroll.saturating_add(usize::from(height)) {
+            self.scroll = cursor_visual + 1 - usize::from(height);
         }
-        self.scroll = self.scroll.min(total.saturating_sub(height));
+        self.scroll = self.scroll.min(total.saturating_sub(usize::from(height)));
 
         // Char selections per line (body multi-line or in-line).
         let line_sels: Vec<Option<(usize, usize)>> = (0..self.lines.len())
@@ -1889,7 +2039,11 @@ impl BodyEditor {
                 (Line::Text(_), _) => TextKind::Plain,
                 (Line::Image { path }, _) => {
                     placed.push(Placed {
-                        block: Painted::Image(crate::image::expand(path)),
+                        block: Painted::Image(resolve_image_reference(
+                            path,
+                            &self.image_root,
+                            &self.attachments,
+                        )),
                         line: i,
                         y,
                         rows: vis_rows,
@@ -1901,22 +2055,18 @@ impl BodyEditor {
             let indent = kind.indent();
             let sel = line_sels[i];
             let breaks = wraps[i].as_deref().unwrap_or(&[]);
-            let view = match line {
-                Line::Text(t)
-                | Line::Bullet(t)
-                | Line::Number(t)
-                | Line::Link(t)
-                | Line::Todo { text: t, .. } => t.wrapped_from_breaks(breaks, sel),
-                Line::Image { .. } => unreachable!(),
+            let Some(text) = line.input() else {
+                continue;
             };
+            let view = text.wrapped_from_breaks(breaks, sel);
             if i == self.cursor {
-                let row = view.cursor_row.saturating_sub(skip);
-                cursor_at = Some((y + row, view.cursor_col + indent as u16));
+                let row = usize::from(view.cursor_row).saturating_sub(skip) as u16;
+                cursor_at = Some((y.saturating_add(row), view.cursor_col + indent as u16));
             }
             let wrap_rows: Vec<WrappedRow> = view
                 .lines
                 .into_iter()
-                .skip(skip as usize)
+                .skip(skip)
                 .take(vis_rows as usize)
                 .map(|l| WrappedRow {
                     text: l.text,
@@ -1937,13 +2087,13 @@ impl BodyEditor {
         (placed, cursor_at)
     }
 
-    /// Body scroll offset after the last [`layout`] call.
-    pub fn scroll(&self) -> u16 {
+    /// Body scroll offset after the last [`Self::layout`] call.
+    pub fn scroll(&self) -> usize {
         self.scroll
     }
 
-    /// Total laid-out rows after the last [`layout`] call (scrollbar).
-    pub fn content_height(&self) -> u16 {
+    /// Total laid-out rows after the last [`Self::layout`] call (scrollbar).
+    pub fn content_height(&self) -> usize {
         self.content_height
     }
 
@@ -1953,14 +2103,14 @@ impl BodyEditor {
     pub fn click(&mut self, row: u16, col: usize) -> bool {
         let width = self.layout_width.max(1);
         let numbers = number_runs(&self.lines);
-        let target = self.scroll + row;
-        let mut at = 0u16;
+        let target = self.scroll.saturating_add(usize::from(row));
+        let mut at = 0usize;
         let mut hit = false;
         for (i, line) in self.lines.iter().enumerate() {
             let h = line.height(width, numbers[i]);
-            if target < at + h {
+            if target < at.saturating_add(h) {
                 self.cursor = i;
-                let row_in = target.saturating_sub(at) as usize;
+                let row_in = target.saturating_sub(at);
                 let indent = numbers[i]
                     .map(number_indent)
                     .unwrap_or_else(|| line.indent());
@@ -1971,7 +2121,7 @@ impl BodyEditor {
                 hit = true;
                 break;
             }
-            at += h;
+            at = at.saturating_add(h);
         }
         self.close_menu();
         self.prefer_col = u16::MAX;
@@ -2118,6 +2268,35 @@ mod tests {
         e.home();
         e.backspace();
         assert_eq!(e.value(), vec![Block::text("one")]);
+    }
+
+    #[test]
+    fn moving_the_cursor_closes_the_body_command_menu() {
+        let mut editor = BodyEditor::new(&[]);
+        for c in "/todo".chars() {
+            editor.insert(c);
+        }
+        assert!(editor.menu.is_some());
+
+        editor.left();
+
+        assert!(
+            editor.menu.is_none(),
+            "the cached query must never outlive its caret range"
+        );
+        assert_eq!(editor.value(), vec![Block::text("/todo")]);
+    }
+
+    #[test]
+    fn link_hit_testing_excludes_blank_row_padding() {
+        let mut editor = BodyEditor::new(&[Block::link("https://example.com")]);
+        let _ = editor.layout(40, 4);
+
+        assert_eq!(
+            editor.link_url_at_position(0, 3).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(editor.link_url_at_position(0, 39), None);
     }
 
     #[test]
@@ -2481,5 +2660,90 @@ mod tests {
         assert_eq!((imgs[1].y, imgs[1].rows), (1, 10));
         // No overlap: first ends at y+rows = 1, second starts at 1.
         assert_eq!(imgs[0].y + imgs[0].rows, imgs[1].y);
+    }
+
+    #[test]
+    fn narrow_maximum_body_keeps_the_last_row_addressable() {
+        let line = "x".repeat(MAX_NOTES_LINE_LEN);
+        let blocks = vec![Block::text(&line); MAX_BODY_LINES];
+        let mut e = editor(&blocks);
+        e.cursor = e.lines.len() - 1;
+        e.input().unwrap().end();
+
+        let (_, cursor) = e.layout(1, 10);
+
+        let expected_height = MAX_BODY_LINES * MAX_NOTES_LINE_LEN;
+        assert_eq!(e.content_height() as usize, expected_height);
+        assert_eq!(e.scroll() as usize, expected_height - 10);
+        assert_eq!(cursor, Some((9, 1)));
+        assert!(e.click(0, 0));
+        assert_eq!(e.cursor_line(), MAX_BODY_LINES - 1);
+    }
+
+    #[test]
+    fn line_join_at_the_length_limit_never_discards_the_next_line() {
+        let full = "a".repeat(MAX_NOTES_LINE_LEN);
+
+        let mut backward = editor(&[Block::text(&full), Block::text("tail")]);
+        backward.cursor = 1;
+        backward.input().unwrap().home();
+        backward.backspace();
+        assert_eq!(
+            backward.value(),
+            vec![Block::text(&full), Block::text("tail")]
+        );
+
+        let mut forward = editor(&[Block::text(&full), Block::text("tail")]);
+        forward.input().unwrap().end();
+        forward.delete();
+        assert_eq!(
+            forward.value(),
+            vec![Block::text(&full), Block::text("tail")]
+        );
+    }
+
+    #[test]
+    fn oversized_cross_line_selection_replacement_is_rejected_without_data_loss() {
+        let full = "a".repeat(MAX_NOTES_LINE_LEN);
+        let mut editor = editor(&[Block::text(&full), Block::text("tail")]);
+        editor.sel_anchor = Some((0, MAX_NOTES_LINE_LEN));
+        editor.cursor = 1;
+        editor.input().unwrap().home();
+
+        editor.insert('x');
+
+        assert_eq!(
+            editor.value(),
+            vec![Block::text(&full), Block::text("tail")]
+        );
+    }
+
+    #[test]
+    fn oversized_image_path_detection_never_discards_a_source_line() {
+        let root = std::env::temp_dir().join(format!(
+            "mach-long-image-path-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let first_dir = "a".repeat(240);
+        let second_dir = "b".repeat(240);
+        let file = format!("{}.png", "c".repeat(40));
+        let relative = format!("{first_dir}/{second_dir}/{file}");
+        assert!(relative.graphemes(true).count() > MAX_NOTES_LINE_LEN);
+        std::fs::create_dir_all(root.join(&first_dir).join(&second_dir)).unwrap();
+        std::fs::write(root.join(&relative), []).unwrap();
+
+        let split = relative.len() / 2;
+        let (left, right) = relative.split_at(split);
+        let expected = vec![Block::text(left), Block::text(right)];
+        let mut loaded = editor(&expected);
+        loaded.set_image_root(root.clone());
+        assert_eq!(loaded.value(), expected);
+
+        let mut pasted = editor(&[]);
+        pasted.set_image_root(root.clone());
+        pasted.insert_str(&format!("{left}\n{right}"));
+        assert_eq!(pasted.value(), expected);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

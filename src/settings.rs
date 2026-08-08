@@ -1,8 +1,6 @@
-//! User settings, stored in `settings.json`.
+//! User settings persisted by [`crate::store::Store`].
 
 use serde::{Deserialize, Serialize};
-
-use crate::store;
 
 pub const THEMES: [&str; 7] = ["purple", "cyan", "blue", "red", "yellow", "green", "white"];
 pub const DATE_FORMATS: [&str; 3] = ["Y-M-D", "D-M-Y", "M-D-Y"];
@@ -19,8 +17,8 @@ pub fn sort_label(sort: &str) -> &'static str {
         "important" => "Most important first",
         "done" => "Done last",
         "due" => "By due date",
-        // "manual", legacy "category", and anything unknown: JSON array order.
-        _ => "File order",
+        // "manual", legacy "category", and anything unknown: persisted order.
+        _ => "As added",
     }
 }
 
@@ -41,7 +39,7 @@ pub fn preview_position_label(pos: &str) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "default_date_format")]
     pub date_format: String,
@@ -74,43 +72,34 @@ impl Default for Settings {
 }
 
 impl Settings {
-    pub fn load() -> Self {
-        match store::read_json::<Settings>(&store::paths().settings) {
-            Some(mut s) => {
-                if !THEMES.contains(&s.selected_color.as_str()) {
-                    s.selected_color = default_color();
-                }
-                if !DATE_FORMATS.contains(&s.date_format.as_str()) {
-                    s.date_format = default_date_format();
-                }
-                // Legacy "category" meant All-Tasks grouping; that is now
-                // always on, so map it to as-added within each group.
-                if s.sort == "category" || !SORTS.contains(&s.sort.as_str()) {
-                    s.sort = default_sort();
-                }
-                if !PREVIEW_POSITIONS.contains(&s.preview_position.as_str()) {
-                    s.preview_position = default_preview_position();
-                }
-                s
-            }
-            None => {
-                let s = Settings::default();
-                s.save();
-                s
-            }
+    /// Normalize values imported from the legacy JSON settings file.
+    ///
+    /// SQLite-backed settings are validated on every write and therefore do
+    /// not need this compatibility path.
+    pub fn normalized(mut self) -> Self {
+        if !THEMES.contains(&self.selected_color.as_str()) {
+            self.selected_color = default_color();
         }
+        if !DATE_FORMATS.contains(&self.date_format.as_str()) {
+            self.date_format = default_date_format();
+        }
+        // Legacy "category" meant All-Tasks grouping; that is now always on,
+        // so map it to as-added within each group.
+        if self.sort == "category" || !SORTS.contains(&self.sort.as_str()) {
+            self.sort = default_sort();
+        }
+        if !PREVIEW_POSITIONS.contains(&self.preview_position.as_str()) {
+            self.preview_position = default_preview_position();
+        }
+        self
     }
 
-    pub fn save(&self) {
-        let _ = store::write_json(&store::paths().settings, self);
-    }
-
-    /// True the first time this data dir has no recorded version.
+    /// Record `version` in memory and report whether this was the first run.
+    /// The caller persists the changed settings through [`crate::store::Store`].
     pub fn take_first_run(&mut self, version: &str) -> bool {
         let first = self.last_run_version.is_none();
         if self.last_run_version.as_deref() != Some(version) {
             self.last_run_version = Some(version.to_string());
-            self.save();
         }
         first
     }

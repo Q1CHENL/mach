@@ -1,10 +1,11 @@
-//! Due dates are typed inline as `[...]` at the end of a task description
-//! and stored separately. Supported: `[yyyy-mm-dd hh:mm]`, `[yyyy-mm-dd]`,
-//! `[mm-dd hh:mm]`, `[mm-dd]`, `[hh:mm]`.
+//! Due dates may be typed inline as `[...]` at the end of a task description.
+//! Input accepts `[yyyy-mm-dd hh:mm]`, `[yyyy-mm-dd]`, `[mm-dd hh:mm]`,
+//! `[mm-dd]`, and `[hh:mm]`; persistence canonicalizes shorthand to an
+//! absolute date and stores it separately from the title.
 
 use std::sync::OnceLock;
 
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use regex::Regex;
 
 fn patterns() -> &'static [Regex] {
@@ -13,11 +14,11 @@ fn patterns() -> &'static [Regex] {
         // Month and day accept one or two digits everywhere, so a date
         // that parses on its own still parses once a time is appended.
         [
-            r"\[(\d{4}-\d{1,2}-\d{1,2} \d{2}:\d{2})\]",
-            r"\[(\d{4}-\d{1,2}-\d{1,2})\]",
-            r"\[(\d{1,2}-\d{1,2} \d{2}:\d{2})\]",
-            r"\[(\d{1,2}-\d{1,2})\]",
-            r"\[(\d{2}:\d{2})\]",
+            r"\[(\d{4}-\d{1,2}-\d{1,2} \d{2}:\d{2})\]\s*$",
+            r"\[(\d{4}-\d{1,2}-\d{1,2})\]\s*$",
+            r"\[(\d{1,2}-\d{1,2} \d{2}:\d{2})\]\s*$",
+            r"\[(\d{1,2}-\d{1,2})\]\s*$",
+            r"\[(\d{2}:\d{2})\]\s*$",
         ]
         .iter()
         .map(|p| Regex::new(p).expect("valid due-date pattern"))
@@ -46,22 +47,176 @@ pub fn parse(description: &str) -> (String, String) {
 /// Whether a bare date (no brackets) is one mach can store. An empty
 /// string counts as valid: it just means "no due date".
 pub fn is_valid(text: &str) -> bool {
-    if text.is_empty() {
-        return true;
-    }
-    let (due, rest) = parse(&format!("[{text}]"));
-    !due.is_empty() && rest.is_empty() && names_a_real_moment(&due)
+    normalize_for_write(text).is_ok()
 }
 
-/// Whether a due string of the right shape also names a day that exists
-/// and a time on the clock. The patterns only count digits, so without
-/// this `2026-13-45 30:70` would be stored and then silently rewritten
-/// (or dropped) by everything that reads it back.
-fn names_a_real_moment(due: &str) -> bool {
-    let Some((year, month, day, hour, minute)) = sort_key(due) else {
-        return false;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidDue {
+    value: String,
+}
+
+impl std::fmt::Display for InvalidDue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid due {:?}; use YYYY-MM-DD, MM-DD, or HH:MM, optionally with a time",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for InvalidDue {}
+
+/// Canonicalize a due value at the moment it is persisted.
+///
+/// Fully qualified dates keep their year, including dates in the past.
+/// Shorthand values name their next occurrence: a past `MM-DD` rolls to a
+/// later year and a past `HH:MM` rolls to tomorrow. The stored result is
+/// always an absolute `YYYY-MM-DD` date, optionally followed by `HH:MM`.
+pub fn normalize_for_write(text: &str) -> Result<String, InvalidDue> {
+    normalize_for_write_at(text, Local::now().naive_local())
+}
+
+pub fn normalize_for_write_at(text: &str, now: NaiveDateTime) -> Result<String, InvalidDue> {
+    normalize_at(text, now, true)
+}
+
+/// Freeze legacy shorthand using the migration clock instead of treating it
+/// as a newly entered future occurrence. This preserves what an existing
+/// `MM-DD` / `HH:MM` value meant on the day SQLite first imports it.
+pub fn normalize_legacy_at(text: &str, now: NaiveDateTime) -> Result<String, InvalidDue> {
+    normalize_at(text, now, false)
+}
+
+fn normalize_at(
+    text: &str,
+    now: NaiveDateTime,
+    roll_shorthand_forward: bool,
+) -> Result<String, InvalidDue> {
+    let original = text.trim();
+    if original.is_empty() {
+        return Ok(String::new());
+    }
+    let input = original.replace('T', " ");
+    let (matched, rest) = parse(&format!("[{input}]"));
+    if matched != input || !rest.is_empty() {
+        return Err(InvalidDue {
+            value: original.to_string(),
+        });
+    }
+
+    let (date_part, time_part) = match input.split_once(' ') {
+        Some((date, time)) if !date.is_empty() && !time.is_empty() => (date, Some(time)),
+        None if input.contains(':') => ("", Some(input.as_str())),
+        None => (input.as_str(), None),
+        _ => {
+            return Err(InvalidDue {
+                value: original.to_string(),
+            });
+        }
     };
-    hour < 24 && minute < 60 && NaiveDate::from_ymd_opt(year, month, day).is_some()
+    let time = match time_part {
+        Some(value) => Some(parse_time(value).ok_or_else(|| InvalidDue {
+            value: original.to_string(),
+        })?),
+        None => None,
+    };
+
+    let pieces: Vec<&str> = date_part.split('-').collect();
+    let date = match pieces.as_slice() {
+        [year, month, day] => {
+            let year = year.parse::<i32>().ok();
+            let month = month.parse::<u32>().ok();
+            let day = day.parse::<u32>().ok();
+            match (year, month, day) {
+                (Some(year), Some(month), Some(day)) => NaiveDate::from_ymd_opt(year, month, day),
+                _ => None,
+            }
+            .ok_or_else(|| InvalidDue {
+                value: original.to_string(),
+            })?
+        }
+        [month, day] => {
+            let month = month.parse::<u32>().ok();
+            let day = day.parse::<u32>().ok();
+            let (Some(month), Some(day)) = (month, day) else {
+                return Err(InvalidDue {
+                    value: original.to_string(),
+                });
+            };
+            if roll_shorthand_forward {
+                next_month_day(month, day, time, now)
+            } else {
+                month_day_in_migration_year(month, day, now)
+            }
+            .ok_or_else(|| InvalidDue {
+                value: original.to_string(),
+            })?
+        }
+        [""] => {
+            let Some(clock) = time else {
+                return Err(InvalidDue {
+                    value: original.to_string(),
+                });
+            };
+            let today = now.date();
+            let candidate = today.and_time(clock);
+            if !roll_shorthand_forward || candidate >= now {
+                today
+            } else {
+                today.succ_opt().ok_or_else(|| InvalidDue {
+                    value: original.to_string(),
+                })?
+            }
+        }
+        _ => {
+            return Err(InvalidDue {
+                value: original.to_string(),
+            });
+        }
+    };
+
+    Ok(match time {
+        Some(time) => format!("{} {}", date.format("%Y-%m-%d"), time.format("%H:%M")),
+        None => date.format("%Y-%m-%d").to_string(),
+    })
+}
+
+fn month_day_in_migration_year(month: u32, day: u32, now: NaiveDateTime) -> Option<NaiveDate> {
+    NaiveDate::from_ymd_opt(now.year(), month, day)
+}
+
+fn parse_time(value: &str) -> Option<NaiveTime> {
+    if value.len() != 5 || value.as_bytes().get(2) != Some(&b':') {
+        return None;
+    }
+    let hour = value.get(..2)?.parse().ok()?;
+    let minute = value.get(3..)?.parse().ok()?;
+    NaiveTime::from_hms_opt(hour, minute, 0)
+}
+
+fn next_month_day(
+    month: u32,
+    day: u32,
+    time: Option<NaiveTime>,
+    now: NaiveDateTime,
+) -> Option<NaiveDate> {
+    // Eight years always crosses a leap year, including the Gregorian
+    // century exception. The wider bound also keeps this correct near i32::MAX.
+    for offset in 0..=8 {
+        let year = now.year().checked_add(offset)?;
+        let Some(candidate) = NaiveDate::from_ymd_opt(year, month, day) else {
+            continue;
+        };
+        let is_future = match time {
+            Some(clock) => candidate.and_time(clock) >= now,
+            None => candidate >= now.date(),
+        };
+        if is_future {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 pub fn is_today(due: &str) -> bool {
@@ -114,10 +269,10 @@ fn format_date(year: i32, month: u32, day: u32, date_format: &str) -> String {
     }
 }
 
-/// A comparable point in time for sorting. The stored forms differ in
-/// shape — a bare time means today, a bare `mm-dd` means this year — so
-/// comparing the strings themselves would put December before next
-/// January. `None` is "no due date", which sorts last.
+/// A comparable point in time for sorting. New writes are canonical absolute
+/// values; the shorthand branches remain for displaying pre-migration callers
+/// without turning malformed text into a real date. `None` is "no due date"
+/// or an invalid value, both of which sort last.
 pub fn sort_key(due: &str) -> Option<(i32, u32, u32, u32, u32)> {
     if due.is_empty() {
         return None;
@@ -129,16 +284,23 @@ pub fn sort_key(due: &str) -> Option<(i32, u32, u32, u32, u32)> {
         None => (due, None),
     };
 
-    let (year, month, day) = match date_part.split('-').collect::<Vec<_>>()[..] {
-        [y, m, d] => (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?),
-        [m, d] => (today.year(), m.parse().ok()?, d.parse().ok()?),
-        _ => (today.year(), today.month(), today.day()),
+    let date = match date_part.split('-').collect::<Vec<_>>().as_slice() {
+        [y, m, d] => NaiveDate::from_ymd_opt(y.parse().ok()?, m.parse().ok()?, d.parse().ok()?)?,
+        [m, d] => NaiveDate::from_ymd_opt(today.year(), m.parse().ok()?, d.parse().ok()?)?,
+        [""] if time_part.is_some() => today,
+        _ => return None,
     };
-    let (hour, minute) = match time_part.and_then(|t| t.split_once(':')) {
-        Some((h, m)) => (h.parse().ok()?, m.parse().ok()?),
-        None => (0, 0),
+    let time = match time_part {
+        Some(value) => parse_time(value)?,
+        None => NaiveTime::from_hms_opt(0, 0, 0)?,
     };
-    Some((year, month, day, hour, minute))
+    Some((
+        date.year(),
+        date.month(),
+        date.day(),
+        time.hour(),
+        time.minute(),
+    ))
 }
 
 /// Current date and time for the status bar, in the configured order.
@@ -181,6 +343,11 @@ mod tests {
             parse("read [the] book"),
             (String::new(), "read [the] book".to_string())
         );
+        assert_eq!(
+            parse("plan [2030-01-02] launch"),
+            (String::new(), "plan [2030-01-02] launch".to_string()),
+            "only a trailing date token is due syntax"
+        );
     }
 
     #[test]
@@ -198,6 +365,14 @@ mod tests {
             sort_key(&format!("{}-01-01", year + 1)) > sort_key("12-25"),
             "next year comes after this December"
         );
+    }
+
+    #[test]
+    fn invalid_due_values_do_not_masquerade_as_today() {
+        for value in ["garbage", "2030-99-99", "25:99"] {
+            assert_eq!(sort_key(value), None, "{value}");
+            assert_eq!(display(value, "Y-M-D"), format!("[{value}]"));
+        }
     }
 
     #[test]
@@ -223,6 +398,65 @@ mod tests {
         assert!(!is_valid("25:99"), "hour and minute out of range");
         assert!(!is_valid("2026-08-10 30:70"));
         assert!(is_valid("2028-02-29"), "a real leap day still passes");
+    }
+
+    #[test]
+    fn normalizes_shorthand_to_the_next_absolute_moment() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 8)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+
+        assert_eq!(normalize_for_write_at("8-8", now).unwrap(), "2026-08-08");
+        assert_eq!(normalize_for_write_at("8-7", now).unwrap(), "2027-08-07");
+        assert_eq!(
+            normalize_for_write_at("8-8 13:00", now).unwrap(),
+            "2026-08-08 13:00"
+        );
+        assert_eq!(
+            normalize_for_write_at("8-8 11:00", now).unwrap(),
+            "2027-08-08 11:00"
+        );
+        assert_eq!(
+            normalize_for_write_at("13:00", now).unwrap(),
+            "2026-08-08 13:00"
+        );
+        assert_eq!(
+            normalize_for_write_at("11:00", now).unwrap(),
+            "2026-08-09 11:00"
+        );
+    }
+
+    #[test]
+    fn absolute_due_values_are_canonicalized_without_rolling_forward() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 8)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+
+        assert_eq!(
+            normalize_for_write_at("2020-1-2", now).unwrap(),
+            "2020-01-02"
+        );
+        assert_eq!(
+            normalize_for_write_at("2020-1-2 03:04", now).unwrap(),
+            "2020-01-02 03:04"
+        );
+        assert!(normalize_for_write_at("2026-02-30", now).is_err());
+    }
+
+    #[test]
+    fn legacy_shorthand_is_frozen_to_the_migration_day_and_year() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 8)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+
+        assert_eq!(normalize_legacy_at("8-7", now).unwrap(), "2026-08-07");
+        assert_eq!(
+            normalize_legacy_at("11:00", now).unwrap(),
+            "2026-08-08 11:00"
+        );
     }
 
     #[test]

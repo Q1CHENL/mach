@@ -1,190 +1,2582 @@
-//! On-disk storage: `~/.mach/{tasks,categories,settings}.json`
+//! SQLite-backed persistence for tasks, categories, and settings.
 //!
-//! Directory resolution (first wins): `--dir` / [`set_data_dir`], then
-//! `$MACH_DIR`, then `~/.mach`.
-//!
-//! Files use a versioned envelope (`schema` = [`SCHEMA_VERSION`]) and UUID ids.
-//! Missing files load as empty. Wrong schema or unreadable JSON exits with an
-//! error (never silently wiped). Deleted tasks are not kept — delete removes
-//! them from `tasks.json`.
+//! A [`Store`] is an explicit instance: callers can open independent data
+//! directories in one process. Writes use `BEGIN IMMEDIATE`, validate a fresh
+//! snapshot, and commit tasks/categories/settings/attachment metadata plus a
+//! monotonic revision in one transaction. Image bytes are immutable,
+//! content-addressed files beside the database. Legacy JSON is imported once
+//! and left untouched.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::time::Duration;
 
+use chrono::{Local, NaiveDateTime};
+use image::ImageFormat;
+use rusqlite::limits::Limit;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
 
-use crate::model::{Category, SCHEMA_VERSION, Task};
+use crate::due;
+use crate::model::{
+    ALL_CATEGORY, Block, Category, MAX_BODY_LINES, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN,
+    MAX_CATEGORY_DESC_LINES, MAX_CATEGORY_NAME_LEN, MAX_IMPORTANCE, MAX_NOTES_LINE_LEN,
+    MAX_TASK_COUNT, MAX_TITLE_LEN, SCHEMA_VERSION, Task, caseless_key, text_byte_limit,
+};
+use crate::settings::{DATE_FORMATS, PREVIEW_POSITIONS, SORTS, Settings, THEMES};
 
-/// Explicit data directory from CLI (`--dir`). Set before first [`paths`] call.
-static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
-static PATHS: OnceLock<Paths> = OnceLock::new();
+const DATABASE_FILE: &str = "mach.db";
+const DATABASE_SCHEMA_VERSION: i64 = 1;
+const LEGACY_MIGRATION_KEY: &str = "legacy_json_migrated";
+const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+const ID_MAX_BYTES: usize = 128;
+const DUE_MAX_BYTES: usize = 128;
+const CREATED_MAX_BYTES: usize = 64;
+const SETTINGS_VALUE_MAX_BYTES: usize = 128;
+const MAX_LEGACY_JSON_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_SQLITE_VALUE_BYTES: i32 = 8 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES: u64 = 128 * 1024 * 1024;
+const ATTACHMENT_ID_LEN: usize = 64;
 
+#[derive(Debug)]
+pub enum StoreError {
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Json {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    Database(rusqlite::Error),
+    UnsupportedLegacySchema {
+        path: PathBuf,
+        found: u32,
+        expected: u32,
+    },
+    UnsupportedDatabaseSchema {
+        path: PathBuf,
+        found: i64,
+        expected: i64,
+    },
+    Conflict {
+        expected: u64,
+        actual: u64,
+    },
+    StaleEntity {
+        entity: &'static str,
+        id: String,
+    },
+    NotFound {
+        entity: &'static str,
+        query: String,
+    },
+    Ambiguous {
+        entity: &'static str,
+        query: String,
+        matches: Vec<String>,
+    },
+    Validation(String),
+    Corrupt(String),
+}
+
+impl StoreError {
+    pub fn validation(message: impl Into<String>) -> Self {
+        Self::Validation(message.into())
+    }
+
+    fn io(operation: &'static str, path: &Path, source: std::io::Error) -> Self {
+        Self::Io {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io {
+                operation,
+                path,
+                source,
+            } => write!(f, "could not {operation} {}: {source}", path.display()),
+            Self::Json { path, source } => {
+                write!(f, "could not parse {}: {source}", path.display())
+            }
+            Self::Database(source) => write!(f, "database error: {source}"),
+            Self::UnsupportedLegacySchema {
+                path,
+                found,
+                expected,
+            } => write!(
+                f,
+                "{} uses unsupported schema {found} (expected {expected})",
+                path.display()
+            ),
+            Self::UnsupportedDatabaseSchema {
+                path,
+                found,
+                expected,
+            } => write!(
+                f,
+                "{} uses unsupported database schema {found} (expected {expected})",
+                path.display()
+            ),
+            Self::Conflict { expected, actual } => write!(
+                f,
+                "store changed since it was loaded (expected revision {expected}, found {actual})"
+            ),
+            Self::StaleEntity { entity, id } => {
+                write!(f, "{entity} {id:?} changed since it was loaded")
+            }
+            Self::NotFound { entity, query } => {
+                write!(f, "no {entity} matching {query:?}")
+            }
+            Self::Ambiguous {
+                entity,
+                query,
+                matches,
+            } => write!(
+                f,
+                "ambiguous {entity} {query:?}; matches: {}",
+                matches.join(", ")
+            ),
+            Self::Validation(message) => write!(f, "invalid data: {message}"),
+            Self::Corrupt(message) => write!(f, "corrupt database: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Json { source, .. } => Some(source),
+            Self::Database(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Database(value)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StoreData {
+    pub revision: u64,
+    pub categories: Vec<Category>,
+    pub tasks: Vec<Task>,
+    pub settings: Settings,
+    pub(crate) attachments: Vec<Attachment>,
+}
+
+/// Immutable metadata for one content-addressed image owned by this store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub id: String,
+    pub sha256: String,
+    pub media_type: String,
+    pub byte_len: u64,
+    pub storage_name: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TaskPatch {
+    pub title: Option<String>,
+    pub body: Option<Vec<Block>>,
+    pub due: Option<String>,
+    pub done: Option<bool>,
+    pub importance: Option<u8>,
+    /// `None` leaves the category unchanged; `Some(None)` clears it.
+    pub category_id: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CategoryPatch {
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PurgeScope {
+    All,
+    Category(String),
+    Uncategorized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelativePosition {
+    Before,
+    After,
+}
+
+impl StoreData {
+    pub fn attachments(&self) -> &[Attachment] {
+        &self.attachments
+    }
+
+    /// Resolve a task by full id or unique id prefix.
+    pub fn resolve_task_id(&self, query: &str) -> Result<String, StoreError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err(StoreError::validation("task id cannot be empty"));
+        }
+        validate_byte_limit(query, ID_MAX_BYTES, "task id query")?;
+        if let Some(task) = self.tasks.iter().find(|task| task.id == query) {
+            return Ok(task.id.clone());
+        }
+        let matches: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|task| task.id.starts_with(query))
+            .map(|task| task.id.clone())
+            .collect();
+        match matches.as_slice() {
+            [id] => Ok(id.clone()),
+            [] => Err(StoreError::NotFound {
+                entity: "task",
+                query: query.to_string(),
+            }),
+            _ => Err(StoreError::Ambiguous {
+                entity: "task id",
+                query: query.to_string(),
+                matches,
+            }),
+        }
+    }
+
+    /// Resolve a category by id, Unicode-caseless name, or unique name prefix.
+    pub fn resolve_category_id(&self, query: &str) -> Result<String, StoreError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err(StoreError::validation("category name cannot be empty"));
+        }
+        if let Some(category) = self.categories.iter().find(|category| category.id == query) {
+            return Ok(category.id.clone());
+        }
+        validate_byte_limit(
+            query,
+            text_byte_limit(MAX_CATEGORY_NAME_LEN),
+            "category query",
+        )?;
+        let folded = category_name_key(query);
+        if let Some(category) = self
+            .categories
+            .iter()
+            .find(|category| category_name_key(&category.name) == folded)
+        {
+            return Ok(category.id.clone());
+        }
+        let matches: Vec<_> = self
+            .categories
+            .iter()
+            .filter(|category| category_name_has_prefix(&category.name, &folded))
+            .collect();
+        match matches.as_slice() {
+            [category] => Ok(category.id.clone()),
+            [] => Err(StoreError::NotFound {
+                entity: "category",
+                query: query.to_string(),
+            }),
+            _ => Err(StoreError::Ambiguous {
+                entity: "category",
+                query: query.to_string(),
+                matches: matches
+                    .into_iter()
+                    .map(|category| category.name.clone())
+                    .collect(),
+            }),
+        }
+    }
+
+    pub fn task(&self, id: &str) -> Result<&Task, StoreError> {
+        self.tasks
+            .iter()
+            .find(|task| task.id == id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "task",
+                query: id.to_string(),
+            })
+    }
+
+    pub fn category(&self, id: &str) -> Result<&Category, StoreError> {
+        self.categories
+            .iter()
+            .find(|category| category.id == id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "category",
+                query: id.to_string(),
+            })
+    }
+
+    pub fn create_task(
+        &mut self,
+        title: impl Into<String>,
+        body: Vec<Block>,
+        due: impl Into<String>,
+        importance: u8,
+        category_id: Option<String>,
+    ) -> Result<Task, StoreError> {
+        if importance > MAX_IMPORTANCE {
+            return Err(StoreError::validation(format!(
+                "importance must be 0-{MAX_IMPORTANCE}"
+            )));
+        }
+        let title = title.into();
+        let due = due.into();
+        let mut task = Task::new(&title, importance, category_id, &due);
+        task.body = body;
+        self.insert_task(task)
+    }
+
+    pub fn insert_task(&mut self, task: Task) -> Result<Task, StoreError> {
+        let index = self.tasks.len();
+        self.tasks.push(task);
+        if let Err(error) = self.normalize_and_validate_new_write() {
+            self.tasks.truncate(index);
+            return Err(error);
+        }
+        Ok(self.tasks[index].clone())
+    }
+
+    pub fn edit_task(&mut self, id: &str, patch: TaskPatch) -> Result<Task, StoreError> {
+        let index = self
+            .tasks
+            .iter()
+            .position(|task| task.id == id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "task",
+                query: id.to_string(),
+            })?;
+        let before = self.tasks[index].clone();
+        {
+            let task = &mut self.tasks[index];
+            if let Some(title) = patch.title {
+                task.title = title;
+            }
+            if let Some(body) = patch.body {
+                task.body = body;
+            }
+            if let Some(due) = patch.due {
+                task.due = due;
+            }
+            if let Some(done) = patch.done {
+                task.done = done;
+            }
+            if let Some(importance) = patch.importance {
+                task.importance = importance;
+            }
+            if let Some(category_id) = patch.category_id {
+                task.category_id = category_id;
+            }
+        }
+        if let Err(error) = self.normalize_and_validate_new_write() {
+            self.tasks[index] = before;
+            return Err(error);
+        }
+        Ok(self.tasks[index].clone())
+    }
+
+    /// Apply only the fields represented by `patch`, but fail if one of those
+    /// fields changed since `expected` was loaded. Unrelated concurrent edits
+    /// (for example toggling `done` while a title form is open) are preserved.
+    pub fn edit_task_if_unchanged(
+        &mut self,
+        expected: &Task,
+        patch: TaskPatch,
+    ) -> Result<Task, StoreError> {
+        let current = self
+            .tasks
+            .iter()
+            .find(|task| task.id == expected.id)
+            .ok_or_else(|| StoreError::StaleEntity {
+                entity: "task",
+                id: expected.id.clone(),
+            })?;
+        let stale = field_conflicts(patch.title.as_ref(), &current.title, &expected.title)
+            || field_conflicts(patch.body.as_ref(), &current.body, &expected.body)
+            || field_conflicts(patch.due.as_ref(), &current.due, &expected.due)
+            || field_conflicts(patch.done.as_ref(), &current.done, &expected.done)
+            || field_conflicts(
+                patch.importance.as_ref(),
+                &current.importance,
+                &expected.importance,
+            )
+            || field_conflicts(
+                patch.category_id.as_ref(),
+                &current.category_id,
+                &expected.category_id,
+            );
+        if stale {
+            return Err(StoreError::StaleEntity {
+                entity: "task",
+                id: expected.id.clone(),
+            });
+        }
+        self.edit_task(&expected.id, patch)
+    }
+
+    pub fn delete_task(&mut self, id: &str) -> Result<Task, StoreError> {
+        let index = self
+            .tasks
+            .iter()
+            .position(|task| task.id == id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "task",
+                query: id.to_string(),
+            })?;
+        Ok(self.tasks.remove(index))
+    }
+
+    pub fn set_task_done(&mut self, id: &str, done: bool) -> Result<Task, StoreError> {
+        self.edit_task(
+            id,
+            TaskPatch {
+                done: Some(done),
+                ..TaskPatch::default()
+            },
+        )
+    }
+
+    pub fn toggle_task_done(&mut self, id: &str) -> Result<Task, StoreError> {
+        let done = !self.task(id)?.done;
+        self.set_task_done(id, done)
+    }
+
+    pub fn set_task_importance(&mut self, id: &str, importance: u8) -> Result<Task, StoreError> {
+        self.edit_task(
+            id,
+            TaskPatch {
+                importance: Some(importance),
+                ..TaskPatch::default()
+            },
+        )
+    }
+
+    pub fn set_task_category(
+        &mut self,
+        id: &str,
+        category_id: Option<String>,
+    ) -> Result<Task, StoreError> {
+        self.edit_task(
+            id,
+            TaskPatch {
+                category_id: Some(category_id),
+                ..TaskPatch::default()
+            },
+        )
+    }
+
+    pub fn move_task(&mut self, id: &str, target: usize) -> Result<(), StoreError> {
+        let index = self
+            .tasks
+            .iter()
+            .position(|task| task.id == id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "task",
+                query: id.to_string(),
+            })?;
+        if target >= self.tasks.len() {
+            return Err(StoreError::validation(format!(
+                "task target index {target} is out of range"
+            )));
+        }
+        if self.tasks[index].category_id != self.tasks[target].category_id {
+            return Err(StoreError::validation(
+                "tasks can only be reordered within the same category",
+            ));
+        }
+        let task = self.tasks.remove(index);
+        self.tasks.insert(target, task);
+        Ok(())
+    }
+
+    pub fn move_task_relative(
+        &mut self,
+        id: &str,
+        target_id: &str,
+        position: RelativePosition,
+    ) -> Result<Task, StoreError> {
+        let id = id.to_string();
+        let target_id = target_id.to_string();
+        if id == target_id {
+            return Err(StoreError::validation(
+                "cannot move a task relative to itself",
+            ));
+        }
+        let index = self
+            .tasks
+            .iter()
+            .position(|task| task.id == id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "task",
+                query: id.clone(),
+            })?;
+        let target_index = self
+            .tasks
+            .iter()
+            .position(|task| task.id == target_id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "task",
+                query: target_id.clone(),
+            })?;
+        if self.tasks[index].category_id != self.tasks[target_index].category_id {
+            return Err(StoreError::validation(
+                "tasks can only be reordered within the same category",
+            ));
+        }
+        let task = self.tasks.remove(index);
+        let target_after_removal = self
+            .tasks
+            .iter()
+            .position(|candidate| candidate.id == target_id)
+            .ok_or_else(|| {
+                StoreError::Corrupt(format!("task {target_id:?} disappeared during reorder"))
+            })?;
+        let insertion = match position {
+            RelativePosition::Before => target_after_removal,
+            RelativePosition::After => target_after_removal + 1,
+        };
+        self.tasks.insert(insertion, task.clone());
+        Ok(task)
+    }
+
+    pub fn purge_completed(&mut self, scope: &PurgeScope) -> Result<Vec<Task>, StoreError> {
+        if let PurgeScope::Category(id) = scope {
+            self.category(id)?;
+        }
+        let mut removed = Vec::new();
+        self.tasks.retain(|task| {
+            let in_scope = match scope {
+                PurgeScope::All => true,
+                PurgeScope::Category(id) => task.category_id.as_deref() == Some(id),
+                PurgeScope::Uncategorized => task.category_id.is_none(),
+            };
+            if task.done && in_scope {
+                removed.push(task.clone());
+                false
+            } else {
+                true
+            }
+        });
+        Ok(removed)
+    }
+
+    /// Purge only the completed tasks captured by a confirmation prompt.
+    pub fn purge_completed_ids(&mut self, ids: &[String]) -> Result<Vec<Task>, StoreError> {
+        let ids: HashSet<_> = ids.iter().map(String::as_str).collect();
+        let mut removed = Vec::new();
+        self.tasks.retain(|task| {
+            if task.done && ids.contains(task.id.as_str()) {
+                removed.push(task.clone());
+                false
+            } else {
+                true
+            }
+        });
+        Ok(removed)
+    }
+
+    pub fn create_category(
+        &mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Result<Category, StoreError> {
+        let name = name.into();
+        let mut category = Category::new(&name);
+        category.description = description.into();
+        self.insert_category(category)
+    }
+
+    pub fn insert_category(&mut self, category: Category) -> Result<Category, StoreError> {
+        let index = self.categories.len();
+        self.categories.push(category);
+        if let Err(error) = self.normalize_and_validate_new_write() {
+            self.categories.truncate(index);
+            return Err(error);
+        }
+        Ok(self.categories[index].clone())
+    }
+
+    pub fn edit_category(
+        &mut self,
+        id: &str,
+        patch: CategoryPatch,
+    ) -> Result<Category, StoreError> {
+        let index = self
+            .categories
+            .iter()
+            .position(|category| category.id == id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "category",
+                query: id.to_string(),
+            })?;
+        let before = self.categories[index].clone();
+        {
+            let category = &mut self.categories[index];
+            if let Some(name) = patch.name {
+                category.name = name;
+            }
+            if let Some(description) = patch.description {
+                category.description = description;
+            }
+        }
+        if let Err(error) = self.normalize_and_validate_new_write() {
+            self.categories[index] = before;
+            return Err(error);
+        }
+        Ok(self.categories[index].clone())
+    }
+
+    pub fn edit_category_if_unchanged(
+        &mut self,
+        expected: &Category,
+        patch: CategoryPatch,
+    ) -> Result<Category, StoreError> {
+        let current = self
+            .categories
+            .iter()
+            .find(|category| category.id == expected.id)
+            .ok_or_else(|| StoreError::StaleEntity {
+                entity: "category",
+                id: expected.id.clone(),
+            })?;
+        let stale = field_conflicts(patch.name.as_ref(), &current.name, &expected.name)
+            || field_conflicts(
+                patch.description.as_ref(),
+                &current.description,
+                &expected.description,
+            );
+        if stale {
+            return Err(StoreError::StaleEntity {
+                entity: "category",
+                id: expected.id.clone(),
+            });
+        }
+        self.edit_category(&expected.id, patch)
+    }
+
+    /// Delete a category while preserving its tasks as uncategorized.
+    pub fn delete_category(&mut self, id: &str) -> Result<Category, StoreError> {
+        let index = self
+            .categories
+            .iter()
+            .position(|category| category.id == id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "category",
+                query: id.to_string(),
+            })?;
+        let category = self.categories.remove(index);
+        for task in &mut self.tasks {
+            if task.category_id.as_deref() == Some(id) {
+                task.category_id = None;
+            }
+        }
+        Ok(category)
+    }
+
+    pub fn move_category(&mut self, id: &str, target: usize) -> Result<(), StoreError> {
+        let index = self
+            .categories
+            .iter()
+            .position(|category| category.id == id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "category",
+                query: id.to_string(),
+            })?;
+        if target >= self.categories.len() {
+            return Err(StoreError::validation(format!(
+                "category target index {target} is out of range"
+            )));
+        }
+        let category = self.categories.remove(index);
+        self.categories.insert(target, category);
+        Ok(())
+    }
+
+    pub fn move_category_relative(
+        &mut self,
+        id: &str,
+        target_id: &str,
+        position: RelativePosition,
+    ) -> Result<Category, StoreError> {
+        if id == target_id {
+            return Err(StoreError::validation(
+                "cannot move a category relative to itself",
+            ));
+        }
+        let index = self
+            .categories
+            .iter()
+            .position(|category| category.id == id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "category",
+                query: id.to_string(),
+            })?;
+        if !self
+            .categories
+            .iter()
+            .any(|category| category.id == target_id)
+        {
+            return Err(StoreError::NotFound {
+                entity: "category",
+                query: target_id.to_string(),
+            });
+        }
+        let category = self.categories.remove(index);
+        let target_after_removal = self
+            .categories
+            .iter()
+            .position(|candidate| candidate.id == target_id)
+            .ok_or_else(|| {
+                StoreError::Corrupt(format!("category {target_id:?} disappeared during reorder"))
+            })?;
+        let insertion = match position {
+            RelativePosition::Before => target_after_removal,
+            RelativePosition::After => target_after_removal + 1,
+        };
+        self.categories.insert(insertion, category.clone());
+        Ok(category)
+    }
+
+    pub fn replace_settings(&mut self, settings: Settings) -> Result<Settings, StoreError> {
+        let before = std::mem::replace(&mut self.settings, settings);
+        if let Err(error) = validate_settings(&self.settings) {
+            self.settings = before;
+            return Err(error);
+        }
+        Ok(self.settings.clone())
+    }
+
+    pub fn update_settings(
+        &mut self,
+        operation: impl FnOnce(&mut Settings),
+    ) -> Result<Settings, StoreError> {
+        let before = self.settings.clone();
+        operation(&mut self.settings);
+        if let Err(error) = validate_settings(&self.settings) {
+            self.settings = before;
+            return Err(error);
+        }
+        Ok(self.settings.clone())
+    }
+
+    fn normalize_and_validate_new_write(&mut self) -> Result<(), StoreError> {
+        normalize_and_validate(
+            self,
+            Local::now().naive_local(),
+            DueMode::NewWrite,
+            AttachmentMode::Draft,
+        )
+    }
+}
+
+/// A three-way field merge conflicts only when the remote and desired values
+/// both diverged from the captured base in different directions.
+fn field_conflicts<T: PartialEq>(desired: Option<&T>, current: &T, expected: &T) -> bool {
+    desired.is_some_and(|desired| current != expected && current != desired)
+}
+
+#[derive(Debug, Clone)]
 pub struct Paths {
     pub dir: PathBuf,
+    pub database: PathBuf,
     pub tasks: PathBuf,
     pub categories: PathBuf,
     pub settings: PathBuf,
     pub images: PathBuf,
 }
 
-/// Override the data directory (e.g. from `--dir`). No-op if already set
-/// or if [`paths`] has already been called with another source.
-pub fn set_data_dir(dir: PathBuf) {
-    let _ = DATA_DIR.set(expand_user(dir));
-}
-
-fn expand_user(path: PathBuf) -> PathBuf {
-    let s = path.to_string_lossy();
-    if s == "~" {
-        return dirs::home_dir().unwrap_or(path);
-    }
-    if let Some(rest) = s.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(rest);
-    }
-    path
-}
-
-fn resolve_data_dir() -> PathBuf {
-    if let Some(dir) = DATA_DIR.get() {
-        return dir.clone();
-    }
-    if let Some(dir) = std::env::var_os("MACH_DIR") {
-        return expand_user(PathBuf::from(dir));
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mach")
-}
-
-pub fn paths() -> &'static Paths {
-    PATHS.get_or_init(|| {
-        let dir = resolve_data_dir();
-        let _ = fs::create_dir_all(&dir);
-        Paths {
+impl Paths {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            database: dir.join(DATABASE_FILE),
             tasks: dir.join("tasks.json"),
             categories: dir.join("categories.json"),
             settings: dir.join("settings.json"),
             images: dir.join("images"),
             dir,
         }
+    }
+}
+
+pub struct Store {
+    connection: Connection,
+    paths: Paths,
+    persistent_attachments: bool,
+}
+
+impl Store {
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let paths = Paths::new(expand_user(dir.as_ref().to_path_buf())?);
+        ensure_private_directory(&paths.dir)?;
+        prepare_private_database_file(&paths.database)?;
+        let mut connection = Connection::open(&paths.database)?;
+        set_private_file(&paths.database)?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        configure_resource_limits(&connection)?;
+        initialize_schema(&mut connection, &paths.database)?;
+        configure_connection(&connection)?;
+        quick_check(&connection)?;
+        let mut store = Self {
+            connection,
+            paths,
+            persistent_attachments: true,
+        };
+        store.migrate_legacy_json()?;
+        Ok(store)
+    }
+
+    /// Open an ephemeral store with no filesystem persistence.
+    ///
+    /// `data_dir` is only the logical base for relative image references. The
+    /// directory is not created or modified.
+    pub fn open_in_memory_with_paths(data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let paths = Paths::new(expand_user(data_dir.as_ref().to_path_buf())?);
+        let mut connection = Connection::open_in_memory()?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        configure_resource_limits(&connection)?;
+        initialize_schema(&mut connection, Path::new(":memory:"))?;
+        configure_in_memory_connection(&connection)?;
+        quick_check(&connection)?;
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, '1')",
+            [LEGACY_MIGRATION_KEY],
+        )?;
+        Ok(Self {
+            connection,
+            paths,
+            persistent_attachments: false,
+        })
+    }
+
+    pub fn open_default(explicit: Option<PathBuf>) -> Result<Self, StoreError> {
+        Self::open(resolve_data_dir(explicit)?)
+    }
+
+    pub fn paths(&self) -> &Paths {
+        &self.paths
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.paths.dir
+    }
+
+    pub fn images_dir(&self) -> &Path {
+        &self.paths.images
+    }
+
+    pub fn database_path(&self) -> &Path {
+        &self.paths.database
+    }
+
+    /// Cheap external-change probe for a long-running TUI.
+    pub fn revision(&self) -> Result<u64, StoreError> {
+        read_revision(&self.connection)
+    }
+
+    pub fn snapshot(&self) -> Result<StoreData, StoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        let data = load_snapshot(&tx)?;
+        tx.commit()?;
+        Ok(data)
+    }
+
+    pub fn load_settings(&self) -> Result<Settings, StoreError> {
+        Ok(self.snapshot()?.settings)
+    }
+
+    pub fn save_settings(&mut self, settings: &Settings) -> Result<(), StoreError> {
+        self.update(|data| {
+            data.replace_settings(settings.clone())?;
+            Ok(())
+        })
+    }
+
+    /// Run a read-modify-write against a fresh snapshot under
+    /// `BEGIN IMMEDIATE`. Every successful call increments `revision` once.
+    pub fn update<R>(
+        &mut self,
+        operation: impl FnOnce(&mut StoreData) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        self.update_with_snapshot(operation)
+            .map(|(result, _)| result)
+    }
+
+    /// Commit a mutation and return the exact normalized snapshot that was
+    /// persisted, including its new revision.
+    pub fn update_with_snapshot<R>(
+        &mut self,
+        operation: impl FnOnce(&mut StoreData) -> Result<R, StoreError>,
+    ) -> Result<(R, StoreData), StoreError> {
+        self.update_inner(None, operation)
+    }
+
+    /// Apply a mutation only if the caller's snapshot is still current.
+    pub fn update_if_revision<R>(
+        &mut self,
+        expected_revision: u64,
+        operation: impl FnOnce(&mut StoreData) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        self.update_if_revision_with_snapshot(expected_revision, operation)
+            .map(|(result, _)| result)
+    }
+
+    pub fn update_if_revision_with_snapshot<R>(
+        &mut self,
+        expected_revision: u64,
+        operation: impl FnOnce(&mut StoreData) -> Result<R, StoreError>,
+    ) -> Result<(R, StoreData), StoreError> {
+        self.update_inner(Some(expected_revision), operation)
+    }
+
+    fn update_inner<R>(
+        &mut self,
+        expected_revision: Option<u64>,
+        operation: impl FnOnce(&mut StoreData) -> Result<R, StoreError>,
+    ) -> Result<(R, StoreData), StoreError> {
+        let images_root = self
+            .persistent_attachments
+            .then(|| self.paths.images.clone());
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before = load_snapshot(&tx)?;
+        let base_revision = before.revision;
+        if let Some(expected) = expected_revision
+            && expected != base_revision
+        {
+            return Err(StoreError::Conflict {
+                expected,
+                actual: base_revision,
+            });
+        }
+        let mut data = before.clone();
+        let result = operation(&mut data)?;
+        import_task_attachments(&mut data, images_root.as_deref())?;
+        normalize_and_validate(
+            &mut data,
+            Local::now().naive_local(),
+            DueMode::NewWrite,
+            AttachmentMode::Persisted,
+        )?;
+        let next_revision = base_revision
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Corrupt("revision overflow".into()))?;
+        data.revision = next_revision;
+        persist_diff(&tx, &before, &data)?;
+        tx.commit()?;
+        Ok((result, data))
+    }
+
+    fn migrate_legacy_json(&mut self) -> Result<(), StoreError> {
+        let images_root = self.paths.images.clone();
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if migration_complete(&tx)? {
+            tx.commit()?;
+            return Ok(());
+        }
+
+        let existing = load_snapshot(&tx)?;
+        if !existing.categories.is_empty() || !existing.tasks.is_empty() || existing.revision != 0 {
+            return Err(StoreError::Corrupt(
+                "database contains data but has no completed legacy migration marker".into(),
+            ));
+        }
+
+        let categories_file = read_optional_json::<CategoriesFile>(&self.paths.categories)?;
+        let tasks_file = read_optional_json::<TasksFile>(&self.paths.tasks)?;
+        let settings = read_optional_json::<Settings>(&self.paths.settings)?;
+        validate_legacy_schema(
+            &self.paths.categories,
+            categories_file.as_ref().map(|f| f.schema),
+        )?;
+        validate_legacy_schema(&self.paths.tasks, tasks_file.as_ref().map(|f| f.schema))?;
+
+        let has_legacy = categories_file.is_some() || tasks_file.is_some() || settings.is_some();
+        if has_legacy {
+            let mut data = StoreData {
+                revision: 0,
+                categories: categories_file
+                    .map(|file| {
+                        file.categories
+                            .into_iter()
+                            .filter(|category| !category.is_all())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                tasks: tasks_file.map(|file| file.tasks).unwrap_or_default(),
+                settings: settings.unwrap_or_default().normalized(),
+                attachments: Vec::new(),
+            };
+            import_task_attachments(&mut data, Some(&images_root))?;
+            // Legacy relative values used the reader's current date/year. Freeze
+            // that interpretation now so it cannot drift after migration.
+            normalize_and_validate(
+                &mut data,
+                Local::now().naive_local(),
+                DueMode::LegacyMigration,
+                AttachmentMode::Persisted,
+            )?;
+            persist_initial_snapshot(&tx, &data, 1)?;
+        }
+        tx.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, '1')",
+            [LEGACY_MIGRATION_KEY],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+pub fn resolve_data_dir(explicit: Option<PathBuf>) -> Result<PathBuf, StoreError> {
+    resolve_data_dir_from(
+        explicit,
+        std::env::var_os("MACH_DIR").map(PathBuf::from),
+        dirs::home_dir(),
+    )
+}
+
+fn resolve_data_dir_from(
+    explicit: Option<PathBuf>,
+    configured: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf, StoreError> {
+    if let Some(dir) = explicit {
+        return expand_user_with_home(dir, home.as_deref());
+    }
+    if let Some(dir) = configured {
+        return expand_user_with_home(dir, home.as_deref());
+    }
+    home.map(|home| home.join(".mach")).ok_or_else(|| {
+        StoreError::validation("could not determine the home directory; use --dir or set MACH_DIR")
     })
 }
 
-pub fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
-    let file = fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    serde_json::from_reader(reader).ok()
+fn expand_user(path: PathBuf) -> Result<PathBuf, StoreError> {
+    let home = dirs::home_dir();
+    expand_user_with_home(path, home.as_deref())
 }
 
-/// Atomic write via temp file + rename (no fsync).
-pub fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
-    let data = serde_json::to_vec(value)?;
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(&data)?;
-        file.write_all(b"\n")?;
+fn expand_user_with_home(path: PathBuf, home: Option<&Path>) -> Result<PathBuf, StoreError> {
+    if path.as_os_str().is_empty() {
+        return Err(StoreError::validation("data directory cannot be empty"));
     }
-    fs::rename(&tmp, path)
+    let text = path.to_string_lossy();
+    if text == "~" {
+        return home
+            .map(Path::to_path_buf)
+            .ok_or_else(|| StoreError::validation("cannot expand ~ without a home directory"));
+    }
+    if let Some(rest) = text.strip_prefix("~/") {
+        return home
+            .map(|home| home.join(rest))
+            .ok_or_else(|| StoreError::validation("cannot expand ~ without a home directory"));
+    }
+    Ok(path)
 }
 
-fn die_load(path: &Path, msg: impl std::fmt::Display) -> ! {
-    eprintln!("mach: {}: {msg}", path.display());
-    std::process::exit(1);
+fn configure_connection(connection: &Connection) -> Result<(), StoreError> {
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    let mode: String = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(StoreError::Corrupt(format!(
+            "SQLite refused WAL mode (using {mode})"
+        )));
+    }
+    Ok(())
 }
 
-// ---------------------------------------------------------------- files
+fn configure_resource_limits(connection: &Connection) -> Result<(), StoreError> {
+    connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
+    Ok(())
+}
 
-#[derive(Debug, Serialize, Deserialize)]
+fn configure_in_memory_connection(connection: &Connection) -> Result<(), StoreError> {
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.pragma_update(None, "journal_mode", "MEMORY")?;
+    Ok(())
+}
+
+fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), StoreError> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 0 && version != DATABASE_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedDatabaseSchema {
+            path: path.to_path_buf(),
+            found: version,
+            expected: DATABASE_SCHEMA_VERSION,
+        });
+    }
+
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS app_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            revision INTEGER NOT NULL CHECK (revision >= 0),
+            settings_json TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS categories (
+            id TEXT PRIMARY KEY,
+            position INTEGER NOT NULL UNIQUE CHECK (position >= 0),
+            name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+            name_key TEXT NOT NULL UNIQUE CHECK (length(name_key) > 0),
+            description TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            position INTEGER NOT NULL UNIQUE CHECK (position >= 0),
+            title TEXT NOT NULL CHECK (length(trim(title)) > 0),
+            body_json TEXT NOT NULL,
+            due TEXT NOT NULL,
+            created TEXT NOT NULL,
+            done INTEGER NOT NULL CHECK (done IN (0, 1)),
+            importance INTEGER NOT NULL CHECK (importance BETWEEN 0 AND 3),
+            category_id TEXT REFERENCES categories(id) ON DELETE SET NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS attachments (
+            id TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL UNIQUE CHECK (sha256 = id),
+            media_type TEXT NOT NULL,
+            byte_len INTEGER NOT NULL CHECK (byte_len > 0),
+            storage_name TEXT NOT NULL UNIQUE
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS task_attachments (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            block_index INTEGER NOT NULL CHECK (block_index >= 0),
+            attachment_id TEXT NOT NULL REFERENCES attachments(id) ON DELETE RESTRICT,
+            PRIMARY KEY (task_id, block_index)
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS task_attachments_by_attachment
+            ON task_attachments(attachment_id);
+        ",
+    )?;
+    let settings = serde_json::to_string(&Settings::default()).map_err(|source| {
+        StoreError::Corrupt(format!("could not encode default settings: {source}"))
+    })?;
+    tx.execute(
+        "INSERT OR IGNORE INTO app_state(id, revision, settings_json) VALUES (1, 0, ?1)",
+        [settings],
+    )?;
+    if version == 0 {
+        tx.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn quick_check(connection: &Connection) -> Result<(), StoreError> {
+    let result: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if result != "ok" {
+        return Err(StoreError::Corrupt(format!(
+            "SQLite quick check failed: {result}"
+        )));
+    }
+    Ok(())
+}
+
+fn migration_complete(connection: &Connection) -> Result<bool, StoreError> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            [LEGACY_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.as_deref() == Some("1"))
+}
+
+fn read_revision(connection: &Connection) -> Result<u64, StoreError> {
+    let value: i64 =
+        connection.query_row("SELECT revision FROM app_state WHERE id = 1", [], |row| {
+            row.get(0)
+        })?;
+    u64::try_from(value).map_err(|_| StoreError::Corrupt(format!("negative revision {value}")))
+}
+
+fn load_snapshot(connection: &Connection) -> Result<StoreData, StoreError> {
+    let (revision, settings_json): (i64, String) = connection.query_row(
+        "SELECT revision, settings_json FROM app_state WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let revision = u64::try_from(revision)
+        .map_err(|_| StoreError::Corrupt(format!("negative revision {revision}")))?;
+    let settings: Settings = serde_json::from_str(&settings_json)
+        .map_err(|error| StoreError::Corrupt(format!("invalid settings JSON: {error}")))?;
+
+    let mut attachment_statement = connection.prepare(
+        "SELECT id, sha256, media_type, byte_len, storage_name FROM attachments ORDER BY id",
+    )?;
+    let attachment_rows = attachment_statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut attachments = Vec::new();
+    for row in attachment_rows {
+        let (id, sha256, media_type, byte_len, storage_name) = row?;
+        attachments.push(Attachment {
+            id,
+            sha256,
+            media_type,
+            byte_len: u64::try_from(byte_len).map_err(|_| {
+                StoreError::Corrupt(format!("attachment has invalid byte length {byte_len}"))
+            })?,
+            storage_name,
+        });
+    }
+
+    let mut categories_statement = connection.prepare(
+        "SELECT position, id, name, name_key, description FROM categories ORDER BY position",
+    )?;
+    let category_rows = categories_statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            Category {
+                id: row.get(1)?,
+                name: row.get(2)?,
+                description: row.get(4)?,
+            },
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut categories = Vec::new();
+    for (expected_position, row) in category_rows.enumerate() {
+        if expected_position >= MAX_CATEGORY_COUNT {
+            return Err(StoreError::Corrupt(format!(
+                "category count exceeds {MAX_CATEGORY_COUNT}"
+            )));
+        }
+        let (stored_position, category, stored_name_key) = row?;
+        validate_stored_position(stored_position, expected_position, "category")?;
+        let expected_name_key = category_name_key(&category.name);
+        if stored_name_key != expected_name_key {
+            return Err(StoreError::Corrupt(format!(
+                "category {:?} has identity key {stored_name_key:?}, expected {expected_name_key:?}",
+                category.id
+            )));
+        }
+        categories.push(category);
+    }
+
+    let mut tasks_statement = connection.prepare(
+        "SELECT position, id, title, body_json, due, created, done, importance, category_id
+         FROM tasks ORDER BY position",
+    )?;
+    let rows = tasks_statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, Option<String>>(8)?,
+        ))
+    })?;
+    let mut tasks = Vec::new();
+    for (expected_position, row) in rows.enumerate() {
+        if expected_position >= MAX_TASK_COUNT {
+            return Err(StoreError::Corrupt(format!(
+                "task count exceeds {MAX_TASK_COUNT}"
+            )));
+        }
+        let (stored_position, id, title, body_json, due, created, done, importance, category_id) =
+            row?;
+        validate_stored_position(stored_position, expected_position, "task")?;
+        let body = serde_json::from_str::<Vec<Block>>(&body_json).map_err(|error| {
+            StoreError::Corrupt(format!("task {id:?} has invalid body JSON: {error}"))
+        })?;
+        let importance = u8::try_from(importance).map_err(|_| {
+            StoreError::Corrupt(format!("task {id:?} has invalid importance {importance}"))
+        })?;
+        tasks.push(Task {
+            id,
+            title,
+            body,
+            due,
+            created,
+            done: done != 0,
+            importance,
+            category_id,
+        });
+    }
+    validate_task_attachment_rows(connection, &tasks)?;
+    let mut data = StoreData {
+        revision,
+        categories,
+        tasks,
+        settings,
+        attachments,
+    };
+    normalize_and_validate(
+        &mut data,
+        Local::now().naive_local(),
+        DueMode::Stored,
+        AttachmentMode::Persisted,
+    )
+    .map_err(|error| match error {
+        StoreError::Validation(message) => StoreError::Corrupt(message),
+        other => other,
+    })?;
+    Ok(data)
+}
+
+fn validate_task_attachment_rows(
+    connection: &Connection,
+    tasks: &[Task],
+) -> Result<(), StoreError> {
+    let expected: HashSet<(String, usize, String)> = tasks
+        .iter()
+        .flat_map(|task| {
+            task.body
+                .iter()
+                .enumerate()
+                .filter_map(|(block_index, block)| match block {
+                    Block::Image { attachment_id } => {
+                        Some((task.id.clone(), block_index, attachment_id.clone()))
+                    }
+                    _ => None,
+                })
+        })
+        .collect();
+    let mut statement = connection.prepare(
+        "SELECT task_id, block_index, attachment_id
+         FROM task_attachments ORDER BY task_id, block_index",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut stored = HashSet::new();
+    for row in rows {
+        let (task_id, block_index, attachment_id) = row?;
+        let block_index = usize::try_from(block_index).map_err(|_| {
+            StoreError::Corrupt(format!(
+                "task {task_id:?} has invalid attachment reference index {block_index}"
+            ))
+        })?;
+        stored.insert((task_id, block_index, attachment_id));
+    }
+    if stored != expected {
+        return Err(StoreError::Corrupt(
+            "task attachment reference rows do not match task body JSON".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stored_position(stored: i64, expected: usize, entity: &str) -> Result<(), StoreError> {
+    let expected = i64::try_from(expected)
+        .map_err(|_| StoreError::Corrupt(format!("{entity} position exceeds integer range")))?;
+    if stored != expected {
+        return Err(StoreError::Corrupt(format!(
+            "{entity} position {stored} is not contiguous (expected {expected})"
+        )));
+    }
+    Ok(())
+}
+
+fn persist_initial_snapshot(
+    tx: &Transaction<'_>,
+    data: &StoreData,
+    revision: u64,
+) -> Result<(), StoreError> {
+    {
+        let mut statement = tx.prepare(
+            "INSERT INTO categories(id, position, name, name_key, description)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (position, category) in data.categories.iter().enumerate() {
+            statement.execute(params![
+                category.id,
+                i64::try_from(position)
+                    .map_err(|_| StoreError::Validation("too many categories".into()))?,
+                category.name,
+                category_name_key(&category.name),
+                category.description,
+            ])?;
+        }
+    }
+    {
+        let mut statement = tx.prepare(
+            "INSERT INTO attachments(id, sha256, media_type, byte_len, storage_name)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for attachment in &data.attachments {
+            statement.execute(params![
+                attachment.id,
+                attachment.sha256,
+                attachment.media_type,
+                sqlite_attachment_size(attachment.byte_len)?,
+                attachment.storage_name,
+            ])?;
+        }
+    }
+    {
+        let mut statement = tx.prepare(
+            "INSERT INTO tasks(
+                id, position, title, body_json, due, created, done, importance, category_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for (position, task) in data.tasks.iter().enumerate() {
+            let body_json = serde_json::to_string(&task.body).map_err(|error| {
+                StoreError::Corrupt(format!("could not encode task {:?}: {error}", task.id))
+            })?;
+            statement.execute(params![
+                task.id,
+                i64::try_from(position)
+                    .map_err(|_| StoreError::Validation("too many tasks".into()))?,
+                task.title,
+                body_json,
+                task.due,
+                task.created,
+                i64::from(task.done),
+                i64::from(task.importance),
+                task.category_id,
+            ])?;
+        }
+    }
+    for task in &data.tasks {
+        insert_task_attachment_rows(tx, task)?;
+    }
+    persist_app_state(tx, revision, Some(&data.settings))?;
+    Ok(())
+}
+
+/// Persist only rows whose identity, content, or position changed.
+///
+/// Positions and category names have UNIQUE constraints. Rows that move or
+/// change names are first assigned transaction-private values outside the
+/// validated application domain, which makes swaps and insertions safe without
+/// deleting and recreating unrelated rows.
+fn persist_diff(
+    tx: &Transaction<'_>,
+    before: &StoreData,
+    after: &StoreData,
+) -> Result<(), StoreError> {
+    let before_categories: HashMap<&str, (usize, &Category)> = before
+        .categories
+        .iter()
+        .enumerate()
+        .map(|(position, category)| (category.id.as_str(), (position, category)))
+        .collect();
+    let after_categories: HashMap<&str, (usize, &Category)> = after
+        .categories
+        .iter()
+        .enumerate()
+        .map(|(position, category)| (category.id.as_str(), (position, category)))
+        .collect();
+    let before_tasks: HashMap<&str, (usize, &Task)> = before
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(position, task)| (task.id.as_str(), (position, task)))
+        .collect();
+    let after_tasks: HashMap<&str, (usize, &Task)> = after
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(position, task)| (task.id.as_str(), (position, task)))
+        .collect();
+    let before_attachments: HashMap<&str, &Attachment> = before
+        .attachments
+        .iter()
+        .map(|attachment| (attachment.id.as_str(), attachment))
+        .collect();
+    let after_attachments: HashMap<&str, &Attachment> = after
+        .attachments
+        .iter()
+        .map(|attachment| (attachment.id.as_str(), attachment))
+        .collect();
+
+    for attachment in &before.attachments {
+        if after_attachments.get(attachment.id.as_str()).copied() != Some(attachment) {
+            return Err(StoreError::Validation(format!(
+                "attachment {:?} metadata is immutable",
+                attachment.id
+            )));
+        }
+    }
+    for attachment in &after.attachments {
+        if !before_attachments.contains_key(attachment.id.as_str()) {
+            tx.execute(
+                "INSERT INTO attachments(id, sha256, media_type, byte_len, storage_name)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    attachment.id,
+                    attachment.sha256,
+                    attachment.media_type,
+                    sqlite_attachment_size(attachment.byte_len)?,
+                    attachment.storage_name,
+                ],
+            )?;
+        }
+    }
+
+    // Remove tasks first so deleting a task and its category does not produce
+    // an unnecessary ON DELETE SET NULL update.
+    for task in &before.tasks {
+        if !after_tasks.contains_key(task.id.as_str()) {
+            execute_one(
+                tx,
+                "DELETE FROM tasks WHERE id = ?1",
+                [task.id.as_str()],
+                "task",
+                &task.id,
+            )?;
+        }
+    }
+
+    // Free every old identity key that may be replaced. Control characters are
+    // rejected by validation, so these temporary values cannot collide with
+    // application data and are never visible outside this transaction.
+    let mut temporary_name_index = 0usize;
+    for category in &before.categories {
+        let name_changed_or_removed = after_categories
+            .get(category.id.as_str())
+            .is_none_or(|(_, current)| current.name != category.name);
+        if name_changed_or_removed {
+            let temporary_name = format!("\u{1f}mach-category-{temporary_name_index}");
+            temporary_name_index += 1;
+            execute_one(
+                tx,
+                "UPDATE categories SET name = ?1, name_key = ?1 WHERE id = ?2",
+                params![temporary_name, category.id],
+                "category",
+                &category.id,
+            )?;
+        }
+    }
+
+    let category_position_base = before.categories.len().max(after.categories.len());
+    let mut category_position_offset = 0usize;
+    for (old_position, category) in before.categories.iter().enumerate() {
+        if let Some((new_position, _)) = after_categories.get(category.id.as_str()).copied()
+            && new_position != old_position
+        {
+            let temporary = temporary_position(
+                category_position_base,
+                category_position_offset,
+                "categories",
+            )?;
+            category_position_offset += 1;
+            execute_one(
+                tx,
+                "UPDATE categories SET position = ?1 WHERE id = ?2",
+                params![temporary, category.id],
+                "category",
+                &category.id,
+            )?;
+        }
+    }
+    for category in &after.categories {
+        if !before_categories.contains_key(category.id.as_str()) {
+            let temporary = temporary_position(
+                category_position_base,
+                category_position_offset,
+                "categories",
+            )?;
+            category_position_offset += 1;
+            tx.execute(
+                "INSERT INTO categories(id, position, name, name_key, description)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    category.id,
+                    temporary,
+                    category.name,
+                    category_name_key(&category.name),
+                    category.description
+                ],
+            )?;
+        }
+    }
+
+    let task_position_base = before.tasks.len().max(after.tasks.len());
+    let mut task_position_offset = 0usize;
+    for (old_position, task) in before.tasks.iter().enumerate() {
+        if let Some((new_position, _)) = after_tasks.get(task.id.as_str()).copied()
+            && new_position != old_position
+        {
+            let temporary = temporary_position(task_position_base, task_position_offset, "tasks")?;
+            task_position_offset += 1;
+            execute_one(
+                tx,
+                "UPDATE tasks SET position = ?1 WHERE id = ?2",
+                params![temporary, task.id],
+                "task",
+                &task.id,
+            )?;
+        }
+    }
+
+    // New categories now exist, so task foreign keys can safely move to them
+    // before obsolete categories are deleted.
+    for task in &after.tasks {
+        if let Some((_, previous)) = before_tasks.get(task.id.as_str()).copied()
+            && previous != task
+        {
+            let body_json = encode_task_body(task)?;
+            execute_one(
+                tx,
+                "UPDATE tasks SET
+                    title = ?1, body_json = ?2, due = ?3, created = ?4,
+                    done = ?5, importance = ?6, category_id = ?7
+                 WHERE id = ?8",
+                params![
+                    task.title,
+                    body_json,
+                    task.due,
+                    task.created,
+                    i64::from(task.done),
+                    i64::from(task.importance),
+                    task.category_id,
+                    task.id,
+                ],
+                "task",
+                &task.id,
+            )?;
+        }
+    }
+    for task in &after.tasks {
+        if !before_tasks.contains_key(task.id.as_str()) {
+            let temporary = temporary_position(task_position_base, task_position_offset, "tasks")?;
+            task_position_offset += 1;
+            let body_json = encode_task_body(task)?;
+            tx.execute(
+                "INSERT INTO tasks(
+                    id, position, title, body_json, due, created, done, importance, category_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    task.id,
+                    temporary,
+                    task.title,
+                    body_json,
+                    task.due,
+                    task.created,
+                    i64::from(task.done),
+                    i64::from(task.importance),
+                    task.category_id,
+                ],
+            )?;
+        }
+    }
+
+    for task in &after.tasks {
+        let body_changed_or_new = before_tasks
+            .get(task.id.as_str())
+            .is_none_or(|(_, previous)| previous.body != task.body);
+        if body_changed_or_new {
+            tx.execute(
+                "DELETE FROM task_attachments WHERE task_id = ?1",
+                [&task.id],
+            )?;
+            insert_task_attachment_rows(tx, task)?;
+        }
+    }
+
+    for category in &before.categories {
+        if !after_categories.contains_key(category.id.as_str()) {
+            execute_one(
+                tx,
+                "DELETE FROM categories WHERE id = ?1",
+                [category.id.as_str()],
+                "category",
+                &category.id,
+            )?;
+        }
+    }
+
+    for category in &after.categories {
+        if let Some((_, previous)) = before_categories.get(category.id.as_str()).copied()
+            && previous != category
+        {
+            execute_one(
+                tx,
+                "UPDATE categories
+                 SET name = ?1, name_key = ?2, description = ?3
+                 WHERE id = ?4",
+                params![
+                    category.name,
+                    category_name_key(&category.name),
+                    category.description,
+                    category.id
+                ],
+                "category",
+                &category.id,
+            )?;
+        }
+    }
+
+    // All rows whose final slots changed are currently at unique temporary
+    // positions. Rows omitted here kept the same slot, so final assignment
+    // cannot collide with them.
+    for (position, category) in after.categories.iter().enumerate() {
+        let moved_or_new = before_categories
+            .get(category.id.as_str())
+            .is_none_or(|(old_position, _)| *old_position != position);
+        if moved_or_new {
+            let position = sqlite_position(position, "categories")?;
+            execute_one(
+                tx,
+                "UPDATE categories SET position = ?1 WHERE id = ?2",
+                params![position, category.id],
+                "category",
+                &category.id,
+            )?;
+        }
+    }
+    for (position, task) in after.tasks.iter().enumerate() {
+        let moved_or_new = before_tasks
+            .get(task.id.as_str())
+            .is_none_or(|(old_position, _)| *old_position != position);
+        if moved_or_new {
+            let position = sqlite_position(position, "tasks")?;
+            execute_one(
+                tx,
+                "UPDATE tasks SET position = ?1 WHERE id = ?2",
+                params![position, task.id],
+                "task",
+                &task.id,
+            )?;
+        }
+    }
+
+    let settings = (before.settings != after.settings).then_some(&after.settings);
+    persist_app_state(tx, after.revision, settings)?;
+    Ok(())
+}
+
+fn execute_one<P: rusqlite::Params>(
+    tx: &Transaction<'_>,
+    sql: &str,
+    params: P,
+    entity: &str,
+    id: &str,
+) -> Result<(), StoreError> {
+    let changed = tx.execute(sql, params)?;
+    if changed != 1 {
+        return Err(StoreError::Corrupt(format!(
+            "expected to change one {entity} {id:?}, changed {changed}"
+        )));
+    }
+    Ok(())
+}
+
+fn temporary_position(base: usize, offset: usize, entity: &str) -> Result<i64, StoreError> {
+    let position = base
+        .checked_add(offset)
+        .ok_or_else(|| StoreError::Validation(format!("too many {entity}")))?;
+    sqlite_position(position, entity)
+}
+
+fn sqlite_position(position: usize, entity: &str) -> Result<i64, StoreError> {
+    i64::try_from(position).map_err(|_| StoreError::Validation(format!("too many {entity}")))
+}
+
+fn sqlite_attachment_size(byte_len: u64) -> Result<i64, StoreError> {
+    i64::try_from(byte_len)
+        .map_err(|_| StoreError::Validation("attachment byte length exceeds integer range".into()))
+}
+
+fn insert_task_attachment_rows(tx: &Transaction<'_>, task: &Task) -> Result<(), StoreError> {
+    let mut statement = tx.prepare(
+        "INSERT INTO task_attachments(task_id, block_index, attachment_id)
+         VALUES (?1, ?2, ?3)",
+    )?;
+    for (block_index, block) in task.body.iter().enumerate() {
+        let Block::Image { attachment_id } = block else {
+            continue;
+        };
+        statement.execute(params![
+            task.id,
+            sqlite_position(block_index, "task attachment blocks")?,
+            attachment_id,
+        ])?;
+    }
+    Ok(())
+}
+
+fn encode_task_body(task: &Task) -> Result<String, StoreError> {
+    serde_json::to_string(&task.body).map_err(|error| {
+        StoreError::Corrupt(format!("could not encode task {:?}: {error}", task.id))
+    })
+}
+
+fn persist_app_state(
+    tx: &Transaction<'_>,
+    revision: u64,
+    settings: Option<&Settings>,
+) -> Result<(), StoreError> {
+    let revision = i64::try_from(revision)
+        .map_err(|_| StoreError::Corrupt("revision exceeds SQLite integer range".into()))?;
+    let changed = if let Some(settings) = settings {
+        let settings_json = serde_json::to_string(settings)
+            .map_err(|error| StoreError::Corrupt(format!("could not encode settings: {error}")))?;
+        tx.execute(
+            "UPDATE app_state SET revision = ?1, settings_json = ?2 WHERE id = 1",
+            params![revision, settings_json],
+        )?
+    } else {
+        tx.execute(
+            "UPDATE app_state SET revision = ?1 WHERE id = 1",
+            [revision],
+        )?
+    };
+    if changed != 1 {
+        return Err(StoreError::Corrupt(format!(
+            "expected to update app state, changed {changed} rows"
+        )));
+    }
+    Ok(())
+}
+
+fn import_task_attachments(
+    data: &mut StoreData,
+    images_root: Option<&Path>,
+) -> Result<(), StoreError> {
+    let mut known: HashMap<String, Attachment> = data
+        .attachments
+        .iter()
+        .cloned()
+        .map(|attachment| (attachment.id.clone(), attachment))
+        .collect();
+
+    for task in &mut data.tasks {
+        for block in &mut task.body {
+            let Block::Image { attachment_id } = block else {
+                continue;
+            };
+            if known.contains_key(attachment_id) {
+                continue;
+            }
+            if is_attachment_id(attachment_id) {
+                return Err(StoreError::Validation(format!(
+                    "task {:?} refers to unknown attachment {attachment_id:?}",
+                    task.id
+                )));
+            }
+            let Some(images_root) = images_root else {
+                return Err(StoreError::Validation(
+                    "image attachments require a persistent store".into(),
+                ));
+            };
+            let imported = import_attachment(attachment_id, images_root)?;
+            if let Some(existing) = known.get(&imported.id) {
+                if existing != &imported {
+                    return Err(StoreError::Corrupt(format!(
+                        "attachment {:?} metadata does not match imported content",
+                        imported.id
+                    )));
+                }
+            } else {
+                known.insert(imported.id.clone(), imported.clone());
+                data.attachments.push(imported.clone());
+            }
+            *attachment_id = imported.id;
+        }
+    }
+    data.attachments
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(())
+}
+
+fn import_attachment(reference: &str, images_root: &Path) -> Result<Attachment, StoreError> {
+    let source_path = crate::image::expand_in(reference, images_root);
+    let mut source = fs::File::open(&source_path)
+        .map_err(|error| StoreError::io("open image attachment", &source_path, error))?;
+    let metadata = source
+        .metadata()
+        .map_err(|error| StoreError::io("inspect image attachment", &source_path, error))?;
+    if !metadata.is_file() {
+        return Err(StoreError::Validation(format!(
+            "image attachment {} is not a regular file",
+            source_path.display()
+        )));
+    }
+
+    ensure_private_directory(images_root)?;
+    let temp_path = images_root.join(format!(".mach-attachment-{}.tmp", uuid::Uuid::new_v4()));
+    let mut temp = open_private_attachment_temp(&temp_path)?;
+    let result = (|| {
+        let mut hasher = Sha256::new();
+        let mut byte_len = 0_u64;
+        let mut prefix = [0_u8; 32];
+        let mut prefix_len = 0usize;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .map_err(|error| StoreError::io("read image attachment", &source_path, error))?;
+            if read == 0 {
+                break;
+            }
+            byte_len = byte_len
+                .checked_add(read as u64)
+                .ok_or_else(|| StoreError::Validation("image attachment is too large".into()))?;
+            if byte_len > MAX_ATTACHMENT_BYTES {
+                return Err(StoreError::Validation(format!(
+                    "image attachment {} exceeds the {} MiB safety limit",
+                    source_path.display(),
+                    MAX_ATTACHMENT_BYTES / 1024 / 1024
+                )));
+            }
+            if prefix_len < prefix.len() {
+                let copy = (prefix.len() - prefix_len).min(read);
+                prefix[prefix_len..prefix_len + copy].copy_from_slice(&buffer[..copy]);
+                prefix_len += copy;
+            }
+            hasher.update(&buffer[..read]);
+            temp.write_all(&buffer[..read]).map_err(|error| {
+                StoreError::io("write managed image attachment", &temp_path, error)
+            })?;
+        }
+        if byte_len == 0 {
+            return Err(StoreError::Validation(format!(
+                "image attachment {} is empty",
+                source_path.display()
+            )));
+        }
+        let format = image::guess_format(&prefix[..prefix_len]).map_err(|_| {
+            StoreError::Validation(format!(
+                "image attachment {} is not a supported PNG, JPEG, GIF, or WebP image",
+                source_path.display()
+            ))
+        })?;
+        let (extension, media_type) = attachment_format(format).ok_or_else(|| {
+            StoreError::Validation(format!(
+                "image attachment {} is not a supported PNG, JPEG, GIF, or WebP image",
+                source_path.display()
+            ))
+        })?;
+        temp.sync_all()
+            .map_err(|error| StoreError::io("sync managed image attachment", &temp_path, error))?;
+        drop(temp);
+        crate::image::load_dynamic(&temp_path).map_err(StoreError::Validation)?;
+
+        let id = format!("{:x}", hasher.finalize());
+        let storage_name = format!("{id}.{extension}");
+        let destination = images_root.join(&storage_name);
+        if destination.exists() {
+            let (stored_hash, stored_len) = hash_attachment_file(&destination)?;
+            if stored_hash != id || stored_len != byte_len {
+                return Err(StoreError::Corrupt(format!(
+                    "managed attachment {} does not match its content address",
+                    destination.display()
+                )));
+            }
+            fs::remove_file(&temp_path).map_err(|error| {
+                StoreError::io("remove duplicate image attachment", &temp_path, error)
+            })?;
+        } else {
+            fs::rename(&temp_path, &destination).map_err(|error| {
+                StoreError::io("install managed image attachment", &destination, error)
+            })?;
+            set_private_file(&destination)?;
+            fs::File::open(images_root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| StoreError::io("sync image directory", images_root, error))?;
+        }
+        Ok(Attachment {
+            id: id.clone(),
+            sha256: id,
+            media_type: media_type.into(),
+            byte_len,
+            storage_name,
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn open_private_attachment_temp(path: &Path) -> Result<fs::File, StoreError> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .map_err(|error| StoreError::io("create managed image attachment", path, error))
+}
+
+fn hash_attachment_file(path: &Path) -> Result<(String, u64), StoreError> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| StoreError::io("open managed image attachment", path, error))?;
+    let mut hasher = Sha256::new();
+    let mut byte_len = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| StoreError::io("read managed image attachment", path, error))?;
+        if read == 0 {
+            break;
+        }
+        byte_len = byte_len
+            .checked_add(read as u64)
+            .ok_or_else(|| StoreError::Corrupt("managed attachment is too large".into()))?;
+        if byte_len > MAX_ATTACHMENT_BYTES {
+            return Err(StoreError::Corrupt(format!(
+                "managed attachment {} exceeds the safety limit",
+                path.display()
+            )));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((format!("{:x}", hasher.finalize()), byte_len))
+}
+
+fn attachment_format(format: ImageFormat) -> Option<(&'static str, &'static str)> {
+    match format {
+        ImageFormat::Png => Some(("png", "image/png")),
+        ImageFormat::Jpeg => Some(("jpg", "image/jpeg")),
+        ImageFormat::Gif => Some(("gif", "image/gif")),
+        ImageFormat::WebP => Some(("webp", "image/webp")),
+        _ => None,
+    }
+}
+
+fn is_attachment_id(value: &str) -> bool {
+    value.len() == ATTACHMENT_ID_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Clone, Copy)]
+enum DueMode {
+    NewWrite,
+    LegacyMigration,
+    Stored,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttachmentMode {
+    Draft,
+    Persisted,
+}
+
+fn normalize_and_validate(
+    data: &mut StoreData,
+    now: NaiveDateTime,
+    due_mode: DueMode,
+    attachment_mode: AttachmentMode,
+) -> Result<(), StoreError> {
+    if data.categories.len() > MAX_CATEGORY_COUNT {
+        return Err(StoreError::Validation(format!(
+            "category limit is {MAX_CATEGORY_COUNT}"
+        )));
+    }
+    if data.tasks.len() > MAX_TASK_COUNT {
+        return Err(StoreError::Validation(format!(
+            "task limit is {MAX_TASK_COUNT}"
+        )));
+    }
+
+    let attachment_ids = validate_attachments(&data.attachments)?;
+
+    let mut category_ids = HashSet::new();
+    let mut category_names = HashSet::new();
+    for category in &data.categories {
+        validate_single_line(&category.id, "category id")?;
+        validate_byte_limit(&category.id, ID_MAX_BYTES, "category id")?;
+        if category.id.is_empty() || category.id == ALL_CATEGORY {
+            return Err(StoreError::Validation(
+                "real category id cannot be empty".into(),
+            ));
+        }
+        if !category_ids.insert(category.id.as_str()) {
+            return Err(StoreError::Validation(format!(
+                "category id {:?} must be unique",
+                category.id
+            )));
+        }
+        validate_single_line(&category.name, "category name")?;
+        validate_byte_limit(
+            &category.name,
+            text_byte_limit(MAX_CATEGORY_NAME_LEN),
+            "category name",
+        )?;
+        let name = category.name.trim();
+        if name.is_empty() {
+            return Err(StoreError::Validation(
+                "category name cannot be empty".into(),
+            ));
+        }
+        if name.graphemes(true).count() > MAX_CATEGORY_NAME_LEN {
+            return Err(StoreError::Validation(format!(
+                "category name {:?} exceeds {MAX_CATEGORY_NAME_LEN} characters",
+                category.name
+            )));
+        }
+        if !category_names.insert(category_name_key(name)) {
+            return Err(StoreError::Validation(format!(
+                "category names must be unique (duplicate {:?})",
+                category.name
+            )));
+        }
+        validate_multiline(
+            &category.description,
+            MAX_CATEGORY_DESC_LINES,
+            MAX_CATEGORY_DESC_LINE_LEN,
+            "category description",
+        )?;
+    }
+
+    let mut task_ids = HashSet::new();
+    for task in &mut data.tasks {
+        validate_single_line(&task.id, "task id")?;
+        validate_byte_limit(&task.id, ID_MAX_BYTES, "task id")?;
+        if task.id.is_empty() || !task_ids.insert(task.id.as_str()) {
+            return Err(StoreError::Validation(format!(
+                "task id {:?} must be nonempty and unique",
+                task.id
+            )));
+        }
+        validate_single_line(&task.title, "task title")?;
+        validate_byte_limit(&task.title, text_byte_limit(MAX_TITLE_LEN), "task title")?;
+        if task.title.trim().is_empty() {
+            return Err(StoreError::Validation(format!(
+                "task {:?} title cannot be empty",
+                task.id
+            )));
+        }
+        if task.title.graphemes(true).count() > MAX_TITLE_LEN {
+            return Err(StoreError::Validation(format!(
+                "task {:?} title exceeds {MAX_TITLE_LEN} characters",
+                task.id
+            )));
+        }
+        if task.importance > MAX_IMPORTANCE {
+            return Err(StoreError::Validation(format!(
+                "task {:?} importance must be 0-{MAX_IMPORTANCE}",
+                task.id
+            )));
+        }
+        if task.body.len() > MAX_BODY_LINES {
+            return Err(StoreError::Validation(format!(
+                "task {:?} body exceeds {MAX_BODY_LINES} blocks",
+                task.id
+            )));
+        }
+        for block in &task.body {
+            validate_block(block, &task.id)?;
+            if let Block::Image { attachment_id } = block {
+                let known = attachment_ids.contains(attachment_id.as_str());
+                if attachment_mode == AttachmentMode::Persisted && !known {
+                    return Err(StoreError::Validation(format!(
+                        "task {:?} refers to unknown attachment {attachment_id:?}",
+                        task.id
+                    )));
+                }
+                if attachment_mode == AttachmentMode::Draft
+                    && is_attachment_id(attachment_id)
+                    && !known
+                {
+                    return Err(StoreError::Validation(format!(
+                        "task {:?} refers to unknown attachment {attachment_id:?}",
+                        task.id
+                    )));
+                }
+            }
+        }
+        if let Some(category_id) = task.category_id.as_deref() {
+            validate_single_line(category_id, "task category id")?;
+            validate_byte_limit(category_id, ID_MAX_BYTES, "task category id")?;
+            if !category_ids.contains(category_id) {
+                return Err(StoreError::Validation(format!(
+                    "task {:?} refers to unknown category {category_id:?}",
+                    task.id
+                )));
+            }
+        }
+        validate_single_line(&task.due, "task due")?;
+        validate_byte_limit(&task.due, DUE_MAX_BYTES, "task due")?;
+        let normalized_due = match due_mode {
+            DueMode::NewWrite => due::normalize_for_write_at(&task.due, now),
+            DueMode::LegacyMigration => due::normalize_legacy_at(&task.due, now),
+            DueMode::Stored => due::normalize_for_write_at(&task.due, now),
+        }
+        .map_err(|error| StoreError::Validation(format!("task {:?} has {error}", task.id)))?;
+        if matches!(due_mode, DueMode::Stored) && normalized_due != task.due {
+            return Err(StoreError::Validation(format!(
+                "task {:?} has noncanonical due value {:?}",
+                task.id, task.due
+            )));
+        }
+        task.due = normalized_due;
+        validate_single_line(&task.created, "task creation timestamp")?;
+        validate_byte_limit(&task.created, CREATED_MAX_BYTES, "task creation timestamp")?;
+        NaiveDateTime::parse_from_str(&task.created, "%Y-%m-%d %H:%M:%S").map_err(|_| {
+            StoreError::Validation(format!(
+                "task {:?} has invalid creation timestamp {:?}",
+                task.id, task.created
+            ))
+        })?;
+    }
+    validate_settings(&data.settings)
+}
+
+fn validate_block(block: &Block, task_id: &str) -> Result<(), StoreError> {
+    let (kind, value) = match block {
+        Block::Text { text } => ("text", text),
+        Block::Todo { text, .. } => ("subtask", text),
+        Block::Bullet { text } => ("bullet", text),
+        Block::Number { text } => ("number", text),
+        Block::Link { url } => ("link", url),
+        Block::Image { attachment_id } => ("image attachment", attachment_id),
+    };
+    validate_single_line(value, kind)?;
+    validate_byte_limit(value, text_byte_limit(MAX_NOTES_LINE_LEN), kind)?;
+    if value.graphemes(true).count() > MAX_NOTES_LINE_LEN {
+        return Err(StoreError::Validation(format!(
+            "task {task_id:?} {kind} exceeds {MAX_NOTES_LINE_LEN} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_attachments(attachments: &[Attachment]) -> Result<HashSet<&str>, StoreError> {
+    let mut ids = HashSet::new();
+    let mut storage_names = HashSet::new();
+    for attachment in attachments {
+        if !is_attachment_id(&attachment.id) || attachment.sha256 != attachment.id {
+            return Err(StoreError::Validation(format!(
+                "attachment {:?} has an invalid content address",
+                attachment.id
+            )));
+        }
+        if !ids.insert(attachment.id.as_str()) {
+            return Err(StoreError::Validation(format!(
+                "attachment id {:?} must be unique",
+                attachment.id
+            )));
+        }
+        if attachment.byte_len == 0 || attachment.byte_len > MAX_ATTACHMENT_BYTES {
+            return Err(StoreError::Validation(format!(
+                "attachment {:?} has invalid byte length {}",
+                attachment.id, attachment.byte_len
+            )));
+        }
+        let extension = match attachment.media_type.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            other => {
+                return Err(StoreError::Validation(format!(
+                    "attachment {:?} has unsupported media type {other:?}",
+                    attachment.id
+                )));
+            }
+        };
+        let expected_storage_name = format!("{}.{}", attachment.id, extension);
+        if attachment.storage_name != expected_storage_name {
+            return Err(StoreError::Validation(format!(
+                "attachment {:?} has invalid storage name {:?}",
+                attachment.id, attachment.storage_name
+            )));
+        }
+        if !storage_names.insert(attachment.storage_name.as_str()) {
+            return Err(StoreError::Validation(format!(
+                "attachment storage name {:?} must be unique",
+                attachment.storage_name
+            )));
+        }
+    }
+    Ok(ids)
+}
+
+fn validate_multiline(
+    value: &str,
+    max_lines: usize,
+    max_line_len: usize,
+    label: &str,
+) -> Result<(), StoreError> {
+    let max_line_bytes = text_byte_limit(max_line_len);
+    let max_total_bytes = max_lines.saturating_mul(max_line_bytes.saturating_add(1));
+    validate_byte_limit(value, max_total_bytes, label)?;
+    if value
+        .chars()
+        .any(|character| character.is_control() && character != '\n')
+    {
+        return Err(StoreError::Validation(format!(
+            "{label} contains a control character"
+        )));
+    }
+    for (index, line) in value.split('\n').enumerate() {
+        if index >= max_lines {
+            return Err(StoreError::Validation(format!(
+                "{label} exceeds {max_lines} lines"
+            )));
+        }
+        if line.len() > max_line_bytes {
+            return Err(StoreError::Validation(format!(
+                "{label} line exceeds {max_line_bytes} bytes"
+            )));
+        }
+        if line.graphemes(true).count() > max_line_len {
+            return Err(StoreError::Validation(format!(
+                "{label} line exceeds {max_line_len} characters"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_single_line(value: &str, label: &str) -> Result<(), StoreError> {
+    if value.chars().any(char::is_control) {
+        return Err(StoreError::Validation(format!(
+            "{label} contains a control character"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_byte_limit(value: &str, max_bytes: usize, label: &str) -> Result<(), StoreError> {
+    if value.len() > max_bytes {
+        return Err(StoreError::Validation(format!(
+            "{label} exceeds {max_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Unicode compatibility normalization followed by full default case folding
+/// defines category identity. A final normalization makes the key stable when
+/// folding introduces decomposed characters.
+fn category_name_key(value: &str) -> String {
+    caseless_key(value.trim())
+}
+
+fn category_name_has_prefix(name: &str, folded_query: &str) -> bool {
+    let normalized: String = name.trim().nfkc().collect();
+    normalized
+        .char_indices()
+        .skip(1)
+        .map(|(index, _)| index)
+        .chain(std::iter::once(normalized.len()))
+        .any(|end| category_name_key(&normalized[..end]) == folded_query)
+}
+
+fn validate_settings(settings: &Settings) -> Result<(), StoreError> {
+    validate_single_line(&settings.date_format, "date format")?;
+    validate_byte_limit(
+        &settings.date_format,
+        SETTINGS_VALUE_MAX_BYTES,
+        "date format",
+    )?;
+    validate_single_line(&settings.selected_color, "theme")?;
+    validate_byte_limit(&settings.selected_color, SETTINGS_VALUE_MAX_BYTES, "theme")?;
+    validate_single_line(&settings.sort, "sort")?;
+    validate_byte_limit(&settings.sort, SETTINGS_VALUE_MAX_BYTES, "sort")?;
+    validate_single_line(&settings.preview_position, "preview position")?;
+    validate_byte_limit(
+        &settings.preview_position,
+        SETTINGS_VALUE_MAX_BYTES,
+        "preview position",
+    )?;
+    if let Some(version) = settings.last_run_version.as_deref() {
+        validate_single_line(version, "last-run version")?;
+        validate_byte_limit(version, SETTINGS_VALUE_MAX_BYTES, "last-run version")?;
+    }
+    if !DATE_FORMATS.contains(&settings.date_format.as_str()) {
+        return Err(StoreError::Validation(format!(
+            "unknown date format {:?}",
+            settings.date_format
+        )));
+    }
+    if !THEMES.contains(&settings.selected_color.as_str()) {
+        return Err(StoreError::Validation(format!(
+            "unknown theme {:?}",
+            settings.selected_color
+        )));
+    }
+    if !SORTS.contains(&settings.sort.as_str()) {
+        return Err(StoreError::Validation(format!(
+            "unknown sort {:?}",
+            settings.sort
+        )));
+    }
+    if !PREVIEW_POSITIONS.contains(&settings.preview_position.as_str()) {
+        return Err(StoreError::Validation(format!(
+            "unknown preview position {:?}",
+            settings.preview_position
+        )));
+    }
+    Ok(())
+}
+
+fn read_optional_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StoreError> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StoreError::io("read", path, error)),
+    };
+    let size = file
+        .metadata()
+        .map_err(|error| StoreError::io("inspect", path, error))?
+        .len();
+    if size > MAX_LEGACY_JSON_BYTES {
+        return Err(StoreError::Validation(format!(
+            "legacy file {} is larger than the {} MiB safety limit",
+            path.display(),
+            MAX_LEGACY_JSON_BYTES / 1024 / 1024
+        )));
+    }
+    serde_json::from_reader(std::io::BufReader::new(file))
+        .map(Some)
+        .map_err(|source| StoreError::Json {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn validate_legacy_schema(path: &Path, schema: Option<u32>) -> Result<(), StoreError> {
+    if let Some(found) = schema
+        && found != SCHEMA_VERSION
+    {
+        return Err(StoreError::UnsupportedLegacySchema {
+            path: path.to_path_buf(),
+            found,
+            expected: SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
 struct TasksFile {
     schema: u32,
     tasks: Vec<Task>,
 }
 
-#[derive(Debug, Serialize)]
-struct TasksFileRef<'a> {
-    schema: u32,
-    tasks: &'a [Task],
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct CategoriesFile {
     schema: u32,
     categories: Vec<Category>,
 }
 
-#[derive(Debug, Serialize)]
-struct CategoriesFileRef<'a> {
-    schema: u32,
-    categories: Vec<&'a Category>,
+fn ensure_private_directory(path: &Path) -> Result<(), StoreError> {
+    let created = match fs::create_dir(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent).map_err(|parent_error| {
+                    StoreError::io("create parent directory", parent, parent_error)
+                })?;
+            }
+            match fs::create_dir(path) {
+                Ok(()) => true,
+                Err(retry)
+                    if retry.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() =>
+                {
+                    false
+                }
+                Err(retry) => {
+                    return Err(StoreError::io("create directory", path, retry));
+                }
+            }
+        }
+        Err(error) => return Err(StoreError::io("create directory", path, error)),
+    };
+    if created {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|error| StoreError::io("set permissions on", path, error))?;
+        }
+    }
+    Ok(())
 }
 
-/// Load categories (real ones only — no "All Tasks").
-pub fn load_categories() -> Vec<Category> {
-    let path = &paths().categories;
-    if !path.exists() {
-        return Vec::new();
+fn prepare_private_database_file(path: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(file) => drop(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(StoreError::io("create database", path, error)),
+        }
     }
-    let Some(file) = read_json::<CategoriesFile>(path) else {
-        die_load(path, "could not read categories (invalid JSON?)");
-    };
-    if file.schema != SCHEMA_VERSION {
-        die_load(
-            path,
-            format!(
-                "unsupported schema {} (this mach expects {SCHEMA_VERSION})",
-                file.schema
-            ),
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn set_private_file(path: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| StoreError::io("set permissions on", path, error))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_directory_requires_a_home_when_no_path_is_configured() {
+        let error = resolve_data_dir_from(None, None, None)
+            .expect_err("missing home must not silently select the working directory");
+        assert!(matches!(error, StoreError::Validation(_)));
+
+        assert_eq!(
+            resolve_data_dir_from(Some(PathBuf::from("/tmp/mach")), None, None).unwrap(),
+            PathBuf::from("/tmp/mach")
         );
-    }
-    file.categories
-        .into_iter()
-        .filter(|c| !c.is_all())
-        .collect()
-}
-
-pub fn save_categories(categories: &[Category]) -> std::io::Result<()> {
-    let real: Vec<&Category> = categories.iter().filter(|c| !c.is_all()).collect();
-    let file = CategoriesFileRef {
-        schema: SCHEMA_VERSION,
-        categories: real,
-    };
-    write_json(&paths().categories, &file)
-}
-
-pub fn load_tasks() -> Vec<Task> {
-    let path = &paths().tasks;
-    if !path.exists() {
-        return Vec::new();
-    }
-    let Some(file) = read_json::<TasksFile>(path) else {
-        die_load(path, "could not read tasks (invalid JSON?)");
-    };
-    if file.schema != SCHEMA_VERSION {
-        die_load(
-            path,
-            format!(
-                "unsupported schema {} (this mach expects {SCHEMA_VERSION})",
-                file.schema
-            ),
+        assert_eq!(
+            resolve_data_dir_from(None, Some(PathBuf::from("/tmp/configured")), None).unwrap(),
+            PathBuf::from("/tmp/configured")
         );
+        assert!(resolve_data_dir_from(Some(PathBuf::from("~/.mach")), None, None).is_err());
     }
-    file.tasks
-}
-
-pub fn save_tasks(tasks: &[Task]) -> std::io::Result<()> {
-    let file = TasksFileRef {
-        schema: SCHEMA_VERSION,
-        tasks,
-    };
-    write_json(&paths().tasks, &file)
-}
-
-pub fn load_all() -> (Vec<Category>, Vec<Task>) {
-    (load_categories(), load_tasks())
 }

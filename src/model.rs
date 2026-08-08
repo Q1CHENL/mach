@@ -1,11 +1,15 @@
 //! Task and category types for the local todo store.
 //!
-//! On-disk format uses a versioned envelope (`schema` = [`SCHEMA_VERSION`]).
-//! "All Tasks" is never stored — it is a UI view over every task.
+//! SQLite is the current on-disk format. [`SCHEMA_VERSION`] identifies only
+//! the legacy JSON envelopes accepted by the one-time importer. "All Tasks"
+//! is never stored — it is a UI view over every task.
 
+use caseless::Caseless;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
+/// Legacy `tasks.json` / `categories.json` envelope schema accepted on import.
 pub const SCHEMA_VERSION: u32 = 3;
 
 pub const MAX_TASK_COUNT: usize = 1024;
@@ -18,10 +22,23 @@ pub const MAX_CATEGORY_DESC_LINE_LEN: usize = 256;
 pub const MAX_CATEGORY_DESC_LINES: usize = 64;
 pub const MAX_CATEGORY_COUNT: usize = 128;
 
+/// Byte budget paired with a user-visible grapheme limit. This keeps a single
+/// grapheme with pathological combining sequences from bypassing every text
+/// length boundary while leaving generous room for emoji ZWJ sequences.
+pub fn text_byte_limit(max_graphemes: usize) -> usize {
+    max_graphemes.saturating_mul(16).max(256)
+}
+
+/// Stable Unicode compatibility-normalized, default-case-folded text used by
+/// every caseless identity and search path.
+pub fn caseless_key(value: &str) -> String {
+    value.nfkc().default_case_fold().nfkc().collect()
+}
+
 /// Sentinel category id for the "All Tasks" view. Not written to disk.
 pub const ALL_CATEGORY: &str = "";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     /// Stable identity.
     pub id: String,
@@ -56,7 +73,7 @@ impl Task {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Block {
     Text {
@@ -83,7 +100,11 @@ pub enum Block {
         url: String,
     },
     Image {
-        path: String,
+        /// Immutable content-addressed attachment ID. During form editing this
+        /// field may temporarily hold a source path; the store imports and
+        /// rewrites it before persistence.
+        #[serde(alias = "path")]
+        attachment_id: String,
     },
 }
 
@@ -119,9 +140,9 @@ impl Block {
         }
     }
 
-    pub fn image(path: &str) -> Self {
+    pub fn image(reference: &str) -> Self {
         Self::Image {
-            path: path.to_string(),
+            attachment_id: reference.to_string(),
         }
     }
 
@@ -137,7 +158,7 @@ impl Block {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Category {
     pub id: String,
     pub name: String,

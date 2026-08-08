@@ -60,7 +60,7 @@ impl<T> History<T> {
         self.last_at = Some(Instant::now());
     }
 
-    /// Push a pre-edit snapshot. Do not call when [`will_coalesce`] is true.
+    /// Push a pre-edit snapshot. Do not call when [`Self::will_coalesce`] is true.
     pub fn push(&mut self, current: T, kind: EditKind) {
         self.undo.push_back(current);
         while self.undo.len() > MAX_DEPTH {

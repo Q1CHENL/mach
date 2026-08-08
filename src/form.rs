@@ -8,24 +8,26 @@ use ratatui::layout::Rect;
 use crate::body::BodyEditor;
 use crate::due;
 use crate::duepicker::DuePicker;
-use crate::image::GifPlayback;
-use crate::model::{Block, MAX_TITLE_LEN, Task};
+use crate::image::{GifLoad, GifPlayback};
+use crate::model::{Block, Category, MAX_TITLE_LEN, Task};
 use crate::text_input::TextInput;
 use crate::undo::{EditKind, History};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Title,
+    Category,
     Due,
     Importance,
     Body,
 }
 
 impl Field {
-    /// Tab order follows the layout: the two short fields, then the body.
+    /// Tab order follows the layout: title, metadata, then body.
     pub fn next(self) -> Self {
         match self {
-            Self::Title => Self::Due,
+            Self::Title => Self::Category,
+            Self::Category => Self::Due,
             Self::Due => Self::Importance,
             Self::Importance => Self::Body,
             Self::Body => Self::Title,
@@ -35,7 +37,8 @@ impl Field {
     pub fn prev(self) -> Self {
         match self {
             Self::Title => Self::Body,
-            Self::Due => Self::Title,
+            Self::Category => Self::Title,
+            Self::Due => Self::Category,
             Self::Importance => Self::Due,
             Self::Body => Self::Importance,
         }
@@ -62,6 +65,8 @@ pub struct CategoryForm {
     pub name_area: Rect,
     pub description_area: Rect,
     history: History<CategorySnap>,
+    initial_name: String,
+    initial_description: String,
 }
 
 impl CategoryForm {
@@ -75,6 +80,8 @@ impl CategoryForm {
             name_area: Rect::ZERO,
             description_area: Rect::ZERO,
             history: History::new(),
+            initial_name: String::new(),
+            initial_description: String::new(),
         }
     }
 
@@ -83,6 +90,8 @@ impl CategoryForm {
             name: TextInput::new(&category.name, crate::model::MAX_CATEGORY_NAME_LEN),
             description: BodyEditor::plain(&category.description),
             editing: Some(category.id.clone()),
+            initial_name: category.name.clone(),
+            initial_description: category.description.clone(),
             ..Self::new()
         }
     }
@@ -98,6 +107,19 @@ impl CategoryForm {
     pub fn toggle_field(&mut self) {
         self.history.break_coalesce();
         self.on_description = !self.on_description;
+    }
+
+    /// Focus a particular field while preserving undo coalescing boundaries.
+    pub fn set_description_focus(&mut self, description: bool) {
+        if self.on_description != description {
+            self.history.break_coalesce();
+            self.on_description = description;
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.name.value() != self.initial_name
+            || self.description.plain_value() != self.initial_description
     }
 
     fn snap(&self) -> CategorySnap {
@@ -147,9 +169,23 @@ impl CategoryForm {
 
     /// `(name, description)` once there is a name to save.
     pub fn submit(&mut self) -> Option<(String, String)> {
+        self.submit_with(|_, _| Ok(()))
+    }
+
+    /// Validate and submit through a caller-provided uniqueness/policy hook.
+    /// The hook receives the normalized name and the edited category id.
+    pub fn submit_with<F>(&mut self, validate_name: F) -> Option<(String, String)>
+    where
+        F: FnOnce(&str, Option<&str>) -> Result<(), String>,
+    {
         let name = self.name.value().trim().to_string();
         if name.is_empty() {
             self.error = Some("A name is required".to_string());
+            self.on_description = false;
+            return None;
+        }
+        if let Err(error) = validate_name(&name, self.editing.as_deref()) {
+            self.error = Some(error);
             self.on_description = false;
             return None;
         }
@@ -169,6 +205,7 @@ impl Default for CategoryForm {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FieldAreas {
     pub title: Rect,
+    pub category: Rect,
     pub due: Rect,
     pub importance: Rect,
     pub body: Rect,
@@ -179,6 +216,8 @@ impl FieldAreas {
         let pos = ratatui::layout::Position { x, y };
         if self.title.contains(pos) {
             Some(Field::Title)
+        } else if self.category.contains(pos) {
+            Some(Field::Category)
         } else if self.due.contains(pos) {
             Some(Field::Due)
         } else if self.importance.contains(pos) {
@@ -193,6 +232,7 @@ impl FieldAreas {
     pub fn rect(&self, field: Field) -> Rect {
         match field {
             Field::Title => self.title,
+            Field::Category => self.category,
             Field::Due => self.due,
             Field::Importance => self.importance,
             Field::Body => self.body,
@@ -201,9 +241,11 @@ impl FieldAreas {
 }
 
 /// The values a submitted form hands back to the app.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TaskDraft {
     pub title: String,
+    /// Real category UUID, or `None` for Uncategorized.
+    pub category_id: Option<String>,
     pub due: String,
     pub importance: u8,
     pub body: Vec<Block>,
@@ -222,14 +264,32 @@ impl TaskDraft {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TaskSnap {
     title: TextInput,
+    category_id: Option<String>,
     due: TextInput,
     importance: u8,
     body: BodyEditor,
     field: Field,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CategoryChoice {
+    id: Option<String>,
+    name: String,
+}
+
+impl CategoryChoice {
+    fn uncategorized() -> Self {
+        Self {
+            id: None,
+            name: "Uncategorized".to_string(),
+        }
+    }
+}
+
 pub struct TaskForm {
     pub title: TextInput,
+    category_id: Option<String>,
+    category_choices: Vec<CategoryChoice>,
     pub due: TextInput,
     pub importance: u8,
     pub body: BodyEditor,
@@ -243,6 +303,8 @@ pub struct TaskForm {
     pub preview: bool,
     /// Decoded GIF for preview, keyed by path (kept after close for fast reopen).
     pub gif: Option<(std::path::PathBuf, GifPlayback)>,
+    /// GIF decode in progress; polled by the normal animation tick.
+    pub gif_pending: Option<GifLoad>,
     /// The calendar, while a due date is being picked.
     pub picker: Option<DuePicker>,
     /// Last body click (line index), for double-click to open a picture.
@@ -252,7 +314,7 @@ pub struct TaskForm {
     pub menu_was_open: bool,
     /// Body scroll after last paint — scroll changes need the same protocol
     /// drop as menu close so pictures that shrink/move do not ghost.
-    pub body_scroll: u16,
+    pub body_scroll: usize,
     /// Screen rect of the open body `/` dropdown (for mouse hit-testing).
     pub body_menu_area: Option<Rect>,
     /// Where each body picture was drawn last frame: `(line index, screen rect)`.
@@ -260,12 +322,15 @@ pub struct TaskForm {
     /// full-width letterbox gutter.
     pub image_hits: Vec<(usize, Rect)>,
     history: History<TaskSnap>,
+    initial: TaskDraft,
 }
 
 impl TaskForm {
     pub fn new() -> Self {
         Self {
             title: TextInput::new("", MAX_TITLE_LEN),
+            category_id: None,
+            category_choices: vec![CategoryChoice::uncategorized()],
             due: TextInput::new("", 32),
             importance: 0,
             body: BodyEditor::new(&[]),
@@ -275,6 +340,7 @@ impl TaskForm {
             areas: FieldAreas::default(),
             preview: false,
             gif: None,
+            gif_pending: None,
             picker: None,
             last_body_click: None,
             menu_was_open: false,
@@ -282,16 +348,25 @@ impl TaskForm {
             body_menu_area: None,
             image_hits: Vec::new(),
             history: History::new(),
+            initial: TaskDraft::default(),
         }
     }
 
     pub fn edit(task: &Task) -> Self {
         Self {
             title: TextInput::new(&task.title, MAX_TITLE_LEN),
+            category_id: task.category_id.clone(),
             due: TextInput::new(&task.due, 32),
             importance: task.importance,
             body: BodyEditor::new(&task.body),
             editing: Some(task.id.clone()),
+            initial: TaskDraft {
+                title: task.title.clone(),
+                category_id: task.category_id.clone(),
+                due: task.due.clone(),
+                importance: task.importance,
+                body: task.body.clone(),
+            },
             ..Self::new()
         }
     }
@@ -304,8 +379,84 @@ impl TaskForm {
             .any(|(i, r)| *i == line && r.contains(Position { x, y }))
     }
 
-    /// Open the full-size image viewer (loads GIF frames when needed).
-    /// Returns an error message if a GIF was expected but could not load.
+    pub fn set_image_root(&mut self, image_root: std::path::PathBuf) {
+        self.body.set_image_root(image_root);
+    }
+
+    pub fn set_attachments(&mut self, attachments: &[crate::store::Attachment]) {
+        self.body.set_attachments(attachments);
+    }
+
+    /// Install the real categories available to this form and select the
+    /// task's starting category. `All tasks` is a view, not a destination;
+    /// Uncategorized is always the first choice.
+    ///
+    /// Call this once when opening the form, before the user edits it. The
+    /// selected value becomes part of the dirty-state baseline.
+    pub fn set_categories(&mut self, categories: &[Category], selected_id: Option<&str>) {
+        self.category_choices.clear();
+        self.category_choices.push(CategoryChoice::uncategorized());
+        self.category_choices
+            .extend(
+                categories
+                    .iter()
+                    .filter(|category| !category.is_all())
+                    .map(|category| CategoryChoice {
+                        id: Some(category.id.clone()),
+                        name: category.name.clone(),
+                    }),
+            );
+        self.category_id = selected_id
+            .filter(|id| {
+                self.category_choices
+                    .iter()
+                    .any(|choice| choice.id.as_deref() == Some(*id))
+            })
+            .map(str::to_string);
+        self.initial.category_id = self.category_id.clone();
+    }
+
+    pub fn category_id(&self) -> Option<&str> {
+        self.category_id.as_deref()
+    }
+
+    pub fn category_label(&self) -> &str {
+        self.category_choices
+            .iter()
+            .find(|choice| choice.id.as_deref() == self.category_id.as_deref())
+            .map(|choice| choice.name.as_str())
+            .unwrap_or("Uncategorized")
+    }
+
+    /// Select the previous/next category, wrapping at either end.
+    pub fn cycle_category(&mut self, delta: i32) {
+        let len = self.category_choices.len();
+        if len <= 1 {
+            return;
+        }
+        let current = self
+            .category_choices
+            .iter()
+            .position(|choice| choice.id.as_deref() == self.category_id.as_deref())
+            .unwrap_or_default();
+        let next = (current as i32 + delta).rem_euclid(len as i32) as usize;
+        if next == current {
+            return;
+        }
+        self.before_edit(EditKind::Atomic);
+        self.category_id = self.category_choices[next].id.clone();
+    }
+
+    pub fn clear_category(&mut self) {
+        if self.category_id.is_none() {
+            return;
+        }
+        self.before_edit(EditKind::Atomic);
+        self.category_id = None;
+    }
+
+    /// Open the full-size image viewer. GIF frames decode asynchronously;
+    /// the still-image cache can paint a placeholder in the meantime.
     pub fn open_image_preview(&mut self) -> Option<String> {
         // Only the image under the cursor — never fall back to "first in body".
         let Some(path) = self.body.selected_image() else {
@@ -318,23 +469,21 @@ impl TaskForm {
             if matches!(&self.gif, Some((p, _)) if p == &path) {
                 return None;
             }
-            match GifPlayback::load(&path) {
-                Ok(gif) => {
-                    self.gif = Some((path, gif));
-                    None
-                }
-                Err(err) => {
-                    self.gif = None;
-                    // Still show static preview via ImageStore, but report why
-                    // animation could not start.
-                    Some(err)
-                }
+            if self
+                .gif_pending
+                .as_ref()
+                .is_none_or(|pending| pending.path() != path)
+            {
+                self.gif = None;
+                self.gif_pending = Some(GifLoad::start(path));
             }
+            None
         } else {
             // Different still — drop any previous GIF cache.
             if !matches!(&self.gif, Some((p, _)) if p == &path) {
                 self.gif = None;
             }
+            self.gif_pending = None;
             None
         }
     }
@@ -346,14 +495,34 @@ impl TaskForm {
 
     pub fn gif_playing(&self) -> bool {
         self.preview
-            && self
-                .gif
-                .as_ref()
-                .is_some_and(|(_, g)| g.is_animated() && !g.is_paused())
+            && (self.gif_pending.is_some()
+                || (!crate::theme::reduced_motion()
+                    && self
+                        .gif
+                        .as_ref()
+                        .is_some_and(|(_, g)| g.is_animated() && !g.is_paused())))
     }
 
     /// Advance GIF animation; returns true when the frame changed.
     pub fn tick_gif(&mut self) -> bool {
+        if let Some(result) = self.gif_pending.as_ref().and_then(GifLoad::poll) {
+            let path = self
+                .gif_pending
+                .take()
+                .map(|pending| pending.path().to_path_buf());
+            match (path, result) {
+                (Some(path), Ok(gif)) => self.gif = Some((path, gif)),
+                (_, Err(error)) => {
+                    self.gif = None;
+                    self.error = Some(error);
+                }
+                (None, Ok(_)) => {}
+            }
+            return true;
+        }
+        if crate::theme::reduced_motion() {
+            return false;
+        }
         if let Some((_, gif)) = &mut self.gif {
             return gif.tick();
         }
@@ -363,6 +532,9 @@ impl TaskForm {
     /// Click while preview is open: pause/resume an animated GIF.
     /// Static images ignore the click (Esc still closes).
     pub fn preview_click(&mut self) {
+        if crate::theme::reduced_motion() {
+            return;
+        }
         if let Some((_, gif)) = &mut self.gif {
             gif.toggle_pause();
         }
@@ -370,6 +542,20 @@ impl TaskForm {
 
     pub fn is_edit(&self) -> bool {
         self.editing.is_some()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.content() != self.initial
+    }
+
+    fn content(&self) -> TaskDraft {
+        TaskDraft {
+            title: self.title.value(),
+            category_id: self.category_id.clone(),
+            due: self.due.value(),
+            importance: self.importance,
+            body: self.body.value(),
+        }
     }
 
     pub fn title_text(&self) -> &'static str {
@@ -383,6 +569,7 @@ impl TaskForm {
     fn snap(&self) -> TaskSnap {
         TaskSnap {
             title: self.title.clone(),
+            category_id: self.category_id.clone(),
             due: self.due.clone(),
             importance: self.importance,
             body: self.body.clone(),
@@ -392,6 +579,7 @@ impl TaskForm {
 
     fn restore(&mut self, s: TaskSnap) {
         self.title = s.title;
+        self.category_id = s.category_id;
         self.due = s.due;
         self.importance = s.importance;
         self.body = s.body;
@@ -400,6 +588,7 @@ impl TaskForm {
         // Overlays are not part of content history.
         self.picker = None;
         self.preview = false;
+        self.gif_pending = None;
         self.body.close_menu();
     }
 
@@ -537,6 +726,7 @@ impl TaskForm {
 
         Some(TaskDraft {
             title,
+            category_id: self.category_id.clone(),
             due: if due_text.is_empty() {
                 inline_due
             } else {
@@ -619,5 +809,101 @@ mod tests {
         assert_eq!(form.importance, 0);
         assert!(form.redo());
         assert_eq!(form.importance, 2);
+    }
+
+    #[test]
+    fn dirty_state_tracks_content_not_focus() {
+        let mut task = TaskForm::new();
+        task.focus_next();
+        assert!(!task.is_dirty());
+        task.title.insert('x');
+        assert!(task.is_dirty());
+
+        let mut category = CategoryForm::new();
+        category.set_description_focus(true);
+        assert!(!category.is_dirty());
+        category.name.insert('x');
+        assert!(category.is_dirty());
+    }
+
+    #[test]
+    fn category_submit_exposes_a_shared_name_policy_hook() {
+        let mut form = CategoryForm::new();
+        form.name.insert_str("Work");
+        assert!(
+            form.submit_with(|name, _| {
+                (name != "Work")
+                    .then_some(())
+                    .ok_or_else(|| "A category with that name already exists".to_string())
+            })
+            .is_none()
+        );
+        assert_eq!(
+            form.error.as_deref(),
+            Some("A category with that name already exists")
+        );
+    }
+
+    #[test]
+    fn opening_a_gif_never_decodes_on_the_input_path() {
+        let path = std::env::temp_dir().join(format!("mach-async-{}.gif", std::process::id()));
+        std::fs::write(&path, b"not a real gif").unwrap();
+        let mut task = Task::new("gif", 0, None, "");
+        task.body = vec![Block::Image {
+            attachment_id: path.display().to_string(),
+        }];
+        let mut form = TaskForm::edit(&task);
+
+        assert!(form.open_image_preview().is_none());
+        assert!(form.gif.is_none());
+        assert!(form.gif_pending.is_some());
+    }
+
+    #[test]
+    fn category_selector_includes_uncategorized_and_is_part_of_the_draft() {
+        let categories = [
+            crate::model::Category::all_tasks(),
+            crate::model::Category {
+                id: "work".into(),
+                name: "Work".into(),
+                description: String::new(),
+            },
+        ];
+        let mut form = TaskForm::new();
+        form.set_categories(&categories, Some("work"));
+
+        assert_eq!(form.category_id(), Some("work"));
+        assert_eq!(form.category_label(), "Work");
+        assert!(!form.is_dirty());
+
+        form.cycle_category(1);
+        assert_eq!(form.category_id(), None);
+        assert_eq!(form.category_label(), "Uncategorized");
+        assert!(form.is_dirty());
+
+        form.title.insert_str("portable task");
+        assert_eq!(form.submit().expect("valid draft").category_id, None);
+        assert!(form.undo());
+        assert_eq!(form.category_id(), Some("work"));
+    }
+
+    #[test]
+    fn editing_a_task_keeps_its_category_in_the_dirty_baseline() {
+        let mut task = Task::new("move me", 0, Some("work".into()), "");
+        task.id = "task".into();
+        let categories = [crate::model::Category {
+            id: "work".into(),
+            name: "Work".into(),
+            description: String::new(),
+        }];
+        let mut form = TaskForm::edit(&task);
+        form.set_categories(&categories, task.category_id.as_deref());
+
+        assert_eq!(form.category_id(), Some("work"));
+        assert!(!form.is_dirty());
+        assert_eq!(
+            form.submit().expect("valid draft").category_id.as_deref(),
+            Some("work")
+        );
     }
 }

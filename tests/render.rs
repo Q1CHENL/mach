@@ -11,8 +11,9 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 
 use mach::app::{App, Focus, Mode};
-use mach::form::{CategoryForm, TaskForm};
+use mach::form::CategoryForm;
 use mach::model::{Block, Category, Task};
+use mach::store::Store;
 use mach::ui;
 
 /// Draw `app` at `width` x `height` and hand back the finished cells.
@@ -70,25 +71,14 @@ fn buffer_text(buffer: &Buffer) -> String {
         .join("\n")
 }
 
-/// An app with two categories and a few tasks, built in memory.
-///
-/// `App::new` reads (and writes settings to) the data directory, so point
-/// that at a throwaway one before the first call — otherwise running the
-/// tests edits the real `~/.mach`.
+/// An app with two categories and a few tasks, backed by an independent
+/// in-memory store for each test.
 fn sample_app() -> App {
-    static REDIRECT_DATA_DIR: std::sync::Once = std::sync::Once::new();
-    REDIRECT_DATA_DIR.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("mach-render-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        mach::store::set_data_dir(dir);
-    });
-
-    let mut app = App::new("test");
-    // A fresh data dir has no recorded version, so the welcome splash is
-    // up; tests that want it set the mode themselves.
-    app.mode = Mode::Normal;
-    app.categories = vec![
-        Category::all_tasks(),
+    let mut store = Store::open_in_memory_with_paths(
+        std::env::temp_dir().join(format!("mach-render-test-{}", uuid::Uuid::new_v4())),
+    )
+    .unwrap();
+    let categories = vec![
         Category {
             id: "c-work".into(),
             name: "Work".into(),
@@ -116,8 +106,18 @@ fn sample_app() -> App {
     ];
     let mut done = Task::new("已完成的任务", 0, Some("c-home".into()), "");
     done.done = true;
-    app.tasks = vec![flagged, done, Task::new("no category", 1, None, "09:00")];
-    app.rebuild_view();
+    let tasks = vec![flagged, done, Task::new("no category", 1, None, "09:00")];
+    store
+        .update(|data| {
+            data.categories = categories;
+            data.tasks = tasks;
+            Ok(())
+        })
+        .unwrap();
+    let mut app = App::with_store("test", store).unwrap();
+    // A fresh store has no recorded version, so the welcome splash is up;
+    // tests that want it set the mode themselves.
+    app.mode = Mode::Normal;
     app
 }
 
@@ -200,9 +200,13 @@ fn draws_the_task_dialog_with_a_body() {
 fn draws_the_new_task_dialog_and_its_calendar() {
     let mut app = sample_app();
     app.select_category(1);
-    app.form = Some(TaskForm::new());
-    app.mode = Mode::TaskForm;
-    assert!(render(&mut app, 100, 30).contains("New task"));
+    app.open_new_task();
+    let screen = render(&mut app, 100, 30);
+    assert!(screen.contains("New task"), "{screen}");
+    assert!(
+        screen.contains("Category") && screen.contains("Work"),
+        "{screen}"
+    );
 
     app.form.as_mut().unwrap().open_due_picker();
     let screen = render(&mut app, 100, 30);
@@ -259,10 +263,10 @@ fn survives_sizes_from_tiny_to_wide() {
     // Below the floor the UI says so instead of laying anything out.
     let mut app = sample_app();
     assert!(render(&mut app, 20, 5).contains("too small"));
+    assert!(render(&mut app, 30, 8).contains("60×16"));
 
-    // Above it, every mode must lay out without panicking at any size —
-    // including one column past the floor, where the panels are thinnest.
-    for (width, height) in [(30, 8), (31, 9), (40, 12), (80, 24), (200, 60)] {
+    // At and above the honest floor every mode remains operable.
+    for (width, height) in [(60, 16), (80, 24), (200, 60)] {
         for mode in [
             Mode::Normal,
             Mode::Help,
@@ -284,6 +288,53 @@ fn survives_sizes_from_tiny_to_wide() {
             render(&mut app, width, height);
         }
     }
+}
+
+#[test]
+fn minimum_size_keeps_both_primary_panels_visible() {
+    let mut app = sample_app();
+    let screen = render(&mut app, 60, 16);
+    assert!(screen.contains("Categories"), "{screen}");
+    assert!(screen.contains("Tasks"), "{screen}");
+    assert!(screen.contains("ship the re"), "{screen}");
+}
+
+#[test]
+fn help_is_single_column_and_scrolls_to_every_section() {
+    let mut app = sample_app();
+    app.mode = Mode::Help;
+    let top = render(&mut app, 80, 24);
+    assert!(top.contains("MOVING AROUND"), "{top}");
+
+    app.help_scroll = usize::MAX;
+    let bottom = render(&mut app, 80, 24);
+    assert!(bottom.contains("PREVIEW"), "{bottom}");
+    assert!(bottom.contains("github.com/Q1CHENL/mach"), "{bottom}");
+}
+
+#[test]
+fn hidden_geometry_is_cleared_on_an_undersized_frame() {
+    let mut app = sample_app();
+    let _ = render(&mut app, 100, 30);
+    assert!(!app.areas.tasks.is_empty());
+
+    let _ = render(&mut app, 20, 5);
+    assert!(app.areas.tasks.is_empty());
+    assert!(app.areas.sidebar.is_empty());
+    assert!(app.areas.slash_menu.is_empty());
+}
+
+#[test]
+fn a_clipped_read_only_preview_says_that_more_content_exists() {
+    let mut app = sample_app();
+    app.tasks[0].body = (0..40)
+        .map(|index| Block::text(&format!("preview line {index}")))
+        .collect();
+    app.invalidate_preview();
+    app.rebuild_view();
+
+    let screen = render(&mut app, 80, 24);
+    assert!(screen.contains("↓ more · Enter to edit"), "{screen}");
 }
 
 #[test]

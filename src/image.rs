@@ -9,18 +9,18 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use image::codecs::gif::GifDecoder;
 use image::imageops::FilterType;
-use image::{AnimationDecoder, DynamicImage};
+use image::{AnimationDecoder, DynamicImage, ImageDecoder, Limits};
 use ratatui_image::FontSize;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 
-const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
 /// Max long edge for stills in body / preview.
 const MAX_STILL_EDGE: u32 = 1920;
@@ -28,8 +28,46 @@ const MAX_STILL_EDGE: u32 = 1920;
 const MAX_GIF_EDGE: u32 = 720;
 /// Max frames decoded from one GIF.
 const MAX_GIF_FRAMES: usize = 48;
-/// Max decoded stills kept in the LRU cache.
+/// Max successful or failed decode outcomes kept in the LRU cache.
 const MAX_CACHE_ENTRIES: usize = 48;
+/// Aggregate decoded-pixel budget for still images. Protocol encodings are
+/// released with the form; decoded pixels are the persistent cache cost.
+const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
+/// Reject implausibly large canvases before a decoder allocates them.
+const MAX_DECODE_DIMENSION: u32 = 8192;
+const MAX_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
+/// Decode work is CPU and memory heavy; keep the UI responsive under a body
+/// containing many images instead of spawning one thread per path.
+const MAX_DECODE_WORKERS: usize = 2;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AttachmentCatalog {
+    files: HashMap<String, String>,
+}
+
+impl AttachmentCatalog {
+    pub fn set(&mut self, attachments: &[crate::store::Attachment]) {
+        self.files = attachments
+            .iter()
+            .map(|attachment| (attachment.id.clone(), attachment.storage_name.clone()))
+            .collect();
+    }
+
+    pub fn resolve(&self, reference: &str, images_root: &Path) -> PathBuf {
+        self.files
+            .get(reference)
+            .map(|storage_name| images_root.join(storage_name))
+            .unwrap_or_else(|| expand_in(reference, images_root))
+    }
+}
+
+fn decode_limits() -> Limits {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_DIMENSION);
+    limits.max_image_height = Some(MAX_DECODE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    limits
+}
 
 /// Shrink so the longer side is at most `max_edge` (no-op when already smaller).
 fn fit(img: DynamicImage, max_edge: u32) -> DynamicImage {
@@ -46,32 +84,42 @@ fn fit(img: DynamicImage, max_edge: u32) -> DynamicImage {
 
 /// Whether a string looks like an image path (extension check; no FS).
 pub fn looks_like_image(text: &str) -> bool {
-    let t = text.trim();
+    let Some(t) = reference_path(text) else {
+        return false;
+    };
     if let Some((_, ext)) = t.rsplit_once('.') {
         let ext = ext.split(['/', '\\', '?', '#']).next().unwrap_or(ext);
         if IMAGE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
             return true;
         }
     }
-    expand(t)
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+    false
 }
 
 /// An existing image file named by `text`, if that is what it is.
 pub fn path_if_image(text: &str) -> Option<PathBuf> {
-    let text = text.trim();
-    if !looks_like_image(text) {
+    path_if_image_in(text, &default_images_root())
+}
+
+/// Resolve a raw or Markdown image reference against an explicit images root.
+/// Relative paths never depend on the process working directory.
+pub fn path_if_image_in(text: &str, images_root: &Path) -> Option<PathBuf> {
+    let reference = reference_path(text)?;
+    if !looks_like_image(reference) {
         return None;
     }
-    let path = expand(text);
+    let path = expand_in(reference, images_root);
     path.is_file().then_some(path)
 }
 
 /// Resolves `~`, `file://` URLs and escaped spaces; the rest is left to
 /// the filesystem.
 pub fn expand(path: &str) -> PathBuf {
+    expand_in(path, &default_images_root())
+}
+
+pub fn expand_in(path: &str, images_root: &Path) -> PathBuf {
+    let path = reference_path(path).unwrap_or_else(|| path.trim());
     let path = path.trim();
     let path = path.strip_prefix("file://").unwrap_or(path);
     let path = path.replace("%20", " ");
@@ -80,7 +128,25 @@ pub fn expand(path: &str) -> PathBuf {
     {
         return home.join(rest);
     }
-    PathBuf::from(path)
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        images_root.join(path)
+    }
+}
+
+/// Extract the path from either `path.png` or `![alt](path.png)`.
+fn reference_path(text: &str) -> Option<&str> {
+    let text = text.trim();
+    if !text.starts_with("![") {
+        return (!text.is_empty()).then_some(text);
+    }
+    let close = text.find("](")?;
+    if !text.ends_with(')') || close + 2 >= text.len() - 1 {
+        return None;
+    }
+    Some(text[close + 2..text.len() - 1].trim())
 }
 
 /// What the terminal says a cell is worth in pixels, when it will say.
@@ -149,7 +215,11 @@ impl GifPlayback {
     pub fn load(path: &Path) -> Result<Self, String> {
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let reader = std::io::BufReader::new(file);
-        let decoder = GifDecoder::new(reader).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut decoder =
+            GifDecoder::new(reader).map_err(|e| format!("{}: {e}", path.display()))?;
+        decoder
+            .set_limits(decode_limits())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let mut frames = Vec::new();
         let mut delays = Vec::new();
         // Stream frames so a 500-frame meme does not decode entirely first.
@@ -241,6 +311,72 @@ impl GifPlayback {
     }
 }
 
+struct GifJob {
+    path: PathBuf,
+    result: Sender<Result<GifPlayback, String>>,
+}
+
+fn gif_worker() -> &'static SyncSender<GifJob> {
+    static WORKER: OnceLock<SyncSender<GifJob>> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        // One active decode and at most one queued request. Forms can be
+        // opened/closed faster than a large GIF decodes; an unbounded queue
+        // would otherwise keep obsolete work alive long after the UI moved on.
+        let (jobs, receiver) = mpsc::sync_channel::<GifJob>(1);
+        let _ = std::thread::Builder::new()
+            .name("mach-gif-decode".into())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    let _ = job.result.send(GifPlayback::load(&job.path));
+                }
+            });
+        jobs
+    })
+}
+
+/// One asynchronous GIF decode owned by the open form. Jobs share one process
+/// worker, so rapidly changing previews cannot create unbounded decode threads.
+pub struct GifLoad {
+    path: PathBuf,
+    receiver: Receiver<Result<GifPlayback, String>>,
+}
+
+impl GifLoad {
+    pub fn start(path: PathBuf) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let job = GifJob {
+            path: path.clone(),
+            result: sender,
+        };
+        match gif_worker().try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(job)) => {
+                let _ = job.result.send(Err(
+                    "GIF decoder is busy; try opening the image again".into()
+                ));
+            }
+            Err(TrySendError::Disconnected(job)) => {
+                let _ = job
+                    .result
+                    .send(Err("GIF decode worker stopped".to_string()));
+            }
+        }
+        Self { path, receiver }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn poll(&self) -> Option<Result<GifPlayback, String>> {
+        match self.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err("GIF load failed".to_string())),
+        }
+    }
+}
+
 /// One file: decoded pixels stay in RAM. Body and full-screen preview keep
 /// separate protocols so closing the preview does not force a slow
 /// re-encode the next time it opens (body is ~10 rows; preview is large).
@@ -259,17 +395,40 @@ pub enum ImageReady<'a> {
 }
 
 /// Decoded images, kept so a redraw does not re-read the file.
-#[derive(Default)]
 pub struct ImageStore {
+    images_root: PathBuf,
+    attachments: AttachmentCatalog,
     picker: Option<Picker>,
     cache: HashMap<PathBuf, Result<CachedImage, String>>,
-    /// LRU order of successful cache keys (front = oldest).
+    cache_bytes: usize,
+    cache_budget: usize,
+    /// LRU order of cache keys (front = oldest).
     lru: VecDeque<PathBuf>,
     /// In-flight background decodes.
     pending: HashMap<PathBuf, Receiver<Result<Arc<DynamicImage>, String>>>,
+    /// FIFO work waiting for one of the bounded decode slots.
+    queued: VecDeque<PathBuf>,
     /// Encoded GIF frames for the open preview (one encode per frame index).
     gif_protocols: Vec<Option<StatefulProtocol>>,
     gif_frame_count: usize,
+}
+
+impl Default for ImageStore {
+    fn default() -> Self {
+        Self {
+            images_root: default_images_root(),
+            attachments: AttachmentCatalog::default(),
+            picker: None,
+            cache: HashMap::new(),
+            cache_bytes: 0,
+            cache_budget: MAX_CACHE_BYTES,
+            lru: VecDeque::new(),
+            pending: HashMap::new(),
+            queued: VecDeque::new(),
+            gif_protocols: Vec::new(),
+            gif_frame_count: 0,
+        }
+    }
 }
 
 /// [`FontSize`] carries no `PartialEq`.
@@ -278,6 +437,37 @@ fn same_cell(a: FontSize, b: FontSize) -> bool {
 }
 
 impl ImageStore {
+    pub fn with_root(images_root: PathBuf) -> Self {
+        Self {
+            images_root,
+            ..Self::default()
+        }
+    }
+
+    pub fn set_root(&mut self, images_root: PathBuf) {
+        if self.images_root != images_root {
+            self.images_root = images_root;
+            self.cache.clear();
+            self.cache_bytes = 0;
+            self.lru.clear();
+            self.pending.clear();
+            self.queued.clear();
+            self.release(true);
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.images_root
+    }
+
+    pub fn set_attachments(&mut self, attachments: &[crate::store::Attachment]) {
+        self.attachments.set(attachments);
+    }
+
+    pub fn resolve(&self, reference: &str) -> PathBuf {
+        self.attachments.resolve(reference, &self.images_root)
+    }
+
     /// Probe the terminal graphics protocol. Call before the alternate screen.
     /// Falls back to halfblocks if unsupported or under tmux without passthrough.
     pub fn detect() -> Self {
@@ -303,17 +493,43 @@ impl ImageStore {
     }
 
     fn evict_if_needed(&mut self) {
-        while self.lru.len() > MAX_CACHE_ENTRIES {
+        while self.lru.len() > MAX_CACHE_ENTRIES || self.cache_bytes > self.cache_budget {
             let Some(old) = self.lru.pop_front() else {
                 break;
             };
-            self.cache.remove(&old);
+            if let Some(cached) = self.cache.remove(&old)
+                && let Ok(cached) = cached
+            {
+                self.cache_bytes = self
+                    .cache_bytes
+                    .saturating_sub(cached.image.as_bytes().len());
+            }
         }
     }
 
     fn insert_decoded(&mut self, path: PathBuf, result: Result<Arc<DynamicImage>, String>) {
+        self.lru.retain(|cached| cached != &path);
+        if let Some(Ok(cached)) = self.cache.remove(&path) {
+            self.cache_bytes = self
+                .cache_bytes
+                .saturating_sub(cached.image.as_bytes().len());
+        }
         match result {
             Ok(image) => {
+                let bytes = image.as_bytes().len();
+                if bytes > self.cache_budget {
+                    self.cache.insert(
+                        path.clone(),
+                        Err(format!(
+                            "decoded image is {bytes} bytes; cache limit is {} bytes",
+                            self.cache_budget
+                        )),
+                    );
+                    self.touch_lru(&path);
+                    self.evict_if_needed();
+                    return;
+                }
+                self.cache_bytes = self.cache_bytes.saturating_add(bytes);
                 self.cache.insert(
                     path.clone(),
                     Ok(CachedImage {
@@ -326,7 +542,9 @@ impl ImageStore {
                 self.evict_if_needed();
             }
             Err(err) => {
-                self.cache.insert(path, Err(err));
+                self.cache.insert(path.clone(), Err(err));
+                self.touch_lru(&path);
+                self.evict_if_needed();
             }
         }
     }
@@ -336,15 +554,35 @@ impl ImageStore {
     /// immediately while this runs.
     pub fn prefetch(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         for path in paths {
-            if self.cache.contains_key(&path) || self.pending.contains_key(&path) {
+            if self.cache.contains_key(&path)
+                || self.pending.contains_key(&path)
+                || self.queued.contains(&path)
+            {
                 continue;
             }
+            self.queued.push_back(path);
+        }
+        self.start_queued();
+    }
+
+    fn start_queued(&mut self) {
+        while self.pending.len() < MAX_DECODE_WORKERS {
+            let Some(path) = self.queued.pop_front() else {
+                break;
+            };
             let (tx, rx) = mpsc::channel();
             let path_bg = path.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(Self::decode(&path_bg));
-            });
-            self.pending.insert(path, rx);
+            match std::thread::Builder::new()
+                .name("mach-image-decode".into())
+                .spawn(move || {
+                    let _ = tx.send(Self::decode(&path_bg));
+                }) {
+                Ok(_) => {
+                    self.pending.insert(path, rx);
+                }
+                Err(error) => self
+                    .insert_decoded(path, Err(format!("could not start image decoder: {error}"))),
+            }
         }
     }
 
@@ -371,11 +609,12 @@ impl ImageStore {
                 }
             }
         }
+        self.start_queued();
         any
     }
 
     pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || !self.queued.is_empty()
     }
 
     /// If the terminal cell size changed, drop encodings and rebuild.
@@ -421,7 +660,7 @@ impl ImageStore {
     /// The protocol for `path`, without blocking on disk I/O.
     ///
     /// Missing files are fetched in the background; the first call returns
-    /// [`ImageReady::Loading`] until a later [`poll_pending`] lands them.
+    /// [`ImageReady::Loading`] until a later [`Self::poll_pending`] lands them.
     pub fn get(&mut self, path: &Path) -> ImageReady<'_> {
         self.protocol_for(path, false)
     }
@@ -547,16 +786,37 @@ impl ImageStore {
 
 /// Open and decode an image file with path-labeled errors.
 pub fn load_dynamic(path: &Path) -> Result<DynamicImage, String> {
-    image::ImageReader::open(path)
+    let mut reader = image::ImageReader::open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .with_guessed_format()
-        .map_err(|e| format!("{}: {e}", path.display()))?
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    reader.limits(decode_limits());
+    reader
         .decode()
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The `~`-relative form of a path, so bodies stay readable.
 pub fn short(path: &Path) -> String {
+    short_in(path, &default_images_root())
+}
+
+/// Stable fallback used by standalone editor tests. Production injects the
+/// active store's images directory into [`ImageStore`] and
+/// [`crate::body::BodyEditor`].
+pub fn default_images_root() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".mach"))
+        .unwrap_or_else(|| std::env::temp_dir().join("mach"))
+        .join("images")
+}
+
+pub fn short_in(path: &Path, images_root: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(images_root)
+        && !relative.as_os_str().is_empty()
+    {
+        return relative.display().to_string();
+    }
     if let Some(home) = dirs::home_dir()
         && let Ok(rest) = path.strip_prefix(&home)
     {
@@ -578,6 +838,42 @@ mod tests {
         );
         assert!(!looks_like_image("notes.txt"));
         assert!(!looks_like_image("remember to send the png to Dana"));
+        assert!(looks_like_image("![diagram](architecture.png)"));
+        assert!(
+            !looks_like_image("legacy.bmp"),
+            "BMP is not compiled into the decoder"
+        );
+    }
+
+    #[test]
+    fn resolves_relative_references_against_an_injected_images_root() {
+        let root = std::env::temp_dir().join(format!("mach-image-root-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let path = root.join("diagram.png");
+        std::fs::write(&path, b"not decoded in this test").unwrap();
+
+        assert_eq!(
+            path_if_image_in("![diagram](diagram.png)", &root),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn resolves_attachment_ids_through_the_managed_catalog() {
+        let root = PathBuf::from("/tmp/mach-managed-images");
+        let id = "a".repeat(64);
+        let attachment = crate::store::Attachment {
+            id: id.clone(),
+            sha256: id.clone(),
+            media_type: "image/png".into(),
+            byte_len: 12,
+            storage_name: format!("{id}.png"),
+        };
+        let mut store = ImageStore::with_root(root.clone());
+        store.set_attachments(&[attachment]);
+
+        assert_eq!(store.resolve(&id), root.join(format!("{id}.png")));
+        assert_eq!(store.resolve("draft.png"), root.join("draft.png"));
     }
 
     #[test]
@@ -666,6 +962,100 @@ mod tests {
         assert!(
             same_cell(store.picker.as_ref().unwrap().font_size(), was),
             "the picker was never touched"
+        );
+    }
+
+    #[test]
+    fn prefetch_uses_a_bounded_number_of_decode_workers() {
+        let mut store = ImageStore::default();
+        let paths = (0..8).map(|index| PathBuf::from(format!("/missing/{index}.png")));
+        store.prefetch(paths);
+        assert!(store.pending.len() <= MAX_DECODE_WORKERS);
+        assert_eq!(store.pending.len() + store.queued.len(), 8);
+    }
+
+    #[test]
+    fn decoded_cache_evicts_by_bytes_before_entry_count() {
+        let mut store = ImageStore {
+            cache_budget: 32,
+            ..ImageStore::default()
+        };
+        let image = || Arc::new(DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2)));
+        let paths: Vec<_> = (0..3)
+            .map(|index| PathBuf::from(format!("small-{index}.png")))
+            .collect();
+
+        for path in &paths {
+            store.insert_decoded(path.clone(), Ok(image()));
+        }
+
+        assert_eq!(store.cache_bytes, 32);
+        assert!(!store.cache.contains_key(&paths[0]));
+        assert!(store.cache.contains_key(&paths[1]));
+        assert!(store.cache.contains_key(&paths[2]));
+    }
+
+    #[test]
+    fn one_image_larger_than_the_cache_budget_is_reported_not_cached() {
+        let mut store = ImageStore {
+            cache_budget: 15,
+            ..ImageStore::default()
+        };
+        let path = PathBuf::from("too-large.png");
+        let image = Arc::new(DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2)));
+
+        store.insert_decoded(path.clone(), Ok(image));
+
+        assert_eq!(store.cache_bytes, 0);
+        assert!(matches!(
+            store.cache.get(&path),
+            Some(Err(error)) if error.contains("cache limit")
+        ));
+    }
+
+    #[test]
+    fn failed_decodes_share_the_cache_entry_limit() {
+        let mut store = ImageStore::default();
+        for index in 0..(MAX_CACHE_ENTRIES + 12) {
+            store.insert_decoded(
+                PathBuf::from(format!("missing-{index}.png")),
+                Err("missing".into()),
+            );
+        }
+
+        assert_eq!(store.cache.len(), MAX_CACHE_ENTRIES);
+        assert_eq!(store.lru.len(), MAX_CACHE_ENTRIES);
+    }
+
+    #[test]
+    fn oversized_canvas_is_rejected_from_still_and_gif_decoders() {
+        let path =
+            std::env::temp_dir().join(format!("mach-oversized-{}.gif", uuid::Uuid::new_v4()));
+        // Valid one-frame GIF with its logical canvas patched to 8193×1. The
+        // strict dimension check runs before a canvas buffer can be allocated.
+        std::fs::write(
+            &path,
+            [
+                b'G', b'I', b'F', b'8', b'9', b'a', 0x01, 0x20, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c,
+                0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00,
+                0x3b,
+            ],
+        )
+        .unwrap();
+
+        let still = load_dynamic(&path).expect_err("still decoder must enforce dimensions");
+        let gif = match GifPlayback::load(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("GIF decoder must enforce dimensions"),
+        };
+        assert!(
+            still.to_lowercase().contains("limit") || still.to_lowercase().contains("dimension"),
+            "{still}"
+        );
+        assert!(
+            gif.to_lowercase().contains("limit") || gif.to_lowercase().contains("dimension"),
+            "{gif}"
         );
     }
 

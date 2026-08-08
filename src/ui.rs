@@ -12,13 +12,14 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Table,
 };
 use ratatui_image::{Resize, StatefulImage};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, MessageKind, Mode, SETTINGS_ITEMS};
 use crate::banner;
 use crate::due;
 use crate::form::Field;
-use crate::theme::{self, Theme};
+use crate::theme::Theme;
 
 /// Outer width of the sidebar, borders and padding included.
 pub const SIDEBAR_WIDTH: u16 = 26;
@@ -36,11 +37,32 @@ const LIST_WIDTH_MIN: u16 = 24;
 const PREVIEW_WIDTH_MIN: u16 = 28;
 /// Whole right column narrower than this → no side preview.
 const PREVIEW_SIDE_MIN: u16 = LIST_WIDTH_MIN + PREVIEW_WIDTH_MIN + 1;
+pub const MIN_TERMINAL_WIDTH: u16 = 60;
+pub const MIN_TERMINAL_HEIGHT: u16 = 16;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    if area.width < 30 || area.height < 8 {
-        let p = Paragraph::new("terminal too small").centered();
+    // Every frame owns its hit targets. Hidden overlays and undersized
+    // terminals must never retain clickable geometry from an older frame.
+    app.areas = crate::app::Areas::default();
+    if let Some(form) = &mut app.form {
+        form.areas = crate::form::FieldAreas::default();
+        form.body_menu_area = None;
+        form.image_hits.clear();
+        if let Some(picker) = &mut form.picker {
+            picker.layout = crate::duepicker::PickerLayout::default();
+        }
+    }
+    if let Some(form) = &mut app.category_form {
+        form.name_area = Rect::ZERO;
+        form.description_area = Rect::ZERO;
+    }
+
+    if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
+        let p = Paragraph::new(format!(
+            "too small · need {MIN_TERMINAL_WIDTH}×{MIN_TERMINAL_HEIGHT}"
+        ))
+        .centered();
         f.render_widget(p, area);
         return;
     }
@@ -82,7 +104,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     match app.mode {
-        Mode::Help => draw_help(f, &theme, area),
+        Mode::Help => draw_help(f, app, &theme, area),
         Mode::Settings => draw_settings(f, app, &theme, area),
         Mode::Welcome => draw_welcome(f, &theme, area),
         Mode::CategoryForm => draw_category_form(f, app, &theme, area),
@@ -140,7 +162,7 @@ fn split_preview_right(right: Rect) -> Option<(Rect, Rect)> {
 
 // --------------------------------------------------------- task dialog
 
-/// Title and due date on one row, then the body: a free stack of prose,
+/// Title, category/due/flags metadata, then the body: a free stack of prose,
 /// to-dos and pictures with a `/` menu for making new ones.
 ///
 /// `docked` fills `area` (the permanent preview pane). Otherwise the
@@ -155,14 +177,20 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
     } = app;
     let Some(form) = form.as_mut() else { return };
 
-    // Borders (2), top boxes (3), hint (1).
-    const CHROME: u16 = 6;
+    // Borders (2), title + metadata boxes (6), hint (1).
+    const CHROME: u16 = 9;
+    const MIN_DOCKED_HEIGHT: u16 = CHROME + 3;
+    const MIN_DOCKED_WIDTH: u16 = 56;
+    // A tiny permanent preview cannot expose every editable field honestly.
+    // Keep the list underneath and use the same centered modal as compact mode.
+    let docked = docked && area.height >= MIN_DOCKED_HEIGHT && area.width >= MIN_DOCKED_WIDTH;
     let rect = if docked {
         area
     } else {
-        let width = 92.min(area.width.saturating_sub(4));
-        let body_height = area.height.saturating_sub(CHROME).clamp(3, 22);
-        centered(area, width, (CHROME + body_height).min(area.height))
+        let full = f.area();
+        let width = 92.min(full.width.saturating_sub(4));
+        let body_height = full.height.saturating_sub(CHROME).clamp(3, 22);
+        centered(full, width, (CHROME + body_height).min(full.height))
     };
     let h_pad = if docked { 1 } else { 2 };
     let block = Block::bordered()
@@ -177,20 +205,21 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
     f.render_widget(Clear, rect);
     f.render_widget(block, rect);
 
-    let [top_box, body_box, hint] = Layout::vertical([
+    let [title_box, metadata_box, body_box, hint] = Layout::vertical([
+        Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
     .areas(inner);
-    // Title takes the rest; Due fits a formatted date+time; Flags fits ⚑⚑⚑.
-    let [title_box, due_box, importance_box] = Layout::horizontal([
+    // Category takes the rest; Due fits a formatted date+time; Flags fits ⚑⚑⚑.
+    let [category_box, due_box, importance_box] = Layout::horizontal([
         Constraint::Fill(1),
         Constraint::Length(20),
         Constraint::Length(9),
     ])
     .spacing(1)
-    .areas(top_box);
+    .areas(metadata_box);
 
     // --- title ----------------------------------------------------------
     let focused = form.field == Field::Title;
@@ -198,7 +227,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
     form.areas.title = box_inner;
     let view = form.title.visible(box_inner.width as usize);
     if view.text.is_empty() {
-        render_or_placeholder(f, box_inner, "", "what needs doing?");
+        render_or_placeholder(f, box_inner, "", "what needs doing?", theme);
     } else {
         f.render_widget(
             Paragraph::new(line_with_selection(
@@ -211,8 +240,22 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
         );
     }
     if focused {
-        f.set_cursor_position((box_inner.x + view.cursor_col, box_inner.y));
+        f.set_cursor_position((box_inner.x.saturating_add(view.cursor_col), box_inner.y));
     }
+
+    // --- category -------------------------------------------------------
+    let focused = form.field == Field::Category;
+    let box_inner = render_field_box(
+        f,
+        field_block("Category", focused, None, theme),
+        category_box,
+    );
+    form.areas.category = box_inner;
+    let category = format!("‹ {} ›", form.category_label());
+    f.render_widget(
+        Paragraph::new(truncate(&category, box_inner.width as usize)),
+        box_inner,
+    );
 
     // --- due -------------------------------------------------------------
     // Picker-only: show the value, no text cursor (Enter / click opens UI).
@@ -221,7 +264,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
     let box_inner = render_field_box(f, field_block("Due", focused, None, theme), due_box);
     form.areas.due = due_box;
     let view = form.due.visible(box_inner.width as usize);
-    render_or_placeholder(f, box_inner, &view.text, "↵ Enter");
+    render_or_placeholder(f, box_inner, &view.text, "↵ Enter", theme);
 
     // --- importance ---------------------------------------------------------
     let focused = form.field == Field::Importance;
@@ -233,10 +276,10 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
     form.areas.importance = box_inner;
     let marks = crate::model::importance_marks(form.importance);
     if marks.is_empty() {
-        render_or_placeholder(f, box_inner, "", "→");
+        render_or_placeholder(f, box_inner, "", "→", theme);
     } else {
         f.render_widget(
-            Paragraph::new(Line::styled(marks, Style::new().fg(theme::RED))),
+            Paragraph::new(Line::styled(marks, Style::new().fg(theme.error_color()))),
             box_inner,
         );
     }
@@ -252,9 +295,9 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
         f,
         theme,
         body_box,
-        form.body.content_height() as usize,
+        form.body.content_height(),
         box_inner.height as usize,
-        form.body.scroll() as usize,
+        form.body.scroll(),
         focused,
     );
 
@@ -262,7 +305,9 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
     let footer = match &form.error {
         Some(error) => Line::styled(
             truncate(error, hint.width as usize),
-            Style::new().fg(theme::RED).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(theme.error_color())
+                .add_modifier(Modifier::BOLD),
         ),
         None => Line::styled(
             if docked {
@@ -270,7 +315,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
             } else {
                 "/ commands · Ctrl+Z undo · Ctrl+S save · Esc cancel"
             },
-            Style::new().fg(theme::GREY),
+            Style::new().fg(theme.muted_color()),
         ),
     };
     f.render_widget(Paragraph::new(footer), hint);
@@ -303,34 +348,29 @@ fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         return;
     }
 
-    let Some(task_id) = app.selected_task().map(|t| t.id.clone()) else {
+    let Some(task) = app.selected_task().cloned() else {
         app.invalidate_preview();
-        let style = Style::new().fg(theme::GREY);
+        let style = Style::new().fg(theme.muted_color());
         draw_box(f, inner, "Select a task · Enter to edit", style);
         return;
     };
 
-    // Snapshot fields we need before borrowing the preview form mutably.
-    let (title, done, due_s, importance, body_empty, image_paths, todo) = {
-        let task = app.selected_task().expect("id present");
-        let paths: Vec<_> = task
-            .body
-            .iter()
-            .filter_map(|b| match b {
-                crate::model::Block::Image { path } => Some(crate::image::expand(path)),
-                _ => None,
-            })
-            .collect();
-        (
-            task.title.clone(),
-            task.done,
-            due::display(&task.due, &app.settings.date_format),
-            task.importance,
-            task.body.is_empty(),
-            paths,
-            crate::model::todo_progress(task),
-        )
-    };
+    // One owned snapshot avoids a second selection lookup and lets the image
+    // cache and preview editor be borrowed independently below.
+    let image_paths: Vec<_> = task
+        .body
+        .iter()
+        .filter_map(|block| match block {
+            crate::model::Block::Image { attachment_id } => Some(app.images.resolve(attachment_id)),
+            _ => None,
+        })
+        .collect();
+    let todo = crate::model::todo_progress(&task);
+    let title = task.title;
+    let done = task.done;
+    let due_s = due::display(&task.due, &app.settings.date_format);
+    let importance = task.importance;
+    let body_empty = task.body.is_empty();
 
     // Prefetch body pictures so they appear on the next frames.
     app.images.prefetch(image_paths);
@@ -355,7 +395,7 @@ fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 
     let title_style = if done {
         Style::new()
-            .fg(theme::GREY)
+            .fg(theme.muted_color())
             .add_modifier(Modifier::CROSSED_OUT | Modifier::BOLD)
     } else {
         Style::new().add_modifier(Modifier::BOLD)
@@ -385,7 +425,7 @@ fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         f.render_widget(
             Paragraph::new(Line::styled(
                 truncate(&meta, meta_row.width as usize),
-                Style::new().fg(theme::GREY),
+                Style::new().fg(theme.muted_color()),
             )),
             meta_row,
         );
@@ -396,7 +436,10 @@ fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     }
     if body_empty {
         f.render_widget(
-            Paragraph::new(Line::styled("Enter to edit", Style::new().fg(theme::GREY))),
+            Paragraph::new(Line::styled(
+                "Enter to edit",
+                Style::new().fg(theme.muted_color()),
+            )),
             body_area,
         );
         return;
@@ -410,8 +453,23 @@ fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     } = app;
     if let Some(paint) = preview_form.as_mut() {
         draw_body(f, paint, store, theme, body_area, false);
+        if paint.body.content_height() > usize::from(body_area.height) && body_area.height > 0 {
+            let indicator = Rect {
+                y: body_area.bottom() - 1,
+                height: 1,
+                ..body_area
+            };
+            f.render_widget(
+                Paragraph::new(Line::styled(
+                    "↓ more · Enter to edit",
+                    Style::new()
+                        .fg(theme.muted_color())
+                        .add_modifier(Modifier::BOLD),
+                )),
+                indicator,
+            );
+        }
     }
-    let _ = task_id;
 }
 
 /// One field of a dialog: a rounded box with its name on the border.
@@ -426,8 +484,10 @@ fn field_block<'a>(
         (theme.accent_text(), theme.accent_text().bold())
     } else {
         (
-            Style::new().fg(theme::GREY),
-            Style::new().fg(theme::GREY).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme.muted_color()),
+            Style::new()
+                .fg(theme.muted_color())
+                .add_modifier(Modifier::BOLD),
         )
     };
     let mut block = Block::bordered()
@@ -437,7 +497,7 @@ fn field_block<'a>(
         .padding(Padding::horizontal(1));
     if let Some(note) = note {
         block = block.title_top(
-            Line::styled(format!(" {note} "), Style::new().fg(theme::GREY)).right_aligned(),
+            Line::styled(format!(" {note} "), Style::new().fg(theme.muted_color())).right_aligned(),
         );
     }
     block
@@ -481,7 +541,7 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     form.name_area = box_inner;
     let view = form.name.visible(box_inner.width as usize);
     if view.text.is_empty() {
-        render_or_placeholder(f, box_inner, "", "What to call it");
+        render_or_placeholder(f, box_inner, "", "What to call it", theme);
     } else {
         f.render_widget(
             Paragraph::new(line_with_selection(
@@ -494,7 +554,7 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         );
     }
     if focused {
-        f.set_cursor_position((box_inner.x + view.cursor_col, box_inner.y));
+        f.set_cursor_position((box_inner.x.saturating_add(view.cursor_col), box_inner.y));
     }
 
     let focused = form.on_description;
@@ -508,7 +568,7 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         .description
         .layout(box_inner.width as usize, box_inner.height);
     if form.description.is_empty() && form.description.menu.is_none() {
-        render_or_placeholder(f, box_inner, "", "Press / for commands");
+        render_or_placeholder(f, box_inner, "", "Press / for commands", theme);
     }
     for placed in lines {
         if matches!(placed.block, crate::body::Painted::Text { .. }) {
@@ -516,7 +576,10 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         }
     }
     if let (true, Some((row, col))) = (focused, cursor) {
-        f.set_cursor_position((box_inner.x + col, box_inner.y + row));
+        f.set_cursor_position((
+            box_inner.x.saturating_add(col),
+            box_inner.y.saturating_add(row),
+        ));
     }
     if focused {
         draw_slash_menu(f, &form.description, theme, box_inner, cursor);
@@ -525,20 +588,22 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         f,
         theme,
         text_box,
-        form.description.content_height() as usize,
+        form.description.content_height(),
         box_inner.height as usize,
-        form.description.scroll() as usize,
+        form.description.scroll(),
         focused,
     );
 
     let footer = match &form.error {
         Some(error) => Line::styled(
             truncate(error, hint.width as usize),
-            Style::new().fg(theme::RED).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(theme.error_color())
+                .add_modifier(Modifier::BOLD),
         ),
         None => Line::styled(
             "/ commands · Ctrl+Z undo · Ctrl+S save · Esc cancel",
-            Style::new().fg(theme::GREY),
+            Style::new().fg(theme.muted_color()),
         ),
     };
     f.render_widget(Paragraph::new(footer), hint);
@@ -555,7 +620,7 @@ fn draw_body(
 ) {
     let menu_open = form.body.menu.is_some();
     if form.body.is_empty() && form.body.menu.is_none() {
-        render_or_placeholder(f, area, "", "Press / for commands");
+        render_or_placeholder(f, area, "", "Press / for commands", theme);
     }
     let (blocks, cursor) = form.body.layout(area.width as usize, area.height);
     let scroll = form.body.scroll();
@@ -578,7 +643,7 @@ fn draw_body(
         match &placed.block {
             crate::body::Painted::Image(path) => {
                 let row = Rect {
-                    y: area.y + placed.y,
+                    y: area.y.saturating_add(placed.y),
                     height: placed.rows,
                     ..area
                 };
@@ -602,14 +667,14 @@ fn draw_body(
         }
     }
     if focused && let Some((row, col)) = cursor {
-        f.set_cursor_position((area.x + col, area.y + row));
+        f.set_cursor_position((area.x.saturating_add(col), area.y.saturating_add(row)));
     }
 
     draw_slash_menu(f, &form.body, theme, area, cursor);
 }
 
 fn rects_overlap(a: Rect, b: Rect) -> bool {
-    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+    a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom()
 }
 
 /// Screen rect of the open `/` dropdown, if any.
@@ -624,20 +689,23 @@ fn slash_menu_rect(
         return None;
     }
     let width = 48.min(area.width);
-    let height = commands.len() as u16 + 2;
+    let height = u16::try_from(commands.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
     let cursor_row = cursor.map(|(row, _)| row).unwrap_or(0);
-    let below = area.y + cursor_row + 1;
-    let y = if below + height <= area.bottom() {
+    let below = area.y.saturating_add(cursor_row).saturating_add(1);
+    let y = if area.bottom().saturating_sub(below) >= height {
         below
     } else {
-        (area.y + cursor_row).saturating_sub(height)
+        area.y.saturating_add(cursor_row).saturating_sub(height)
     };
     Some(Rect {
-        x: area.x
-            + cursor
+        x: area.x.saturating_add(
+            cursor
                 .map(|(_, col)| col)
                 .unwrap_or(0)
                 .min(area.width.saturating_sub(width)),
+        ),
         y,
         width,
         height,
@@ -652,7 +720,10 @@ fn draw_placed_text(f: &mut Frame, theme: &Theme, area: Rect, placed: &crate::bo
     let indent = kind.indent();
     let max_rows = placed.rows as usize;
     for (i, wr) in rows.iter().enumerate().take(max_rows) {
-        let y = area.y + placed.y + i as u16;
+        let y = area
+            .y
+            .saturating_add(placed.y)
+            .saturating_add(u16::try_from(i).unwrap_or(u16::MAX));
         if y >= area.bottom() {
             break;
         }
@@ -667,7 +738,7 @@ fn draw_placed_text(f: &mut Frame, theme: &Theme, area: Rect, placed: &crate::bo
                 .fg(theme.accent)
                 .add_modifier(Modifier::UNDERLINED),
             crate::body::TextKind::Todo { done: true } => Style::new()
-                .fg(theme::GREY)
+                .fg(theme.muted_color())
                 .add_modifier(Modifier::CROSSED_OUT),
             _ => Style::new(),
         };
@@ -676,35 +747,38 @@ fn draw_placed_text(f: &mut Frame, theme: &Theme, area: Rect, placed: &crate::bo
             match kind {
                 crate::body::TextKind::Todo { done: true } => Line::from(
                     [
-                        vec![Span::styled("[✓] ", Style::new().fg(theme::GREEN))],
+                        vec![Span::styled("[✓] ", Style::new().fg(theme.success_color()))],
                         body.spans,
                     ]
                     .concat(),
                 ),
                 crate::body::TextKind::Todo { done: false } => Line::from(
                     [
-                        vec![Span::styled("[ ] ", Style::new().fg(theme::GREY))],
+                        vec![Span::styled("[ ] ", Style::new().fg(theme.muted_color()))],
                         body.spans,
                     ]
                     .concat(),
                 ),
                 crate::body::TextKind::Bullet => Line::from(
                     [
-                        vec![Span::styled("• ", Style::new().fg(theme::GREY))],
+                        vec![Span::styled("• ", Style::new().fg(theme.muted_color()))],
                         body.spans,
                     ]
                     .concat(),
                 ),
                 crate::body::TextKind::Number(n) => Line::from(
                     [
-                        vec![Span::styled(format!("{n}. "), Style::new().fg(theme::GREY))],
+                        vec![Span::styled(
+                            format!("{n}. "),
+                            Style::new().fg(theme.muted_color()),
+                        )],
                         body.spans,
                     ]
                     .concat(),
                 ),
                 crate::body::TextKind::Link => Line::from(
                     [
-                        vec![Span::styled("↗ ", Style::new().fg(theme::GREY))],
+                        vec![Span::styled("↗ ", Style::new().fg(theme.muted_color()))],
                         body.spans,
                     ]
                     .concat(),
@@ -730,7 +804,7 @@ fn draw_image_placeholder(f: &mut Frame, theme: &Theme, area: Rect, selected: bo
     let style = if selected {
         theme.accent_text()
     } else {
-        Style::new().fg(theme::GREY)
+        Style::new().fg(theme.muted_color())
     };
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(Line::styled(" [image] ", style)), rect);
@@ -792,14 +866,14 @@ fn draw_image_slot(
     let border = if selected {
         theme.accent_text()
     } else {
-        Style::new().fg(theme::GREY)
+        Style::new().fg(theme.muted_color())
     };
     let (icon, title, title_style, detail) = match kind {
-        ImageSlotKind::Loading => ("▢", "loading", Style::new().fg(theme::GREY), None),
+        ImageSlotKind::Loading => ("▢", "loading", Style::new().fg(theme.muted_color()), None),
         ImageSlotKind::Broken { detail } => (
             "✕",
             "broken image",
-            Style::new().fg(theme::RED),
+            Style::new().fg(theme.error_color()),
             Some(detail),
         ),
     };
@@ -840,7 +914,7 @@ fn draw_image_slot(
             lines.push(
                 Line::from(Span::styled(
                     truncate(d, inner.width as usize),
-                    Style::new().fg(theme::GREY),
+                    Style::new().fg(theme.muted_color()),
                 ))
                 .centered(),
             );
@@ -883,7 +957,7 @@ fn draw_slash_menu(
         .border_style(theme.accent_text())
         .title(Span::styled(
             format!(" /{} ", menu.query),
-            Style::new().fg(theme::GREY),
+            Style::new().fg(theme.muted_color()),
         ));
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
@@ -903,8 +977,9 @@ fn draw_due_picker(
     let Some(day) = crate::duepicker::to_time_date(picker.day) else {
         return;
     };
-    let mut events =
-        ratatui::widgets::calendar::CalendarEventStore::today(Style::new().fg(theme::GREEN));
+    let mut events = ratatui::widgets::calendar::CalendarEventStore::today(
+        Style::new().fg(theme.success_color()),
+    );
     // Underlined rather than filled, to match the task list.
     events.add(day, theme.selection().add_modifier(Modifier::UNDERLINED));
 
@@ -919,7 +994,7 @@ fn draw_due_picker(
     let rect = Rect {
         // Left-align with the Due field's outer box.
         x: field.x.min(area.right().saturating_sub(width)),
-        y: if below + height <= area.bottom() {
+        y: if area.bottom().saturating_sub(below) >= height {
             below
         } else {
             field.y.saturating_sub(height)
@@ -931,7 +1006,7 @@ fn draw_due_picker(
         .border_type(BorderType::Thick)
         .border_style(theme.accent_text())
         .title_bottom(
-            Line::styled(" Tab · clear(x) ", Style::new().fg(theme::GREY)).left_aligned(),
+            Line::styled(" Tab · clear(x) ", Style::new().fg(theme.muted_color())).left_aligned(),
         );
     f.render_widget(Clear, rect);
     let inner = block.inner(rect);
@@ -956,15 +1031,19 @@ fn draw_due_picker(
     // Month header (1) + weekdays (1) + day grid — matches Monthly's layout.
     let days = Rect {
         x: cal_area.x,
-        y: cal_area.y + 2,
+        y: cal_area.y.saturating_add(2),
         width: cal_area.width,
         height: cal_area.height.saturating_sub(2),
     };
 
     let calendar = ratatui::widgets::calendar::Monthly::new(day, events)
         .show_month_header(theme.accent_text().add_modifier(Modifier::BOLD))
-        .show_weekdays_header(Style::new().fg(theme::GREY))
-        .show_surrounding(Style::new().fg(theme::GREY).add_modifier(Modifier::DIM));
+        .show_weekdays_header(Style::new().fg(theme.muted_color()))
+        .show_surrounding(
+            Style::new()
+                .fg(theme.muted_color())
+                .add_modifier(Modifier::DIM),
+        );
     f.render_widget(calendar, cal_area);
 
     // Clock only — no "Time" label — centered under the calendar.
@@ -982,7 +1061,7 @@ fn draw_due_picker(
     };
     let time_line = Line::from(vec![
         unit(&hour, picker.focus == PickerFocus::Hour),
-        Span::styled(":", Style::new().fg(theme::GREY)),
+        Span::styled(":", Style::new().fg(theme.muted_color())),
         unit(&minute, picker.focus == PickerFocus::Minute),
     ])
     .centered();
@@ -990,7 +1069,9 @@ fn draw_due_picker(
 
     // Hit targets for "HH" and "MM" within the centered "HH:MM" (5 cells).
     let clock_w = 5u16;
-    let clock_x = time_area.x + time_area.width.saturating_sub(clock_w) / 2;
+    let clock_x = time_area
+        .x
+        .saturating_add(time_area.width.saturating_sub(clock_w) / 2);
     picker.layout = PickerLayout {
         frame: rect,
         days,
@@ -1001,7 +1082,7 @@ fn draw_due_picker(
             height: 1,
         },
         minute: Rect {
-            x: clock_x + 3,
+            x: clock_x.saturating_add(3),
             y: time_area.y,
             width: 2,
             height: 1,
@@ -1019,7 +1100,11 @@ fn draw_image_preview(
     path: &std::path::Path,
     area: Rect,
 ) {
-    let rect = centered(area, area.width * 9 / 10, area.height * 9 / 10);
+    let rect = centered(
+        area,
+        (u32::from(area.width) * 9 / 10) as u16,
+        (u32::from(area.height) * 9 / 10) as u16,
+    );
     let title = truncate(
         &path.file_name().unwrap_or_default().to_string_lossy(),
         rect.width.saturating_sub(10) as usize,
@@ -1040,8 +1125,11 @@ fn draw_image_preview(
             theme.accent_text().bold(),
         ))
         .title_top(
-            Line::styled(format!(" {kind}{anim_note} "), Style::new().fg(theme::GREY))
-                .right_aligned(),
+            Line::styled(
+                format!(" {kind}{anim_note} "),
+                Style::new().fg(theme.muted_color()),
+            )
+            .right_aligned(),
         )
         .title_bottom(
             Line::styled(
@@ -1052,7 +1140,7 @@ fn draw_image_preview(
                     Some(g) if g.is_animated() => " Esc closes · click/space pause ",
                     _ => " Esc closes ",
                 },
-                Style::new().fg(theme::GREY),
+                Style::new().fg(theme.muted_color()),
             )
             .right_aligned(),
         );
@@ -1064,7 +1152,7 @@ fn draw_image_preview(
     if let Some((_, gif)) = form.gif.as_ref() {
         match store.preview_frame(gif) {
             Ok(protocol) => {
-                let _ = render_protocol(f, protocol, inner, None);
+                let _ = render_protocol(f, protocol, inner, theme, None);
             }
             Err(err) => {
                 let slot = letterbox_rect(preview_slot_area(inner), 4, 3);
@@ -1080,7 +1168,7 @@ fn draw_image_preview(
     } else {
         match store.get_preview(path) {
             crate::image::ImageReady::Ready(protocol) => {
-                let _ = render_protocol(f, protocol, inner, None);
+                let _ = render_protocol(f, protocol, inner, theme, None);
             }
             crate::image::ImageReady::Loading => {
                 // Loading means not cached yet — aspect unknown.
@@ -1125,7 +1213,8 @@ fn draw_image(
             f,
             protocol,
             inner,
-            selected.then_some((theme, path)),
+            theme,
+            selected.then_some(path),
         )),
         crate::image::ImageReady::Loading => {
             // Not in cache yet — aspect unknown until decode finishes.
@@ -1157,7 +1246,8 @@ fn render_protocol(
     f: &mut Frame,
     protocol: &mut ratatui_image::protocol::StatefulProtocol,
     inner: Rect,
-    frame: Option<(&Theme, &std::path::Path)>,
+    theme: &Theme,
+    frame: Option<&std::path::Path>,
 ) -> Rect {
     // Scale (not Fit): Fit never grows past the source pixel size, so a
     // 1920px image on a large terminal only fills part of the preview.
@@ -1173,7 +1263,7 @@ fn render_protocol(
         picture,
         protocol,
     );
-    let hit = if let Some((theme, path)) = frame {
+    let hit = if let Some(path) = frame {
         let border = Rect {
             x: picture.x.saturating_sub(1),
             y: picture.y.saturating_sub(1),
@@ -1186,7 +1276,8 @@ fn render_protocol(
                 .border_type(BorderType::Thick)
                 .border_style(theme.accent_text())
                 .title_top(
-                    Line::styled(format!(" {kind} "), Style::new().fg(theme::GREY)).right_aligned(),
+                    Line::styled(format!(" {kind} "), Style::new().fg(theme.muted_color()))
+                        .right_aligned(),
                 ),
             border,
         );
@@ -1197,7 +1288,7 @@ fn render_protocol(
     if let Some(Err(err)) = protocol.last_encoding_result() {
         let line = Line::styled(
             truncate(&format!("image: {err}"), inner.width as usize),
-            Style::new().fg(theme::RED),
+            Style::new().fg(theme.error_color()),
         );
         f.render_widget(Paragraph::new(line), inner);
     }
@@ -1238,25 +1329,27 @@ fn line_with_selection(
         let style = if in_sel { sel_style } else { base };
         spans.push(Span::styled(std::mem::take(chunk), style));
     };
-    for c in text.chars() {
-        let w = c.width().unwrap_or(0);
+    for grapheme in text.graphemes(true) {
+        let w = grapheme.width();
         let in_sel = col >= a && col < b;
         if !chunk.is_empty() && in_sel != chunk_in_sel {
             flush(&mut spans, &mut chunk, chunk_in_sel);
         }
         chunk_in_sel = in_sel;
-        chunk.push(c);
+        chunk.push_str(grapheme);
         col += w;
     }
     flush(&mut spans, &mut chunk, chunk_in_sel);
     Line::from(spans)
 }
 
-fn render_or_placeholder(f: &mut Frame, area: Rect, text: &str, placeholder: &str) {
+fn render_or_placeholder(f: &mut Frame, area: Rect, text: &str, placeholder: &str, theme: &Theme) {
     let line = if text.is_empty() {
         Line::styled(
             truncate(placeholder, area.width as usize),
-            Style::new().fg(theme::GREY).add_modifier(Modifier::DIM),
+            Style::new()
+                .fg(theme.muted_color())
+                .add_modifier(Modifier::DIM),
         )
     } else {
         Line::raw(text.to_string())
@@ -1271,8 +1364,10 @@ fn panel<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
         (theme.accent_text(), theme.accent_text().bold())
     } else {
         (
-            Style::new().fg(theme::GREY),
-            Style::new().fg(theme::GREY).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme.muted_color()),
+            Style::new()
+                .fg(theme.muted_color())
+                .add_modifier(Modifier::BOLD),
         )
     };
     Block::bordered()
@@ -1331,7 +1426,7 @@ fn paint_scrollbar(
     let style = if focused {
         theme.accent_text()
     } else {
-        Style::new().fg(theme::GREY)
+        Style::new().fg(theme.muted_color())
     };
     f.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -1383,7 +1478,7 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             ListItem::new(Line::from(vec![
                 Span::raw(name),
                 Span::raw(pad),
-                Span::styled(count, Style::new().fg(theme::GREY)),
+                Span::styled(count, Style::new().fg(theme.muted_color())),
             ]))
         })
         .collect();
@@ -1420,8 +1515,8 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     // Search spells out what matched; category notes stay in the editor.
     if app.searching {
         let context = format!(" search: {} · {} found ", app.search_query, app.view.len());
-        block =
-            block.title_top(Line::styled(context, Style::new().fg(theme::GREY)).right_aligned());
+        block = block
+            .title_top(Line::styled(context, Style::new().fg(theme.muted_color())).right_aligned());
     }
     let inner = block.inner(area);
     app.areas.tasks = inner;
@@ -1440,7 +1535,7 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         let style = if chrome_focus {
             theme.accent_text()
         } else {
-            Style::new().fg(theme::GREY)
+            Style::new().fg(theme.muted_color())
         };
         draw_box(f, inner, text, style);
         return;
@@ -1460,23 +1555,38 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         )
     });
 
+    // Preserve a useful title at narrow widths. Optional metadata appears in
+    // priority order only when its complete column fits.
+    const TITLE_MIN: usize = 8;
+    let available = inner.width as usize;
+    let mut used = DONE_MARK_WIDTH as usize + 1 + TITLE_MIN;
+    let due_visible = due_width > 0 && used + 1 + due_width <= available;
+    if due_visible {
+        used += 1 + due_width;
+    }
+    let flags_visible = used + 1 + flags_width <= available;
+    if flags_visible {
+        used += 1 + flags_width;
+    }
+    let extras_visible = extras_width > 0 && used + 1 + extras_width <= available;
     let columns = Columns {
-        extras: extras_width > 0,
-        due: due_width > 0,
-        flags: true,
+        extras: extras_visible,
+        due: due_visible,
+        flags: flags_visible,
     };
-    // Columns nothing fills are left out entirely — an empty one would
-    // still cost the gap beside it. Flags always take a fixed slot.
     let mut widths = vec![
         Constraint::Length(DONE_MARK_WIDTH), // [ ] / [✓]
         Constraint::Fill(1),                 // title
     ];
-    for width in [extras_width, due_width] {
-        if width > 0 {
-            widths.push(Constraint::Length(width as u16));
-        }
+    if columns.extras {
+        widths.push(Constraint::Length(extras_width as u16));
     }
-    widths.push(Constraint::Length(flags_width as u16));
+    if columns.due {
+        widths.push(Constraint::Length(due_width as u16));
+    }
+    if columns.flags {
+        widths.push(Constraint::Length(flags_width as u16));
+    }
     let rows: Vec<Row> = app
         .list_rows
         .iter()
@@ -1502,7 +1612,9 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     // Remember where the markers ended up, so a click can find them. The
     // flags sit at the right edge, the tick at the left.
     app.areas.done_x = Some(inner.x);
-    app.areas.flag_x = Some(inner.right() - flags_width as u16);
+    app.areas.flag_x = columns
+        .flags
+        .then_some(inner.right().saturating_sub(flags_width as u16));
 
     let vis = app.selected_visual_row();
     app.task_state.select(vis);
@@ -1516,9 +1628,11 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 
     // Full-width category rules on top of separator placeholder rows.
     let offset = app.task_state.offset();
-    let rule_style = Style::new().fg(theme::GREY);
+    let rule_style = Style::new().fg(theme.muted_color());
     for (vis_i, row) in app.list_rows.iter().enumerate().skip(offset) {
-        let y = inner.y + (vis_i - offset) as u16;
+        let y = inner
+            .y
+            .saturating_add(u16::try_from(vis_i - offset).unwrap_or(u16::MAX));
         if y >= inner.bottom() {
             break;
         }
@@ -1623,13 +1737,13 @@ fn task_row(app: &App, theme: &Theme, view_idx: usize, columns: Columns) -> Row<
 
     let title_style = if !task.due.is_empty() {
         let color = if done && !selected {
-            theme::dimmed(theme.accent)
+            theme.dimmed_accent()
         } else {
             theme.accent
         };
         Style::new().fg(color)
     } else if done && !selected {
-        Style::new().fg(theme::GREY)
+        Style::new().fg(theme.muted_color())
     } else {
         theme.plain()
     };
@@ -1641,9 +1755,9 @@ fn task_row(app: &App, theme: &Theme, view_idx: usize, columns: Columns) -> Row<
 
     let mut cells = Vec::with_capacity(5);
     let (mark, mark_style) = if done {
-        ("[✓]", Style::new().fg(theme::GREEN))
+        ("[✓]", Style::new().fg(theme.success_color()))
     } else {
-        ("[ ]", Style::new().fg(theme::GREY))
+        ("[ ]", Style::new().fg(theme.muted_color()))
     };
     cells.push(Cell::new(mark).style(mark_style));
     cells.push(Cell::new(Span::styled(title, title_style)));
@@ -1651,7 +1765,7 @@ fn task_row(app: &App, theme: &Theme, view_idx: usize, columns: Columns) -> Row<
     if columns.extras {
         cells.push(Cell::new(Span::styled(
             extras(task),
-            Style::new().fg(theme::GREY),
+            Style::new().fg(theme.muted_color()),
         )));
     }
     if columns.due {
@@ -1663,7 +1777,7 @@ fn task_row(app: &App, theme: &Theme, view_idx: usize, columns: Columns) -> Row<
         cells.push(Cell::new(Text::from(
             Line::from(Span::styled(
                 crate::model::importance_marks(task.importance),
-                Style::new().fg(theme::RED),
+                Style::new().fg(theme.error_color()),
             ))
             .right_aligned(),
         )));
@@ -1682,7 +1796,7 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         .border_style(if typing {
             theme.accent_text()
         } else {
-            Style::new().fg(theme::GREY)
+            Style::new().fg(theme.muted_color())
         })
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
@@ -1691,7 +1805,7 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 
     let right = Line::from(Span::styled(
         due::now_string(&app.settings.date_format),
-        Style::new().fg(theme::GREY),
+        Style::new().fg(theme.muted_color()),
     ));
     let right_width = right.width() as u16;
     let [left_area, right_area] = Layout::horizontal([
@@ -1705,14 +1819,22 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let left = match app.mode {
         Mode::Slash | Mode::Search => {
             let view = app.input.visible(field);
-            f.set_cursor_position((left_area.x + 1 + view.cursor_col, left_area.y));
+            f.set_cursor_position((
+                left_area
+                    .x
+                    .saturating_add(1)
+                    .saturating_add(view.cursor_col),
+                left_area.y,
+            ));
             let body = line_with_selection(&view.text, view.sel_cols, Style::new(), theme);
             Line::from([vec![Span::styled("/", theme.accent_text())], body.spans].concat())
         }
         _ => match &app.message {
             Some(m) => {
                 let style = match m.kind {
-                    MessageKind::Error => Style::new().fg(theme::RED).add_modifier(Modifier::BOLD),
+                    MessageKind::Error => Style::new()
+                        .fg(theme.error_color())
+                        .add_modifier(Modifier::BOLD),
                     MessageKind::Info => theme.accent_text(),
                 };
                 Line::from(Span::styled(truncate(&m.text, field), style))
@@ -1724,7 +1846,7 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                     "/ commands".to_string()
                 };
                 if (left_area.width as usize) >= hint.width() + 2 {
-                    Line::from(Span::styled(hint, Style::new().fg(theme::GREY)))
+                    Line::from(Span::styled(hint, Style::new().fg(theme.muted_color())))
                 } else {
                     Line::raw("")
                 }
@@ -1735,20 +1857,24 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 }
 
 /// Dropdown of `/` commands, drawn upward from the status bar.
-fn draw_slash_palette(f: &mut Frame, app: &App, theme: &Theme, status: Rect) {
+fn draw_slash_palette(f: &mut Frame, app: &mut App, theme: &Theme, status: Rect) {
     let query = app.input.value();
     let commands = crate::slash::matching(&query);
     if commands.is_empty() {
         return;
     }
     let width = 53.min(status.width.saturating_sub(2)).max(24);
-    let height = (commands.len() as u16 + 2).min(status.y.max(3));
+    let height = u16::try_from(commands.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(status.y.max(3));
     let rect = Rect {
         x: status.x,
         y: status.y.saturating_sub(height),
         width,
         height,
     };
+    app.areas.slash_menu = rect;
     let row_width = width.saturating_sub(2) as usize;
     let lines: Vec<Line> = commands
         .iter()
@@ -1769,7 +1895,7 @@ fn draw_slash_palette(f: &mut Frame, app: &App, theme: &Theme, status: Rect) {
         .border_style(theme.accent_text())
         .title(Span::styled(
             format!(" /{} ", query),
-            Style::new().fg(theme::GREY),
+            Style::new().fg(theme.muted_color()),
         ));
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
@@ -1789,15 +1915,15 @@ fn dropdown_row(
     let used = label_part.width() + hint_part.width();
     let pad = " ".repeat(row_width.saturating_sub(used));
 
-    let wash = theme::tint(theme.accent);
     let (label_style, hint_style, pad_style) = if selected {
-        (
-            theme.selection(),
-            Style::new().fg(theme::GREY).bg(wash),
-            Style::new().bg(wash),
-        )
+        let selection = theme.selection();
+        (selection, selection, selection)
     } else {
-        (Style::new(), Style::new().fg(theme::GREY), Style::new())
+        (
+            Style::new(),
+            Style::new().fg(theme.muted_color()),
+            Style::new(),
+        )
     };
     Line::from(vec![
         Span::styled(label_part, label_style),
@@ -1808,7 +1934,7 @@ fn dropdown_row(
 
 // -------------------------------------------------------------- overlays
 
-fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
+fn draw_help(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let big = area.width >= banner::BANNER_WIDTH + 8;
     let art: Vec<&str> = if big {
         banner::BANNER.to_vec()
@@ -1816,41 +1942,48 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         banner::BANNER_SMALL.to_vec()
     };
 
-    let col_width = 40usize;
-    let inner_width = (col_width * 2 + 3).min(area.width.saturating_sub(4) as usize);
     let mut lines: Vec<Line> = Vec::new();
     for row in &art {
         lines.push(Line::styled((*row).to_string(), theme.accent_text()).centered());
     }
     lines.push(Line::raw(""));
-    for banner::HelpRow {
-        left,
-        right,
-        heading,
-    } in banner::HELP_COLUMNS
-    {
-        let style = if heading {
-            theme.accent_text().add_modifier(Modifier::BOLD)
-        } else {
-            Style::new()
-        };
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("{left:<col_width$}"), style),
-            Span::styled(right.to_string(), style),
-        ]));
+    // One logical column keeps every shortcut readable on ordinary 80-column
+    // terminals. The two source columns become consecutive sections.
+    for side in 0..2 {
+        for banner::HelpRow {
+            left,
+            right,
+            heading,
+        } in banner::HELP_COLUMNS
+        {
+            let text = if side == 0 { left } else { right };
+            if text.is_empty() {
+                lines.push(Line::raw(""));
+                continue;
+            }
+            let style = if heading {
+                theme.accent_text().add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            let prefix = if heading { "" } else { "  " };
+            lines.push(Line::styled(format!("{prefix}{text}"), style));
+        }
+        lines.push(Line::raw(""));
     }
-    lines.push(Line::raw(""));
     lines.push(Line::styled(banner::HELP_FOOTER, theme.accent_text()).centered());
 
-    let height = (lines.len() as u16 + 2).min(area.height);
-    let width = (inner_width as u16 + 4).min(area.width);
+    let height = area.height;
+    let width = 58.min(area.width);
     let rect = centered(area, width, height);
+    let viewport = rect.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(viewport);
+    app.help_scroll = app.help_scroll.min(max_scroll);
     let title = Line::from(vec![
         Span::raw(" mach "),
         Span::styled(
             format!("v{} ", crate::VERSION),
-            Style::new().fg(theme::GREY),
+            Style::new().fg(theme.muted_color()),
         ),
     ]);
     let block = Block::bordered()
@@ -1859,7 +1992,12 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         .border_style(theme.accent_text())
         .padding(ratatui::widgets::Padding::horizontal(1));
     f.render_widget(Clear, rect);
-    f.render_widget(Paragraph::new(lines).block(block), rect);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((app.help_scroll.min(u16::MAX as usize) as u16, 0)),
+        rect,
+    );
 }
 
 fn draw_settings(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
@@ -1882,11 +2020,14 @@ fn draw_settings(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         "↑↓ select · ←→ change · Esc close",
-        Style::new().fg(theme::GREY),
+        Style::new().fg(theme.muted_color()),
     ));
 
     let width = 48.min(area.width);
-    let height = (lines.len() as u16 + 2).min(area.height);
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(area.height);
     let rect = centered(area, width, height);
     let block = Block::bordered()
         .border_type(BorderType::Thick)
@@ -1918,12 +2059,12 @@ fn draw_welcome(f: &mut Frame, theme: &Theme, area: Rect) {
     );
     lines.push(Line::raw(""));
     lines.push(Line::raw("Written in Rust with ratatui.").centered());
-    lines.push(Line::raw("Your tasks live in ~/.mach as plain JSON.").centered());
+    lines.push(Line::raw("Your tasks stay local in ~/.mach.").centered());
     lines.push(Line::raw(""));
     lines.push(
         Line::styled(
             "Press Enter to start · /help for the key list",
-            Style::new().fg(theme::GREY),
+            Style::new().fg(theme.muted_color()),
         )
         .centered(),
     );
@@ -1935,7 +2076,10 @@ fn draw_welcome(f: &mut Frame, theme: &Theme, area: Rect) {
     } + 8)
         .max(50)
         .min(area.width);
-    let height = (lines.len() as u16 + 2).min(area.height);
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(area.height);
     let rect = centered(area, width, height);
     let block = Block::bordered()
         .border_type(BorderType::Thick)
@@ -1947,7 +2091,10 @@ fn draw_welcome(f: &mut Frame, theme: &Theme, area: Rect) {
 // ----------------------------------------------------------------- utils
 
 fn draw_box(f: &mut Frame, area: Rect, text: &str, style: Style) {
-    let width = (text.width() as u16 + 8).min(area.width);
+    let width = u16::try_from(text.width())
+        .unwrap_or(u16::MAX)
+        .saturating_add(8)
+        .min(area.width);
     let rect = centered(area, width, 3);
     let block = Block::bordered()
         .border_type(BorderType::Thick)
@@ -1965,27 +2112,27 @@ pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
     Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height - height) / 2,
+        x: area.x.saturating_add((area.width - width) / 2),
+        y: area.y.saturating_add((area.height - height) / 2),
         width,
         height,
     }
 }
 
-/// Cut a string to a display width, never splitting a wide character.
+/// Cut a string to a display width without splitting a grapheme cluster.
 pub fn truncate(s: &str, width: usize) -> String {
     if s.width() <= width {
         return s.to_string();
     }
     let mut out = String::new();
     let mut used = 0;
-    for c in s.chars() {
-        let w = c.width().unwrap_or(0);
+    for grapheme in s.graphemes(true) {
+        let w = grapheme.width();
         if used + w > width {
             break;
         }
         used += w;
-        out.push(c);
+        out.push_str(grapheme);
     }
     out
 }

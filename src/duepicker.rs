@@ -50,6 +50,12 @@ pub struct DuePicker {
     pub focus: PickerFocus,
     /// Digits typed into the focused hour/minute field (0–2).
     entry: Vec<u8>,
+    original: String,
+    had_date: bool,
+    had_year: bool,
+    had_time: bool,
+    date_changed: bool,
+    time_changed: bool,
     /// Last drawn positions for hit-testing.
     pub layout: PickerLayout,
 }
@@ -57,6 +63,7 @@ pub struct DuePicker {
 impl DuePicker {
     /// Opens on the date/time already in the field, or on now.
     pub fn new(current: &str) -> Self {
+        let current = current.trim();
         let now = Local::now();
         let day = parse_day(current).unwrap_or_else(|| now.date_naive());
         let (hour, minute) = match crate::due::sort_key(current) {
@@ -70,6 +77,15 @@ impl DuePicker {
             minute,
             focus: PickerFocus::Calendar,
             entry: Vec::new(),
+            original: current.to_string(),
+            had_date: current.contains('-'),
+            had_year: current
+                .split_whitespace()
+                .next()
+                .is_some_and(|date| date.split('-').next().is_some_and(|year| year.len() == 4)),
+            had_time: current.contains(':'),
+            date_changed: false,
+            time_changed: false,
             layout: PickerLayout::default(),
         }
     }
@@ -92,7 +108,7 @@ impl DuePicker {
             return true;
         }
         if let Some(day) = date_at_click(self.day, layout.days, x, y) {
-            self.day = day;
+            self.set_day(day);
             self.set_focus(PickerFocus::Calendar);
             return true;
         }
@@ -129,14 +145,39 @@ impl DuePicker {
         false
     }
 
-    /// What the field should read once this is confirmed — always date + time.
+    /// Preserve the representation the user opened. A missing date or clock
+    /// is only added when the user actually changes that component.
     pub fn value(&self) -> String {
-        format!(
-            "{} {:02}:{:02}",
-            self.day.format("%Y-%m-%d"),
-            self.hour,
-            self.minute
-        )
+        if !self.date_changed && !self.time_changed {
+            if !self.original.is_empty() {
+                return self.original.clone();
+            }
+            return format!(
+                "{} {:02}:{:02}",
+                self.day.format("%Y-%m-%d"),
+                self.hour,
+                self.minute
+            );
+        }
+        let include_date = self.had_date || self.date_changed;
+        let include_time = self.had_time || self.time_changed;
+        match (include_date, include_time) {
+            (true, true) => format!(
+                "{} {:02}:{:02}",
+                self.day.format("%Y-%m-%d"),
+                self.hour,
+                self.minute
+            ),
+            (true, false) => {
+                if self.had_date && !self.had_year {
+                    self.day.format("%m-%d").to_string()
+                } else {
+                    self.day.format("%Y-%m-%d").to_string()
+                }
+            }
+            (false, true) => format!("{:02}:{:02}", self.hour, self.minute),
+            (false, false) => String::new(),
+        }
     }
 
     pub fn focus_next(&mut self) {
@@ -157,7 +198,7 @@ impl DuePicker {
     pub fn move_days(&mut self, days: i64) {
         self.entry.clear();
         if let Some(day) = self.day.checked_add_signed(chrono::Duration::days(days)) {
-            self.day = day;
+            self.set_day(day);
         }
     }
 
@@ -175,35 +216,33 @@ impl DuePicker {
         // Clamp onto the last day of a shorter month.
         let day = self.day.day().min(days_in_month(year, month as u32));
         if let Some(date) = NaiveDate::from_ymd_opt(year, month as u32, day) {
-            self.day = date;
+            self.set_day(date);
         }
     }
 
     /// Jump the day to today; leave the clock as it is.
     pub fn today(&mut self) {
-        self.day = Local::now().date_naive();
+        self.set_day(Local::now().date_naive());
     }
 
     /// Set the clock to the current time of day.
     pub fn now_time(&mut self) {
         self.entry.clear();
         let now = Local::now();
-        self.hour = now.hour() as u8;
-        self.minute = now.minute() as u8;
+        self.set_time(now.hour() as u8, now.minute() as u8);
     }
 
     pub fn bump_hour(&mut self, delta: i32) {
         self.entry.clear();
         let h = (self.hour as i32 + delta).rem_euclid(24) as u8;
-        self.hour = h;
+        self.set_time(h, self.minute);
     }
 
     pub fn bump_minute(&mut self, delta: i32) {
         self.entry.clear();
         let total = self.hour as i32 * 60 + self.minute as i32 + delta;
         let total = total.rem_euclid(24 * 60);
-        self.hour = (total / 60) as u8;
-        self.minute = (total % 60) as u8;
+        self.set_time((total / 60) as u8, (total % 60) as u8);
     }
 
     /// Type a digit into the clock. On the calendar, jumps to hour first.
@@ -226,7 +265,7 @@ impl DuePicker {
     fn push_hour_digit(&mut self, d: u8) {
         if self.entry.is_empty() {
             self.entry.push(d);
-            self.hour = d;
+            self.set_time(d, self.minute);
             // 3–9 can only be single-digit hours → commit and move on.
             if d >= 3 {
                 self.entry.clear();
@@ -235,7 +274,7 @@ impl DuePicker {
             return;
         }
         let h = self.entry[0] * 10 + d;
-        self.hour = if h < 24 { h } else { d };
+        self.set_time(if h < 24 { h } else { d }, self.minute);
         self.entry.clear();
         self.set_focus(PickerFocus::Minute);
     }
@@ -243,7 +282,7 @@ impl DuePicker {
     fn push_minute_digit(&mut self, d: u8) {
         if self.entry.is_empty() {
             self.entry.push(d);
-            self.minute = d;
+            self.set_time(self.hour, d);
             // 6–9 can only be single-digit minutes.
             if d >= 6 {
                 self.entry.clear();
@@ -251,8 +290,23 @@ impl DuePicker {
             return;
         }
         let m = self.entry[0] * 10 + d;
-        self.minute = if m < 60 { m } else { d };
+        self.set_time(self.hour, if m < 60 { m } else { d });
         self.entry.clear();
+    }
+
+    fn set_day(&mut self, day: NaiveDate) {
+        if day != self.day {
+            self.day = day;
+            self.date_changed = true;
+        }
+    }
+
+    fn set_time(&mut self, hour: u8, minute: u8) {
+        if (hour, minute) != (self.hour, self.minute) {
+            self.hour = hour;
+            self.minute = minute;
+            self.time_changed = true;
+        }
     }
 }
 
@@ -314,8 +368,7 @@ mod tests {
     fn opens_on_the_date_already_set() {
         let picker = DuePicker::new("2030-01-02");
         assert_eq!(picker.day, NaiveDate::from_ymd_opt(2030, 1, 2).unwrap());
-        // No clock in the field → uses "now"; value always has a time.
-        assert!(picker.value().starts_with("2030-01-02 "));
+        assert_eq!(picker.value(), "2030-01-02");
     }
 
     #[test]
@@ -332,7 +385,33 @@ mod tests {
         assert_eq!(picker.day, Local::now().date_naive());
         assert_eq!(picker.hour, 9);
         assert_eq!(picker.minute, 30);
-        assert!(picker.value().ends_with(" 09:30"));
+        assert_eq!(picker.value(), "09:30");
+    }
+
+    #[test]
+    fn changing_only_an_existing_component_preserves_due_precision() {
+        let mut date = DuePicker::new("2030-01-02");
+        date.move_days(1);
+        assert_eq!(date.value(), "2030-01-03");
+
+        let mut time = DuePicker::new("09:30");
+        time.bump_minute(5);
+        assert_eq!(time.value(), "09:35");
+
+        let mut yearless = DuePicker::new("08-09");
+        yearless.move_days(1);
+        assert_eq!(yearless.value(), "08-10");
+    }
+
+    #[test]
+    fn changing_a_missing_component_intentionally_adds_it() {
+        let mut date = DuePicker::new("2030-01-02");
+        date.bump_hour(1);
+        assert!(date.value().starts_with("2030-01-02 "));
+
+        let mut time = DuePicker::new("09:30");
+        time.move_days(1);
+        assert!(time.value().ends_with(" 09:30"));
     }
 
     #[test]

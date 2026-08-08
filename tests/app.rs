@@ -1,71 +1,77 @@
-//! End-to-end checks against a throwaway schema-3 data directory.
+//! App behavior against an independent in-memory store per test.
 
-use std::fs;
-use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
-
-use mach::app::App;
+use mach::app::{App, Confirm, Mode};
 use mach::form::TaskDraft;
-use mach::model::Block;
+use mach::model::{Block, Category, Task};
+use mach::store::{CategoryPatch, RelativePosition, Store, TaskPatch};
 
-/// `store::paths()` resolves once per process, so every test in this file
-/// shares one directory. The lock keeps them from running concurrently.
-static DATA_DIR: Mutex<()> = Mutex::new(());
+fn seed(store: &mut Store) {
+    let categories = vec![
+        Category {
+            id: "c-work".into(),
+            name: "Work".into(),
+            description: String::new(),
+        },
+        Category {
+            id: "c-home".into(),
+            name: "Home".into(),
+            description: String::new(),
+        },
+    ];
+    let mut done = Task::new("done task", 0, Some("c-work".into()), "");
+    done.id = "t-done".into();
+    done.created = "2024-01-01 00:00:00".into();
+    done.done = true;
+    let mut open = Task::new("open task", 1, None, "2030-01-02");
+    open.id = "t-open".into();
+    open.created = "2024-01-02 00:00:00".into();
+    store
+        .update(|data| {
+            data.categories = categories;
+            data.tasks = vec![done, open];
+            Ok(())
+        })
+        .unwrap();
+}
 
-fn setup() -> (PathBuf, MutexGuard<'static, ()>) {
-    let guard = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = std::env::temp_dir().join(format!("mach-test-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    // SAFETY: no other thread is running while the lock is held.
-    unsafe { std::env::set_var("MACH_DIR", &dir) };
-
-    fs::write(
-        dir.join("categories.json"),
-        r#"{
-          "schema": 3,
-          "categories": [
-            {"id":"c-work","name":"Work","description":""},
-            {"id":"c-home","name":"Home","description":""}
-          ]
-        }"#,
+fn setup() -> App {
+    let mut store = Store::open_in_memory_with_paths(
+        std::env::temp_dir().join(format!("mach-app-test-{}", uuid::Uuid::new_v4())),
     )
     .unwrap();
-    fs::write(
-        dir.join("tasks.json"),
-        r#"{
-          "schema": 3,
-          "tasks": [
-            {
-              "id":"t-done",
-              "title":"done task",
-              "body":[],
-              "due":"",
-              "created":"2024-01-01 00:00:00",
-              "done":true,
-              "importance":0,
-              "category_id":"c-work"
-            },
-            {
-              "id":"t-open",
-              "title":"open task",
-              "body":[],
-              "due":"2030-01-02",
-              "created":"2024-01-02 00:00:00",
-              "done":false,
-              "importance":1
-            }
-          ]
-        }"#,
-    )
-    .unwrap();
-    (dir, guard)
+    seed(&mut store);
+    let mut app = App::with_store("test", store).unwrap();
+    app.mode = Mode::Normal;
+    app
+}
+
+fn on_disk_pair() -> (App, Store, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("mach-app-agents-{}", uuid::Uuid::new_v4()));
+    let mut initial = Store::open(&dir).unwrap();
+    seed(&mut initial);
+    drop(initial);
+    let mut app = App::with_store("test", Store::open(&dir).unwrap()).unwrap();
+    app.mode = Mode::Normal;
+    let external = Store::open(&dir).unwrap();
+    (app, external, dir)
+}
+
+fn cleanup_on_disk(app: App, external: Store, dir: std::path::PathBuf) {
+    drop(external);
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn replace_form_title(app: &mut App, title: &str) {
+    let input = &mut app.form.as_mut().expect("task form open").title;
+    input.home();
+    input.delete_to_end();
+    input.insert_str(title);
 }
 
 #[test]
-fn reads_writes_and_edits_a_data_directory() {
-    let (dir, _guard) = setup();
-    let mut app = App::new("test");
+fn loads_and_mutates_a_store_snapshot() {
+    let mut app = setup();
 
     assert_eq!(app.tasks.len(), 2);
     assert!(app.tasks[0].done);
@@ -75,14 +81,23 @@ fn reads_writes_and_edits_a_data_directory() {
     assert!(app.categories[0].is_all());
     assert_eq!(app.task_count(), 2, "All Tasks shows everything");
 
-    assert!(
-        app.create_task(&TaskDraft::new("nope")).is_none(),
-        "cannot file a task under All Tasks"
+    let uncategorized = app
+        .create_task(&TaskDraft::new("from all"))
+        .expect("All view creates an Uncategorized task");
+    assert_eq!(
+        app.tasks
+            .iter()
+            .find(|task| task.id == uncategorized)
+            .unwrap()
+            .category_id,
+        None
     );
     app.select_category(1); // Work
+    let work_id = app.categories[1].id.clone();
     let id = app
         .create_task(&TaskDraft {
             title: "draft the release note [2030-05-06 07:08]".into(),
+            category_id: Some(work_id.clone()),
             due: String::new(),
             importance: 2,
             body: vec![
@@ -96,17 +111,14 @@ fn reads_writes_and_edits_a_data_directory() {
     assert_eq!(added.title, "draft the release note");
     assert_eq!(added.due, "2030-05-06 07:08");
     assert_eq!(added.body[0], Block::text("with notes"));
-    assert_eq!(
-        added.category_id.as_deref(),
-        Some(app.categories[1].id.as_str())
-    );
+    assert_eq!(added.category_id.as_deref(), Some(work_id.as_str()));
     assert_eq!(mach::model::todo_progress(added), Some((1, 2)));
     assert!(mach::model::has_prose_or_image(added));
 
     let pos = app.task_index;
     app.toggle_done(pos);
-    app.cycle_importance(pos);
-    let task = app.visible_task(pos).unwrap();
+    app.cycle_importance(app.task_index);
+    let task = app.selected_task().unwrap();
     assert!(task.done);
     assert_eq!(task.importance, 3, "two flags, stepped up to three");
     assert_eq!(app.done_count(), 2);
@@ -119,57 +131,56 @@ fn reads_writes_and_edits_a_data_directory() {
             ..TaskDraft::default()
         },
     );
-    let task = app.visible_task(pos).unwrap();
+    let task = app.tasks.iter().find(|task| task.id == id).unwrap();
     assert_eq!(task.title, "renamed task");
-    assert_eq!(task.due, "09:00");
+    assert!(task.due.ends_with("09:00"), "{}", task.due);
     assert!(task.body.is_empty(), "the body can be cleared");
-
-    let saved = fs::read_to_string(dir.join("tasks.json")).unwrap();
-    assert!(
-        saved.contains("\"schema\":3") || saved.contains("\"schema\": 3"),
-        "schema version is written"
-    );
-    assert!(saved.contains("\"title\""), "title is stored");
+    assert_eq!(task.category_id, None, "editing can move a task");
 
     let before = app.tasks.len();
-    let deleted_title = app.visible_task(pos).unwrap().title.clone();
-    app.delete_task(pos);
+    app.delete_task_by_id(&id);
     assert_eq!(app.tasks.len(), before - 1);
-    assert!(!app.tasks.iter().any(|t| t.title == deleted_title));
-    assert!(
-        !dir.join("purged.json").exists(),
-        "delete does not write a trash file"
-    );
-
+    assert!(!app.tasks.iter().any(|task| task.id == id));
     assert_eq!(app.purge(), 1);
     assert!(app.tasks.iter().all(|t| !t.done));
+}
 
-    let reloaded = App::new("test");
-    assert_eq!(reloaded.tasks.len(), app.tasks.len());
-    assert_eq!(reloaded.tasks[0].title, app.tasks[0].title);
-    // Only the three real files; no trash / backup beside them.
-    let mut written: Vec<String> = fs::read_dir(&dir)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    written.sort();
-    assert_eq!(written, ["categories.json", "settings.json", "tasks.json"]);
+#[test]
+fn search_uses_the_same_unicode_caseless_identity_as_typeahead_and_categories() {
+    let mut app = setup();
+    app.create_task(&TaskDraft::new("Maße"))
+        .expect("create Unicode title");
+    let mut body_task = TaskDraft::new("accent note");
+    body_task.body = vec![Block::text("Cafe\u{301}")];
+    app.create_task(&body_task).expect("create decomposed body");
+
+    app.start_search("MASSE");
+    assert_eq!(app.task_count(), 1);
+    assert_eq!(app.selected_task().unwrap().title, "Maße");
+
+    app.start_search("Café");
+    assert_eq!(app.task_count(), 1);
+    assert_eq!(app.selected_task().unwrap().title, "accent note");
 }
 
 #[test]
 fn filters_by_category_and_sorts_as_configured() {
-    let (_dir, _guard) = setup();
-    let mut app = App::new("test");
+    let mut app = setup();
 
     app.select_category(1); // Work
     assert!(!app.is_all_view());
     assert_eq!(app.task_count(), 1);
     assert_eq!(app.selected_task().unwrap().title, "done task");
 
-    app.create_task(&TaskDraft::new("work item"));
+    let work_id = app.categories[1].id.clone();
+    app.create_task(&TaskDraft {
+        title: "work item".into(),
+        category_id: Some(work_id.clone()),
+        ..TaskDraft::default()
+    });
     assert_eq!(
         app.selected_task().unwrap().category_id.as_deref(),
-        Some(app.categories[1].id.as_str())
+        Some(work_id.as_str())
     );
     assert_eq!(app.task_count(), 2);
 
@@ -225,9 +236,11 @@ fn filters_by_category_and_sorts_as_configured() {
 
     app.end_search();
     app.select_category(2); // Home
+    let home_id = app.categories[2].id.clone();
     let id = app
         .create_task(&TaskDraft {
             title: "plain title".into(),
+            category_id: Some(home_id),
             body: vec![Block::text("buried in the body")],
             ..TaskDraft::default()
         })
@@ -245,8 +258,7 @@ fn filters_by_category_and_sorts_as_configured() {
 
 #[test]
 fn selection_follows_the_task_when_sort_reorders() {
-    let (_dir, _guard) = setup();
-    let mut app = App::new("test");
+    let mut app = setup();
     app.settings.sort = "done".into();
     app.rebuild_view();
 
@@ -275,9 +287,45 @@ fn selection_follows_the_task_when_sort_reorders() {
 }
 
 #[test]
-fn deleting_a_category_takes_its_tasks_without_renumbering() {
-    let (_dir, _guard) = setup();
-    let mut app = App::new("test");
+fn every_view_rebuild_preserves_the_selected_task_by_id() {
+    let mut app = setup();
+    app.settings.sort = "manual".into();
+    app.settings.hide_done = false;
+    app.select_category(0);
+    app.rebuild_view();
+
+    let selected = app
+        .tasks
+        .iter()
+        .find(|task| !task.done)
+        .expect("open task")
+        .id
+        .clone();
+    let pos = app
+        .view
+        .iter()
+        .position(|index| app.tasks[*index].id == selected)
+        .unwrap();
+    app.select_task(pos);
+
+    app.settings.sort = "important".into();
+    app.rebuild_view();
+    assert_eq!(
+        app.selected_task().map(|task| task.id.as_str()),
+        Some(selected.as_str())
+    );
+
+    app.settings.hide_done = true;
+    app.rebuild_view();
+    assert_eq!(
+        app.selected_task().map(|task| task.id.as_str()),
+        Some(selected.as_str())
+    );
+}
+
+#[test]
+fn deleting_a_category_keeps_its_tasks_uncategorized_without_renumbering() {
+    let mut app = setup();
     app.select_category(1); // Work
     let work_id = app.categories[1].id.clone();
     let home_id = app.categories[2].id.clone();
@@ -287,7 +335,12 @@ fn deleting_a_category_takes_its_tasks_without_renumbering() {
     // Virtual All + Home
     assert_eq!(app.categories.len(), 2);
     assert!(app.categories.iter().all(|c| c.name != "Work"));
-    assert!(app.tasks.iter().all(|t| t.title != "done task"));
+    let retained = app
+        .tasks
+        .iter()
+        .find(|task| task.title == "done task")
+        .expect("category tasks are retained");
+    assert_eq!(retained.category_id, None);
     // Home keeps its uuid.
     assert_eq!(app.categories[1].id, home_id);
 
@@ -298,17 +351,20 @@ fn deleting_a_category_takes_its_tasks_without_renumbering() {
 
 #[test]
 fn hide_done_and_purge_follow_the_category_view() {
-    let (_dir, _guard) = setup();
-    let mut app = App::new("test");
+    let mut app = setup();
     // Seed: open + done in Work, open elsewhere.
     let total = app.tasks.len();
     let done_n = app.tasks.iter().filter(|t| t.done).count();
     assert!(done_n >= 1);
 
-    assert!(app.toggle_hide_done(), "first toggle hides");
+    assert_eq!(app.toggle_hide_done(), Some(true), "first toggle hides");
     assert_eq!(app.task_count(), total - done_n);
     assert!(app.tasks.iter().any(|t| t.done), "still on disk");
-    assert!(!app.toggle_hide_done(), "second toggle shows again");
+    assert_eq!(
+        app.toggle_hide_done(),
+        Some(false),
+        "second toggle shows again"
+    );
 
     app.select_category(1); // Work has the done task
     let work_id = app.categories[1].id.clone();
@@ -333,4 +389,318 @@ fn hide_done_and_purge_follow_the_category_view() {
     let n = app.purge();
     assert!(n >= 1);
     assert!(app.tasks.iter().all(|t| !t.done));
+}
+
+#[test]
+fn external_commit_refreshes_without_losing_selected_task_identity() {
+    let (mut app, mut external, dir) = on_disk_pair();
+    app.select_category(0);
+    let pos = app
+        .view
+        .iter()
+        .position(|index| app.tasks[*index].id == "t-open")
+        .unwrap();
+    app.select_task(pos);
+    let selected = app.selected_task().unwrap().id.clone();
+
+    external
+        .update(|data| {
+            data.edit_task(
+                &selected,
+                TaskPatch {
+                    title: Some("agent-renamed".into()),
+                    ..TaskPatch::default()
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(app.poll_external_changes());
+    assert_eq!(app.selected_task().unwrap().id, selected);
+    assert_eq!(app.selected_task().unwrap().title, "agent-renamed");
+    cleanup_on_disk(app, external, dir);
+}
+
+#[test]
+fn repeated_external_poll_errors_do_not_disarm_a_confirmation() {
+    let (mut app, external, dir) = on_disk_pair();
+    let database = dir.join("mach.db");
+    let observer = rusqlite::Connection::open(database).unwrap();
+    observer.execute("DROP TABLE app_state", []).unwrap();
+    drop(observer);
+
+    assert!(app.poll_external_changes(), "the first failure is reported");
+    app.ask_confirm(Confirm::Quit, "Press Ctrl+C again to quit");
+    assert!(app.awaiting(Confirm::Quit));
+
+    let redrawn = app.poll_external_changes();
+    assert!(
+        !redrawn,
+        "an unchanged polling failure must not redraw or replace the message: {:?}",
+        app.message.as_ref().map(|message| message.text.as_str())
+    );
+    assert!(
+        app.awaiting(Confirm::Quit),
+        "background polling must not cancel an unrelated confirmation"
+    );
+    cleanup_on_disk(app, external, dir);
+}
+
+#[test]
+fn form_save_preserves_an_external_done_toggle() {
+    let (mut app, mut external, dir) = on_disk_pair();
+    app.select_category(0);
+    let pos = app
+        .view
+        .iter()
+        .position(|index| app.tasks[*index].id == "t-open")
+        .unwrap();
+    app.select_task(pos);
+    app.open_edit_task();
+    external
+        .update(|data| {
+            data.toggle_task_done("t-open")?;
+            Ok(())
+        })
+        .unwrap();
+    replace_form_title(&mut app, "human title");
+
+    app.submit_form();
+
+    assert!(
+        app.form.is_none(),
+        "unrelated external fields do not conflict"
+    );
+    let saved = app.tasks.iter().find(|task| task.id == "t-open").unwrap();
+    assert_eq!(saved.title, "human title");
+    assert!(saved.done, "the external toggle must survive form save");
+    cleanup_on_disk(app, external, dir);
+}
+
+#[test]
+fn form_save_merges_disjoint_human_and_agent_fields() {
+    let (mut app, mut external, dir) = on_disk_pair();
+    app.select_category(0);
+    let pos = app
+        .view
+        .iter()
+        .position(|index| app.tasks[*index].id == "t-open")
+        .unwrap();
+    app.select_task(pos);
+    app.open_edit_task();
+    external
+        .update(|data| {
+            data.edit_task(
+                "t-open",
+                TaskPatch {
+                    title: Some("agent title".into()),
+                    ..TaskPatch::default()
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    app.form
+        .as_mut()
+        .expect("task form open")
+        .body
+        .insert_str("human body");
+
+    app.submit_form();
+
+    assert!(app.form.is_none(), "disjoint fields should merge");
+    let saved = app.tasks.iter().find(|task| task.id == "t-open").unwrap();
+    assert_eq!(saved.title, "agent title");
+    assert_eq!(saved.body, vec![Block::text("human body")]);
+    cleanup_on_disk(app, external, dir);
+}
+
+#[test]
+fn form_save_accepts_a_convergent_external_edit() {
+    let (mut app, mut external, dir) = on_disk_pair();
+    app.select_category(0);
+    let pos = app
+        .view
+        .iter()
+        .position(|index| app.tasks[*index].id == "t-open")
+        .unwrap();
+    app.select_task(pos);
+    app.open_edit_task();
+    replace_form_title(&mut app, "shared title");
+    external
+        .update(|data| {
+            data.edit_task(
+                "t-open",
+                TaskPatch {
+                    title: Some("shared title".into()),
+                    ..TaskPatch::default()
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    app.submit_form();
+
+    assert!(
+        app.form.is_none(),
+        "identical human and agent edits have already converged"
+    );
+    assert_eq!(
+        app.tasks
+            .iter()
+            .find(|task| task.id == "t-open")
+            .unwrap()
+            .title,
+        "shared title"
+    );
+    cleanup_on_disk(app, external, dir);
+}
+
+#[test]
+fn external_title_edit_returns_stale_entity_without_discarding_typed_form() {
+    let (mut app, mut external, dir) = on_disk_pair();
+    app.select_category(0);
+    let pos = app
+        .view
+        .iter()
+        .position(|index| app.tasks[*index].id == "t-open")
+        .unwrap();
+    app.select_task(pos);
+    app.open_edit_task();
+    external
+        .update(|data| {
+            data.edit_task(
+                "t-open",
+                TaskPatch {
+                    title: Some("agent title".into()),
+                    ..TaskPatch::default()
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    replace_form_title(&mut app, "human title");
+
+    app.submit_form();
+
+    let form = app.form.as_ref().expect("stale form stays open");
+    assert_eq!(form.title.value(), "human title");
+    assert!(
+        form.error
+            .as_deref()
+            .is_some_and(|error| error.contains("changed since it was loaded")),
+        "{:?}",
+        form.error
+    );
+    assert_eq!(
+        external
+            .snapshot()
+            .unwrap()
+            .tasks
+            .iter()
+            .find(|task| task.id == "t-open")
+            .unwrap()
+            .title,
+        "agent title"
+    );
+    cleanup_on_disk(app, external, dir);
+}
+
+#[test]
+fn task_reorder_keeps_its_entity_target_across_an_external_insertion() {
+    let (mut app, mut external, dir) = on_disk_pair();
+    app.select_category(0);
+    let a = app.create_task(&TaskDraft::new("a")).unwrap();
+    let b = app.create_task(&TaskDraft::new("b")).unwrap();
+    let c = app.create_task(&TaskDraft::new("c")).unwrap();
+    let b_position = app
+        .view
+        .iter()
+        .position(|index| app.tasks[*index].id == b)
+        .unwrap();
+    app.select_task(b_position);
+
+    external
+        .update(|data| {
+            let inserted = data.create_task("inserted", Vec::new(), "", 0, None)?;
+            data.move_task_relative(&inserted.id, &a, RelativePosition::Before)?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(app.move_task_order(1));
+    let snapshot = external.snapshot().unwrap();
+    let b_position = snapshot.tasks.iter().position(|task| task.id == b).unwrap();
+    let c_position = snapshot.tasks.iter().position(|task| task.id == c).unwrap();
+    assert_eq!(b_position, c_position + 1, "b must remain targeted after c");
+    cleanup_on_disk(app, external, dir);
+}
+
+#[test]
+fn category_reorder_keeps_its_entity_target_across_an_external_insertion() {
+    let (mut app, mut external, dir) = on_disk_pair();
+    let work_id = app.categories[1].id.clone();
+    let home_id = app.categories[2].id.clone();
+    app.select_category(2);
+
+    external
+        .update(|data| {
+            let inserted = data.create_category("Inserted", "")?;
+            data.move_category(&inserted.id, 0)?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(app.move_category_order(-1));
+    let snapshot = external.snapshot().unwrap();
+    let work_position = snapshot
+        .categories
+        .iter()
+        .position(|category| category.id == work_id)
+        .unwrap();
+    let home_position = snapshot
+        .categories
+        .iter()
+        .position(|category| category.id == home_id)
+        .unwrap();
+    assert_eq!(home_position + 1, work_position);
+    cleanup_on_disk(app, external, dir);
+}
+
+#[test]
+fn category_form_merges_disjoint_human_and_agent_fields() {
+    let (mut app, mut external, dir) = on_disk_pair();
+    app.select_category(1);
+    app.open_edit_category();
+    external
+        .update(|data| {
+            data.edit_category(
+                "c-work",
+                CategoryPatch {
+                    name: Some("Agent work".into()),
+                    ..CategoryPatch::default()
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    app.category_form
+        .as_mut()
+        .expect("category form open")
+        .description
+        .insert_str("human description");
+
+    app.submit_category_form();
+
+    assert!(app.category_form.is_none(), "disjoint fields should merge");
+    let saved = app
+        .categories
+        .iter()
+        .find(|category| category.id == "c-work")
+        .unwrap();
+    assert_eq!(saved.name, "Agent work");
+    assert_eq!(saved.description, "human description");
+    cleanup_on_disk(app, external, dir);
 }

@@ -5,16 +5,19 @@ use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 use ratatui::widgets::{ListState, TableState};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::due;
 use crate::form::{CategoryForm, TaskDraft, TaskForm};
 use crate::image::ImageStore;
 use crate::model::{
     ALL_CATEGORY, Category, MAX_CATEGORY_COUNT, MAX_CATEGORY_NAME_LEN, MAX_TASK_COUNT,
-    MAX_TITLE_LEN, Task,
+    MAX_TITLE_LEN, Task, caseless_key,
 };
 use crate::settings::Settings;
-use crate::store;
+use crate::store::{
+    Attachment, CategoryPatch, RelativePosition, Store, StoreData, StoreError, TaskPatch,
+};
 use crate::text_input::TextInput;
 use crate::theme::Theme;
 
@@ -65,10 +68,17 @@ pub struct Message {
 /// Something destructive waiting on a second press of the same key. Only
 /// one can be armed at a time, so a half-typed delete cannot survive
 /// behind a quit prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confirm {
-    /// Backspace again deletes the selected task or category.
-    Delete,
+    /// Backspace again deletes this exact task.
+    DeleteTask(String),
+    /// Backspace again deletes this exact category; its tasks become uncategorized.
+    DeleteCategory(String),
+    /// Enter purges this exact set of completed task ids.
+    Purge(Vec<String>),
+    /// Esc again discards the current task/category draft.
+    DiscardTask(Option<String>),
+    DiscardCategory(Option<String>),
     /// Ctrl+C again leaves mach.
     Quit,
 }
@@ -78,9 +88,6 @@ const CONFIRM_WINDOW: Duration = Duration::from_millis(2000);
 
 /// Idle gap after which type-to-jump starts a new query.
 const TYPEAHEAD_TIMEOUT: Duration = Duration::from_millis(800);
-
-/// Debounce window for rapid toggle/flag task saves.
-const SAVE_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// Rects from the last frame, used to hit-test mouse events.
 #[derive(Debug, Default, Clone, Copy)]
@@ -95,6 +102,8 @@ pub struct Areas {
     /// for up to three flags.
     pub flag_x: Option<u16>,
     pub done_x: Option<u16>,
+    /// Open top-level command palette, including its border.
+    pub slash_menu: Rect,
 }
 
 pub const SETTINGS_ITEMS: [&str; 4] = ["Sort", "Theme", "Date format", "Preview"];
@@ -111,6 +120,8 @@ pub enum TaskListRow {
 }
 
 pub struct App {
+    store: Store,
+    store_revision: u64,
     pub tasks: Vec<Task>,
     pub categories: Vec<Category>,
     pub settings: Settings,
@@ -139,8 +150,13 @@ pub struct App {
     /// The open category dialog, if any.
     pub category_form: Option<CategoryForm>,
     pub settings_index: usize,
+    /// First help content row currently visible.
+    pub help_scroll: usize,
     pub message: Option<Message>,
-    /// Pending double-press confirm (`Delete` / `Quit`) and its deadline.
+    /// Whether the visible status message belongs to `pending`. A later
+    /// informational/error message replaces it independently.
+    message_is_confirmation: bool,
+    /// Pending entity-bound destructive action and its deadline.
     pub pending: Option<(Confirm, Instant)>,
     /// Last click `(time, panel, row)` for double-click detection.
     pub last_click: Option<(Instant, Focus, usize)>,
@@ -148,16 +164,12 @@ pub struct App {
     pub areas: Areas,
     /// Body/preview image store.
     pub images: ImageStore,
+    pub(crate) attachments: Vec<Attachment>,
     /// Type-to-jump buffer (Tasks/Sidebar focus); cleared on timeout.
     typeahead: String,
     typeahead_at: Option<Instant>,
     /// Needs a redraw.
     pub dirty: bool,
-    /// In-memory tasks differ from disk; write pending.
-    tasks_dirty: bool,
-    tasks_dirty_since: Option<Instant>,
-    /// Categories differ from disk; write on next flush.
-    categories_dirty: bool,
     /// Incremented on task mutation (invalidates preview cache).
     pub data_gen: u64,
     /// Per-category `(done, total)`, parallel to `categories`.
@@ -166,21 +178,51 @@ pub struct App {
     pub preview_form: Option<TaskForm>,
     preview_task_id: Option<String>,
     preview_gen: u64,
+    /// Entity snapshots captured when an edit dialog opens. Save compares only
+    /// editable fields so unrelated changes (for example, another agent
+    /// toggling `done`) are preserved instead of becoming false conflicts.
+    task_edit_base: Option<Task>,
+    category_edit_base: Option<Category>,
     /// In-flight `/update` check.
     update_rx: Option<Receiver<Result<crate::update::CheckResult, String>>>,
+    /// Whether persistence polling has failed since its last successful pass.
+    /// Repeated failures are quiet so they cannot continuously replace messages
+    /// or disarm destructive confirmations; success rearms reporting.
+    external_poll_failed: bool,
 }
 
 impl App {
-    pub fn new(version: &str) -> Self {
-        let mut settings = Settings::load();
-        // Only ever shown once, not again on every upgrade.
-        let first_run = settings.take_first_run(version);
-        let (real_cats, tasks) = store::load_all();
+    pub fn new(version: &str) -> Result<Self, StoreError> {
+        Self::with_store(version, Store::open_default(None)?)
+    }
+
+    pub fn with_store(version: &str, mut store: Store) -> Result<Self, StoreError> {
+        // Only ever shown once, not again on every upgrade. The transaction
+        // reads fresh state, so two concurrently-starting processes cannot
+        // both treat an existing profile as new.
+        let initial = store.snapshot()?;
+        let first_run = if initial.settings.last_run_version.as_deref() == Some(version) {
+            false
+        } else {
+            store.update(|data| Ok(data.settings.take_first_run(version)))?
+        };
+        let snapshot = store.snapshot()?;
+        let StoreData {
+            revision,
+            categories: real_cats,
+            tasks,
+            settings,
+            attachments,
+        } = snapshot;
         // "All Tasks" is a view only — prepended in memory, never saved.
         let mut categories = vec![Category::all_tasks()];
         categories.extend(real_cats);
+        let mut images = ImageStore::with_root(store.images_dir().to_path_buf());
+        images.set_attachments(&attachments);
 
         let mut app = Self {
+            store,
+            store_revision: revision,
             tasks,
             categories,
             settings,
@@ -203,27 +245,127 @@ impl App {
             form: None,
             category_form: None,
             settings_index: 0,
+            help_scroll: 0,
             message: None,
+            message_is_confirmation: false,
             pending: None,
             last_click: None,
             should_quit: false,
             areas: Areas::default(),
-            images: ImageStore::default(),
+            images,
+            attachments,
             typeahead: String::new(),
             typeahead_at: None,
             dirty: true,
-            tasks_dirty: false,
-            tasks_dirty_since: None,
-            categories_dirty: false,
             data_gen: 0,
             cat_progress: Vec::new(),
             preview_form: None,
             preview_task_id: None,
             preview_gen: 0,
+            task_edit_base: None,
+            category_edit_base: None,
             update_rx: None,
+            external_poll_failed: false,
         };
         app.rebuild_view();
-        app
+        Ok(app)
+    }
+
+    /// Refresh after another process commits. Dialogs deliberately defer the
+    /// visual refresh: their entity snapshot is checked transactionally when
+    /// the user saves, so typed work is never replaced under the cursor.
+    pub fn poll_external_changes(&mut self) -> bool {
+        let revision = match self.store.revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                return self.report_external_poll_error(format!(
+                    "Could not check for external changes: {error}"
+                ));
+            }
+        };
+        if revision == self.store_revision || self.form.is_some() || self.category_form.is_some() {
+            self.external_poll_failed = false;
+            return false;
+        }
+        match self.reload_store() {
+            Ok(()) => {
+                self.external_poll_failed = false;
+                true
+            }
+            Err(error) => self
+                .report_external_poll_error(format!("Could not reload external changes: {error}")),
+        }
+    }
+
+    fn report_external_poll_error(&mut self, message: String) -> bool {
+        if self.external_poll_failed {
+            return false;
+        }
+        self.external_poll_failed = true;
+        self.error(message);
+        true
+    }
+
+    fn reload_store(&mut self) -> Result<(), StoreError> {
+        let selected_category = self.current_category_id().to_string();
+        let selected_task = self.selected_task().map(|task| task.id.clone());
+        let snapshot = self.store.snapshot()?;
+        self.apply_snapshot(snapshot, &selected_category, selected_task.as_deref());
+        Ok(())
+    }
+
+    fn apply_snapshot(
+        &mut self,
+        snapshot: StoreData,
+        selected_category: &str,
+        selected_task: Option<&str>,
+    ) {
+        let StoreData {
+            revision,
+            categories,
+            tasks,
+            settings,
+            attachments,
+        } = snapshot;
+        self.store_revision = revision;
+        self.tasks = tasks;
+        self.settings = settings;
+        self.attachments = attachments;
+        self.images.set_attachments(&self.attachments);
+        self.categories.clear();
+        self.categories.push(Category::all_tasks());
+        self.categories.extend(categories);
+        self.cat_index = self
+            .categories
+            .iter()
+            .position(|category| category.id == selected_category)
+            .unwrap_or(0);
+        self.cat_progress.clear();
+        self.data_gen = self.data_gen.wrapping_add(1);
+        self.invalidate_preview();
+        self.rebuild_view();
+        if let Some(id) = selected_task {
+            self.select_task_by_id(id);
+        }
+        self.recompute_cat_progress();
+        self.dirty = true;
+    }
+
+    /// Commit against the transaction's fresh snapshot and apply the exact
+    /// normalized state returned after a successful commit.
+    fn update_store<R>(
+        &mut self,
+        operation: impl FnOnce(&mut StoreData) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        let selected_category = self.current_category_id().to_string();
+        let selected_task = self.selected_task().map(|task| task.id.clone());
+        let (result, snapshot) = self.store.update_with_snapshot(operation)?;
+        self.apply_snapshot(snapshot, &selected_category, selected_task.as_deref());
+        Ok(result)
+    }
+
+    fn report_store_error(&mut self, action: &str, error: StoreError) {
+        self.error(format!("{action}: {error}"));
     }
 
     /// Start a non-blocking GitHub release check (for `/update`).
@@ -233,11 +375,17 @@ impl App {
             return;
         }
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(crate::update::check());
-        });
-        self.update_rx = Some(rx);
-        self.info("Checking for updates…");
+        match std::thread::Builder::new()
+            .name("mach-update-check".into())
+            .spawn(move || {
+                let _ = tx.send(crate::update::check());
+            }) {
+            Ok(_) => {
+                self.update_rx = Some(rx);
+                self.info("Checking for updates…");
+            }
+            Err(error) => self.error(format!("Could not start update check: {error}")),
+        }
     }
 
     /// Apply a finished update check, if any. Returns true when UI should redraw.
@@ -282,7 +430,7 @@ impl App {
         self.preview_gen = 0;
     }
 
-    /// Rebuild [`preview_form`] if the selection or `data_gen` changed.
+    /// Rebuild [`Self::preview_form`] if the selection or `data_gen` changed.
     pub fn ensure_preview(&mut self) {
         let Some((id, generation)) = self.selected_task().map(|t| (t.id.clone(), self.data_gen))
         else {
@@ -295,8 +443,15 @@ impl App {
         {
             return;
         }
-        let task = self.selected_task().expect("checked").clone();
-        self.preview_form = Some(TaskForm::edit(&task));
+        let Some(task) = self.selected_task().cloned() else {
+            self.invalidate_preview();
+            return;
+        };
+        let mut form = TaskForm::edit(&task);
+        form.set_categories(&self.categories, task.category_id.as_deref());
+        form.set_image_root(self.images.root().to_path_buf());
+        form.set_attachments(&self.attachments);
+        self.preview_form = Some(form);
         self.preview_task_id = Some(id);
         self.preview_gen = generation;
     }
@@ -331,6 +486,7 @@ impl App {
     /// those already-sorted groups in sidebar order; a single category is
     /// just one group.
     pub fn rebuild_view(&mut self) {
+        let selected_id = self.selected_task().map(|task| task.id.clone());
         self.dirty = true;
         if self.cat_progress.len() != self.categories.len() {
             self.recompute_cat_progress();
@@ -339,7 +495,7 @@ impl App {
         let all = cat_id == ALL_CATEGORY;
         let hide_done = self.settings.hide_done;
         let candidates: Vec<usize> = if self.searching {
-            let q = self.search_query.to_lowercase();
+            let q = caseless_key(&self.search_query);
             self.tasks
                 .iter()
                 .enumerate()
@@ -369,7 +525,9 @@ impl App {
             self.sort_within(&mut view);
             view
         };
-        if self.task_index >= self.view.len() {
+        if let Some(id) = selected_id {
+            self.select_task_by_id(&id);
+        } else if self.task_index >= self.view.len() {
             self.task_index = self.view.len().saturating_sub(1);
         }
         self.list_rows = self.build_list_rows(multi);
@@ -446,7 +604,7 @@ impl App {
                 let due = &self.tasks[*i].due;
                 (due.is_empty(), due::sort_key(due))
             }),
-            _ => {} // manual — keep tasks.json order
+            _ => {} // manual — keep the store's explicit task order
         }
     }
 
@@ -455,7 +613,7 @@ impl App {
     }
 
     pub fn visible_task(&self, pos: usize) -> Option<&Task> {
-        self.view.get(pos).map(|i| &self.tasks[*i])
+        self.view.get(pos).and_then(|index| self.tasks.get(*index))
     }
 
     pub fn selected_task(&self) -> Option<&Task> {
@@ -476,6 +634,8 @@ impl App {
         let next = (self.task_index as isize + delta).clamp(0, last as isize) as usize;
         if next != self.task_index {
             self.task_index = next;
+            self.cancel_pending();
+            self.clear_typeahead();
             self.dirty = true;
         }
     }
@@ -483,6 +643,8 @@ impl App {
     pub fn select_task(&mut self, pos: usize) {
         if pos < self.view.len() && pos != self.task_index {
             self.task_index = pos;
+            self.cancel_pending();
+            self.clear_typeahead();
             self.dirty = true;
         }
     }
@@ -504,7 +666,13 @@ impl App {
         {
             self.typeahead.clear();
         }
-        self.typeahead.push(c);
+        let limit = match self.focus {
+            Focus::Tasks => MAX_TITLE_LEN,
+            Focus::Sidebar => MAX_CATEGORY_NAME_LEN,
+        };
+        if self.typeahead.graphemes(true).count() < limit {
+            self.typeahead.push(c);
+        }
         self.typeahead_at = Some(now);
 
         let query = self.typeahead.clone();
@@ -517,12 +685,17 @@ impl App {
                     .collect();
                 if let Some(pos) = crate::fuzzy::best_index(&query, titles) {
                     self.task_index = pos;
+                    self.cancel_pending();
                 }
             }
             Focus::Sidebar => {
                 let names: Vec<&str> = self.categories.iter().map(|c| c.name.as_str()).collect();
-                if let Some(pos) = crate::fuzzy::best_index(&query, names) {
-                    self.select_category(pos);
+                if let Some(pos) = crate::fuzzy::best_index(&query, names)
+                    && pos != self.cat_index
+                {
+                    self.cat_index = pos;
+                    self.cancel_pending();
+                    self.on_category_changed();
                 }
             }
         }
@@ -536,6 +709,8 @@ impl App {
         let next = (self.cat_index as isize + delta).clamp(0, last as isize) as usize;
         if next != self.cat_index {
             self.cat_index = next;
+            self.cancel_pending();
+            self.clear_typeahead();
             self.on_category_changed();
         }
     }
@@ -545,7 +720,7 @@ impl App {
         if delta == 0 {
             return;
         }
-        self.pending = None;
+        self.cancel_pending();
         match self.focus {
             Focus::Tasks => {
                 if self.view.is_empty() {
@@ -562,6 +737,8 @@ impl App {
     pub fn select_category(&mut self, index: usize) {
         if index < self.categories.len() && index != self.cat_index {
             self.cat_index = index;
+            self.cancel_pending();
+            self.clear_typeahead();
             self.on_category_changed();
         }
     }
@@ -578,79 +755,43 @@ impl App {
     }
 
     pub fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
+        let next = match self.focus {
             Focus::Sidebar => Focus::Tasks,
             Focus::Tasks => Focus::Sidebar,
         };
-        self.pending = None;
+        let _ = self.set_focus(next);
+    }
+
+    /// Move keyboard focus. A locked search owns the task list until Esc.
+    pub fn set_focus(&mut self, focus: Focus) -> bool {
+        if self.searching && focus == Focus::Sidebar {
+            return false;
+        }
+        if self.focus != focus {
+            self.focus = focus;
+            self.cancel_pending();
+            self.clear_typeahead();
+            self.dirty = true;
+        }
+        true
+    }
+
+    pub fn cancel_pending(&mut self) {
+        if self.pending.take().is_some()
+            && self.message_is_confirmation
+            && self.message.take().is_some()
+        {
+            self.dirty = true;
+        }
+        self.message_is_confirmation = false;
+    }
+
+    fn clear_typeahead(&mut self) {
+        self.typeahead.clear();
+        self.typeahead_at = None;
     }
 
     // ------------------------------------------------------------ mutation
-
-    fn note_tasks_changed(&mut self) {
-        self.data_gen = self.data_gen.wrapping_add(1);
-        self.invalidate_preview();
-        self.recompute_cat_progress();
-        self.dirty = true;
-    }
-
-    /// Write tasks to disk immediately (create / edit / delete / purge).
-    pub fn save_tasks(&mut self) {
-        self.note_tasks_changed();
-        self.tasks_dirty = true;
-        self.tasks_dirty_since = None;
-        self.flush_saves_now();
-    }
-
-    /// Coalesce rapid toggles (done / importance) into one disk write.
-    fn save_tasks_debounced(&mut self) {
-        self.note_tasks_changed();
-        if self.tasks_dirty_since.is_none() {
-            self.tasks_dirty_since = Some(Instant::now());
-        }
-        self.tasks_dirty = true;
-    }
-
-    fn save_categories(&mut self) {
-        self.categories_dirty = true;
-        self.dirty = true;
-        self.flush_saves_now();
-    }
-
-    pub fn tasks_dirty_pending(&self) -> bool {
-        self.tasks_dirty
-    }
-
-    /// Write dirty store files if the task-save debounce has elapsed.
-    /// Returns true if a write ran.
-    pub fn flush_saves(&mut self) -> bool {
-        let due = self.tasks_dirty
-            && self
-                .tasks_dirty_since
-                .is_some_and(|t| t.elapsed() >= SAVE_DEBOUNCE);
-        if due || self.categories_dirty {
-            self.flush_saves_now();
-            return true;
-        }
-        false
-    }
-
-    /// Write any dirty store files immediately.
-    pub fn flush_saves_now(&mut self) {
-        if self.tasks_dirty {
-            if let Err(err) = store::save_tasks(&self.tasks) {
-                self.error(format!("Could not save tasks: {err}"));
-            }
-            self.tasks_dirty = false;
-            self.tasks_dirty_since = None;
-        }
-        if self.categories_dirty {
-            if let Err(err) = store::save_categories(&self.categories) {
-                self.error(format!("Could not save categories: {err}"));
-            }
-            self.categories_dirty = false;
-        }
-    }
 
     fn recompute_cat_progress(&mut self) {
         let mut all_done = 0usize;
@@ -690,10 +831,10 @@ impl App {
     pub fn toggle_done(&mut self, pos: usize) {
         if let Some(&i) = self.view.get(pos) {
             let id = self.tasks[i].id.clone();
-            self.tasks[i].done = !self.tasks[i].done;
-            self.save_tasks_debounced();
-            self.rebuild_view();
-            self.select_task_by_id(&id);
+            match self.update_store(|data| data.toggle_task_done(&id)) {
+                Ok(_) => self.select_task_by_id(&id),
+                Err(error) => self.report_store_error("Could not update task", error),
+            }
         }
     }
 
@@ -701,38 +842,85 @@ impl App {
     pub fn cycle_importance(&mut self, pos: usize) {
         if let Some(&i) = self.view.get(pos) {
             let id = self.tasks[i].id.clone();
-            let task = &mut self.tasks[i];
-            task.importance = (task.importance + 1) % (crate::model::MAX_IMPORTANCE + 1);
-            self.save_tasks_debounced();
-            self.rebuild_view();
-            self.select_task_by_id(&id);
+            match self.update_store(|data| {
+                let importance =
+                    (data.task(&id)?.importance + 1) % (crate::model::MAX_IMPORTANCE + 1);
+                data.set_task_importance(&id, importance)
+            }) {
+                Ok(_) => self.select_task_by_id(&id),
+                Err(error) => self.report_store_error("Could not update task", error),
+            }
+        }
+    }
+
+    /// Reorder the selected task inside its category when using manual sort.
+    /// In All Tasks, crossing a category section boundary is intentionally
+    /// blocked; changing category belongs in the task form.
+    pub fn move_task_order(&mut self, delta: isize) -> bool {
+        if delta == 0 || self.settings.sort != "manual" || self.searching {
+            return false;
+        }
+        let Some(current) = self.selected_task().cloned() else {
+            return false;
+        };
+        let target_view = self.task_index as isize + delta.signum();
+        if !(0..self.view.len() as isize).contains(&target_view) {
+            return false;
+        }
+        let Some(target) = self.visible_task(target_view as usize) else {
+            return false;
+        };
+        if target.category_id != current.category_id {
+            return false;
+        }
+        let target_id = target.id.clone();
+        let id = current.id;
+        let position = if delta.is_negative() {
+            RelativePosition::Before
+        } else {
+            RelativePosition::After
+        };
+        match self.update_store(|data| data.move_task_relative(&id, &target_id, position)) {
+            Ok(_) => {
+                self.select_task_by_id(&id);
+                true
+            }
+            Err(error) => {
+                self.report_store_error("Could not reorder task", error);
+                false
+            }
         }
     }
 
     /// Opens the dialog for a new task, unless the list is full.
-    /// All Tasks is a view, not a category — pick a real one first.
     pub fn open_new_task(&mut self) {
-        if self.is_all_view() {
-            self.info("Pick a category");
-            return;
-        }
         if self.tasks.len() >= MAX_TASK_COUNT {
             self.error(format!(
                 "You already have {MAX_TASK_COUNT} tasks in hand. Maybe deal with them first :)"
             ));
             return;
         }
-        self.form = Some(TaskForm::new());
+        let mut form = TaskForm::new();
+        let category = (!self.is_all_view()).then(|| self.current_category_id());
+        form.set_categories(&self.categories, category);
+        form.set_image_root(self.images.root().to_path_buf());
+        form.set_attachments(&self.attachments);
+        self.task_edit_base = None;
+        self.form = Some(form);
         self.mode = Mode::TaskForm;
     }
 
     /// Opens the dialog on the selected task.
     pub fn open_edit_task(&mut self) {
-        if let Some(task) = self.selected_task() {
-            let form = TaskForm::edit(task);
+        if let Some(task) = self.selected_task().cloned() {
+            let mut form = TaskForm::edit(&task);
+            form.set_categories(&self.categories, task.category_id.as_deref());
+            form.set_image_root(self.images.root().to_path_buf());
+            form.set_attachments(&self.attachments);
             // Decode body pictures off the UI thread so the dialog opens
             // immediately; they fill in on the next frames.
             self.images.prefetch(form.body.images());
+            self.task_edit_base = Some(task);
             self.form = Some(form);
             self.mode = Mode::TaskForm;
         }
@@ -740,35 +928,32 @@ impl App {
 
     pub fn close_form(&mut self) {
         self.form = None;
+        self.task_edit_base = None;
         self.mode = Mode::Normal;
         self.focus = Focus::Tasks;
         // Drop placed graphics so they do not float over the list; pixels
         // stay in RAM for a fast reopen. GIF frames are dropped with the form.
         self.images.release_form_graphics();
         self.images.clear_preview();
+        self.cancel_pending();
     }
 
     /// Validates the open form and writes it back to the task list.
     pub fn submit_form(&mut self) {
         let Some(form) = &mut self.form else { return };
         let Some(draft) = form.submit() else { return };
-        match form.editing.clone() {
+        let saved = match form.editing.clone() {
             Some(uuid) => self.update_task(&uuid, &draft),
-            None => {
-                self.create_task(&draft);
-            }
+            None => self.create_task(&draft).is_some(),
+        };
+        if saved {
+            self.close_form();
         }
-        self.close_form();
     }
 
-    /// Creates a task in the current category and selects it. A `[date]`
+    /// Creates a task in the chosen category and selects it. A `[date]`
     /// left in the title is moved into `due` when `due` is empty.
-    /// Refuses All Tasks — it is not a real category.
     pub fn create_task(&mut self, draft: &TaskDraft) -> Option<String> {
-        if self.is_all_view() {
-            return None;
-        }
-        let category_id = Some(self.current_category_id().to_string());
         let (inline_due, title) = due::parse(draft.title.trim());
         if title.is_empty() || self.tasks.len() >= MAX_TASK_COUNT {
             return None;
@@ -778,11 +963,23 @@ impl App {
         } else {
             &draft.due
         };
-        let mut task = Task::new(&title, draft.importance, category_id, due);
-        task.body = draft.body.clone();
-        let id = task.id.clone();
-        self.tasks.push(task);
-        self.save_tasks();
+        let body = draft.body.clone();
+        let category_id = draft.category_id.clone();
+        let importance = draft.importance;
+        let task = match self.update_store(|data| {
+            data.create_task(title, body, due.to_string(), importance, category_id)
+        }) {
+            Ok(task) => task,
+            Err(error) => {
+                let message = error.to_string();
+                if let Some(form) = &mut self.form {
+                    form.error = Some(message.clone());
+                }
+                self.report_store_error("Could not create task", error);
+                return None;
+            }
+        };
+        let id = task.id;
         self.searching = false;
         self.search_query.clear();
         self.rebuild_view();
@@ -790,69 +987,123 @@ impl App {
         Some(id)
     }
 
-    pub fn update_task(&mut self, id: &str, draft: &TaskDraft) {
+    pub fn update_task(&mut self, id: &str, draft: &TaskDraft) -> bool {
         let (inline_due, title) = due::parse(draft.title.trim());
         if title.is_empty() {
-            return;
+            return false;
         }
         let due = if draft.due.is_empty() {
             &inline_due
         } else {
             &draft.due
         };
-        let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) else {
-            return;
+        let expected = self.task_edit_base.clone();
+        let id = id.to_string();
+        let due = due.to_string();
+        let patch = match expected.as_ref() {
+            Some(base) => TaskPatch {
+                title: (title != base.title).then_some(title),
+                body: (draft.body != base.body).then(|| draft.body.clone()),
+                due: (due != base.due).then_some(due),
+                importance: (draft.importance != base.importance).then_some(draft.importance),
+                category_id: (draft.category_id != base.category_id)
+                    .then(|| draft.category_id.clone()),
+                ..TaskPatch::default()
+            },
+            None => TaskPatch {
+                title: Some(title),
+                body: Some(draft.body.clone()),
+                due: Some(due),
+                importance: Some(draft.importance),
+                category_id: Some(draft.category_id.clone()),
+                ..TaskPatch::default()
+            },
         };
-        task.title = title;
-        task.body = draft.body.clone();
-        task.importance = draft.importance;
-        task.due = due.to_string();
-        self.save_tasks();
-        self.rebuild_view();
-        self.select_task_by_id(id);
+        match self.update_store(|data| {
+            if let Some(expected) = &expected {
+                data.edit_task_if_unchanged(expected, patch)
+            } else {
+                data.edit_task(&id, patch)
+            }
+        }) {
+            Ok(_) => {
+                self.select_task_by_id(&id);
+                true
+            }
+            Err(error) => {
+                let message = edit_error_message(&error);
+                if let Some(form) = &mut self.form {
+                    form.error = Some(message);
+                }
+                self.report_store_error("Could not update task", error);
+                false
+            }
+        }
     }
 
     pub fn delete_task(&mut self, pos: usize) {
-        let Some(&i) = self.view.get(pos) else { return };
-        self.tasks.remove(i);
-        self.save_tasks();
-        self.rebuild_view();
-        if self.task_index >= self.view.len() {
-            self.task_index = self.view.len().saturating_sub(1);
+        let Some(id) = self.visible_task(pos).map(|task| task.id.clone()) else {
+            return;
+        };
+        self.delete_task_by_id(&id);
+    }
+
+    pub fn delete_task_by_id(&mut self, id: &str) -> bool {
+        let id = id.to_string();
+        if let Err(error) = self.update_store(|data| data.delete_task(&id)) {
+            self.report_store_error("Could not delete task", error);
+            return false;
         }
-        self.pending = None;
+        self.cancel_pending();
+        true
     }
 
     /// Permanently remove done tasks. In All Tasks → every done task; in a
     /// category → only that category's done tasks. Nothing is archived.
     pub fn purge(&mut self) -> usize {
+        let ids = self.purge_candidate_ids();
+        self.purge_ids(&ids)
+    }
+
+    /// Completed task ids in the current purge scope, captured for confirmation.
+    pub fn purge_candidate_ids(&self) -> Vec<String> {
         let everywhere = self.is_all_view();
-        let cat_id = self.current_category_id().to_string();
-        let before = self.tasks.len();
-        self.tasks.retain(|t| {
-            if !t.done {
-                return true;
+        let category = self.current_category_id();
+        self.tasks
+            .iter()
+            .filter(|task| {
+                task.done && (everywhere || task.category_id.as_deref() == Some(category))
+            })
+            .map(|task| task.id.clone())
+            .collect()
+    }
+
+    /// Purge exactly the confirmed ids; newly completed tasks are never swept in.
+    pub fn purge_ids(&mut self, ids: &[String]) -> usize {
+        let ids = ids.to_vec();
+        match self.update_store(|data| data.purge_completed_ids(&ids)) {
+            Ok(removed) => {
+                self.cancel_pending();
+                removed.len()
             }
-            if everywhere {
-                return false;
+            Err(error) => {
+                self.report_store_error("Could not purge completed tasks", error);
+                0
             }
-            t.category_id.as_deref() != Some(cat_id.as_str())
-        });
-        let n = before - self.tasks.len();
-        if n > 0 {
-            self.save_tasks();
-            self.rebuild_view();
-            self.task_index = 0;
         }
-        n
     }
 
     /// `/done` — show or hide completed tasks in the list (still on disk).
-    pub fn toggle_hide_done(&mut self) -> bool {
-        self.settings.hide_done = !self.settings.hide_done;
-        self.settings.save();
-        self.rebuild_view();
-        self.settings.hide_done
+    pub fn toggle_hide_done(&mut self) -> Option<bool> {
+        match self.update_store(|data| {
+            data.update_settings(|settings| settings.hide_done = !settings.hide_done)
+        }) {
+            Ok(settings) => Some(settings.hide_done),
+            Err(error) => {
+                self.report_store_error("Could not update settings", error);
+                None
+            }
+        }
     }
 
     // ---------------------------------------------------------- categories
@@ -865,6 +1116,7 @@ impl App {
             self.error(format!("At most {MAX_CATEGORY_COUNT} categories"));
             return;
         }
+        self.category_edit_base = None;
         self.category_form = Some(CategoryForm::new());
         self.mode = Mode::CategoryForm;
     }
@@ -875,62 +1127,164 @@ impl App {
         if self.is_all_view() {
             return;
         }
-        if let Some(category) = self.categories.get(self.cat_index) {
-            self.category_form = Some(CategoryForm::edit(category));
+        if let Some(category) = self.categories.get(self.cat_index).cloned() {
+            self.category_form = Some(CategoryForm::edit(&category));
+            self.category_edit_base = Some(category);
             self.mode = Mode::CategoryForm;
         }
     }
 
     pub fn close_category_form(&mut self) {
         self.category_form = None;
+        self.category_edit_base = None;
         self.mode = Mode::Normal;
+        self.cancel_pending();
     }
 
     pub fn submit_category_form(&mut self) {
+        let existing: Vec<(String, String)> = self
+            .categories
+            .iter()
+            .filter(|category| !category.is_all())
+            .map(|category| (category.id.clone(), category.name.clone()))
+            .collect();
         let Some(form) = &mut self.category_form else {
             return;
         };
-        let Some((name, description)) = form.submit() else {
+        let Some((name, description)) = form.submit_with(|name, editing| {
+            let duplicate = existing.iter().any(|(id, existing_name)| {
+                Some(id.as_str()) != editing
+                    && caseless_key(existing_name.trim()) == caseless_key(name.trim())
+            });
+            if duplicate {
+                Err("A category with that name already exists".to_string())
+            } else {
+                Ok(())
+            }
+        }) else {
             return;
         };
         let name = truncate_chars(&name, MAX_CATEGORY_NAME_LEN);
-        match form.editing.clone() {
+        let editing = form.editing.clone();
+        let expected = self.category_edit_base.clone();
+        let saved = match editing {
             Some(id) => {
-                if let Some(cat) = self.categories.iter_mut().find(|c| c.id == id) {
-                    cat.name = name;
-                    cat.description = description;
+                let patch = match expected.as_ref() {
+                    Some(base) => CategoryPatch {
+                        name: (name != base.name).then_some(name),
+                        description: (description != base.description).then_some(description),
+                    },
+                    None => CategoryPatch {
+                        name: Some(name),
+                        description: Some(description),
+                    },
+                };
+                match self.update_store(|data| {
+                    if let Some(expected) = &expected {
+                        data.edit_category_if_unchanged(expected, patch)
+                    } else {
+                        data.edit_category(&id, patch)
+                    }
+                }) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        let message = edit_error_message(&error);
+                        if let Some(form) = &mut self.category_form {
+                            form.error = Some(message);
+                        }
+                        self.report_store_error("Could not update category", error);
+                        false
+                    }
                 }
-                self.save_categories();
             }
-            None => {
-                let mut category = Category::new(&name);
-                category.description = description;
-                self.categories.push(category);
-                self.save_categories();
-                self.cat_index = self.categories.len() - 1;
-                self.on_category_changed();
-            }
+            None => match self.update_store(|data| data.create_category(name, description)) {
+                Ok(category) => {
+                    self.cat_index = self
+                        .categories
+                        .iter()
+                        .position(|item| item.id == category.id)
+                        .unwrap_or(0);
+                    self.on_category_changed();
+                    true
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    if let Some(form) = &mut self.category_form {
+                        form.error = Some(message);
+                    }
+                    self.report_store_error("Could not create category", error);
+                    false
+                }
+            },
+        };
+        if saved {
+            self.close_category_form();
         }
-        self.close_category_form();
     }
 
-    /// Deletes the category together with the tasks filed under it.
+    /// Deletes the category while preserving its tasks as Uncategorized.
     /// Category ids are stable UUIDs — no renumbering.
     pub fn delete_category(&mut self) {
         if self.is_all_view() {
             return;
         }
         let id = self.current_category_id().to_string();
-        self.tasks
-            .retain(|t| t.category_id.as_deref() != Some(id.as_str()));
-        self.categories.retain(|c| c.id != id);
-        self.save_categories();
-        self.save_tasks();
-        if self.cat_index >= self.categories.len() {
-            self.cat_index = self.categories.len().saturating_sub(1);
+        let _ = self.delete_category_by_id(&id);
+    }
+
+    pub fn delete_category_by_id(&mut self, id: &str) -> bool {
+        let Some(category) = self.categories.iter().find(|category| category.id == id) else {
+            return false;
+        };
+        if category.is_all() {
+            return false;
         }
-        self.pending = None;
-        self.on_category_changed();
+        let id = id.to_string();
+        match self.update_store(|data| data.delete_category(&id)) {
+            Ok(_) => {
+                self.cancel_pending();
+                self.cat_index = 0;
+                self.on_category_changed();
+                true
+            }
+            Err(error) => {
+                self.report_store_error("Could not delete category", error);
+                false
+            }
+        }
+    }
+
+    /// Reorder real categories while keeping the virtual All Tasks row fixed.
+    pub fn move_category_order(&mut self, delta: isize) -> bool {
+        if delta == 0 || self.is_all_view() || self.searching {
+            return false;
+        }
+        let target_display = self.cat_index as isize + delta.signum();
+        if !(1..self.categories.len() as isize).contains(&target_display) {
+            return false;
+        }
+        let id = self.current_category_id().to_string();
+        let target_id = self.categories[target_display as usize].id.clone();
+        let position = if delta.is_negative() {
+            RelativePosition::Before
+        } else {
+            RelativePosition::After
+        };
+        match self.update_store(|data| data.move_category_relative(&id, &target_id, position)) {
+            Ok(_) => {
+                self.cat_index = self
+                    .categories
+                    .iter()
+                    .position(|category| category.id == id)
+                    .unwrap_or(0);
+                self.on_category_changed();
+                true
+            }
+            Err(error) => {
+                self.report_store_error("Could not reorder category", error);
+                false
+            }
+        }
     }
 
     /// `(done, total)` for a category. All Tasks counts every task.
@@ -1001,11 +1355,16 @@ impl App {
     }
 
     fn set_message(&mut self, text: String, kind: MessageKind, millis: u64) {
-        self.message = Some(Message {
-            text,
-            kind,
-            until: Instant::now() + Duration::from_millis(millis),
-        });
+        self.set_message_until(text, kind, Instant::now() + Duration::from_millis(millis));
+    }
+
+    fn set_message_until(&mut self, text: String, kind: MessageKind, until: Instant) {
+        // A confirmation is only safe while its matching prompt is visible.
+        // Any independent status replaces that prompt and therefore disarms
+        // the pending destructive action as part of the same state change.
+        self.pending = None;
+        self.message = Some(Message { text, kind, until });
+        self.message_is_confirmation = false;
         self.dirty = true;
     }
 
@@ -1014,7 +1373,11 @@ impl App {
         if let Some(m) = &self.message
             && Instant::now() >= m.until
         {
+            if self.message_is_confirmation {
+                self.pending = None;
+            }
             self.message = None;
+            self.message_is_confirmation = false;
             self.dirty = true;
             return true;
         }
@@ -1023,13 +1386,22 @@ impl App {
 
     /// Arm a destructive key on its second press, and say so.
     pub fn ask_confirm(&mut self, confirm: Confirm, prompt: impl Into<String>) {
-        self.pending = Some((confirm, Instant::now() + CONFIRM_WINDOW));
-        self.info(prompt);
+        let until = Instant::now() + CONFIRM_WINDOW;
+        self.set_message_until(prompt.into(), MessageKind::Info, until);
+        self.pending = Some((confirm, until));
+        self.message_is_confirmation = true;
     }
 
     /// Whether `confirm` is armed and still inside its window.
     pub fn awaiting(&self, confirm: Confirm) -> bool {
-        matches!(self.pending, Some((armed, until)) if armed == confirm && Instant::now() < until)
+        matches!(&self.pending, Some((armed, until)) if *armed == confirm && Instant::now() < *until)
+    }
+
+    pub fn pending_confirmation(&self) -> Option<&Confirm> {
+        self.pending
+            .as_ref()
+            .filter(|(_, until)| Instant::now() < *until)
+            .map(|(confirm, _)| confirm)
     }
 
     // ----------------------------------------------------------- settings
@@ -1037,24 +1409,23 @@ impl App {
     /// Step a settings row by `delta` (+1 forward, −1 back), wrapping.
     pub fn cycle_setting(&mut self, index: usize, delta: isize) {
         use crate::settings::{DATE_FORMATS, PREVIEW_POSITIONS, SORTS, THEMES, cycle_by};
-        match index {
-            0 => self.settings.sort = cycle_by(&SORTS, &self.settings.sort, delta),
-            1 => {
-                self.settings.selected_color =
-                    cycle_by(&THEMES, &self.settings.selected_color, delta)
-            }
-            2 => {
-                self.settings.date_format =
-                    cycle_by(&DATE_FORMATS, &self.settings.date_format, delta)
-            }
-            3 => {
-                self.settings.preview_position =
-                    cycle_by(&PREVIEW_POSITIONS, &self.settings.preview_position, delta)
-            }
-            _ => {}
+        if index >= SETTINGS_ITEMS.len() {
+            return;
         }
-        self.settings.save();
-        self.rebuild_view();
+        if let Err(error) = self.update_store(|data| {
+            data.update_settings(|settings| match index {
+                0 => settings.sort = cycle_by(&SORTS, &settings.sort, delta),
+                1 => settings.selected_color = cycle_by(&THEMES, &settings.selected_color, delta),
+                2 => settings.date_format = cycle_by(&DATE_FORMATS, &settings.date_format, delta),
+                3 => {
+                    settings.preview_position =
+                        cycle_by(&PREVIEW_POSITIONS, &settings.preview_position, delta)
+                }
+                _ => {}
+            })
+        }) {
+            self.report_store_error("Could not update settings", error);
+        }
     }
 
     pub fn setting_value(&self, index: usize) -> String {
@@ -1070,19 +1441,19 @@ impl App {
     }
 }
 
-/// Case-insensitive contains. `needle_lower` must already be lowercased.
+/// Unicode-caseless contains. `folded_needle` must already be normalized.
 /// ASCII path avoids allocating.
-fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
+fn contains_ignore_case(haystack: &str, folded_needle: &str) -> bool {
+    if folded_needle.is_empty() {
         return true;
     }
-    if haystack.is_ascii() && needle_lower.is_ascii() {
+    if haystack.is_ascii() && folded_needle.is_ascii() {
         return haystack
             .as_bytes()
-            .windows(needle_lower.len())
-            .any(|w| w.eq_ignore_ascii_case(needle_lower.as_bytes()));
+            .windows(folded_needle.len())
+            .any(|w| w.eq_ignore_ascii_case(folded_needle.as_bytes()));
     }
-    haystack.to_lowercase().contains(needle_lower)
+    caseless_key(haystack).contains(folded_needle)
 }
 
 /// Whether any prose or to-do in the body mentions `query`.
@@ -1097,6 +1468,37 @@ fn body_contains(task: &Task, query: &str) -> bool {
     })
 }
 
+fn edit_error_message(error: &StoreError) -> String {
+    match error {
+        StoreError::StaleEntity { .. } => {
+            format!("{error}; close and reopen the editor to load the latest values")
+        }
+        _ => error.to_string(),
+    }
+}
+
 pub fn truncate_chars(s: &str, max: usize) -> String {
-    s.chars().take(max).collect()
+    s.graphemes(true).take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typeahead_buffer_is_bounded_by_the_longest_searchable_title() {
+        let store = Store::open_in_memory_with_paths("/tmp/mach-typeahead-test")
+            .expect("open in-memory store");
+        let mut app = App::with_store("test", store).expect("build app");
+        app.mode = Mode::Normal;
+
+        for _ in 0..(MAX_TITLE_LEN * 2) {
+            app.typeahead_jump('x');
+        }
+
+        assert!(
+            app.typeahead.graphemes(true).count() <= MAX_TITLE_LEN,
+            "a held key must not grow the navigation query without bound"
+        );
+    }
 }
