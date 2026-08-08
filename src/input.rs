@@ -14,16 +14,35 @@ use crate::undo::EditKind;
 /// Two clicks on the same task within this long open it.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
-pub fn handle_event(app: &mut App, event: Event) {
+/// Handle one terminal event and report whether the screen may have changed.
+pub fn handle_event(app: &mut App, event: Event) -> bool {
     match event {
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-            handle_key(app, key)
+            handle_key(app, key);
+            true
         }
-        Event::Mouse(m) => handle_mouse(app, m),
+        Event::Mouse(m)
+            if app.pending.is_some()
+                || matches!(
+                    m.kind,
+                    MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
+                ) =>
+        {
+            handle_mouse(app, m);
+            true
+        }
         // The terminal's own paste (Cmd+V / middle click), delivered in
         // one piece because bracketed paste is on.
-        Event::Paste(text) => paste_text(app, &text),
-        _ => {}
+        Event::Paste(text) if !text.is_empty() => {
+            paste_text(app, &text);
+            true
+        }
+        // Crossterm has already resized the terminal; the next draw picks up
+        // the new dimensions without any App mutation here.
+        Event::Resize(_, _) => true,
+        _ => false,
     }
 }
 

@@ -22,7 +22,7 @@ pub mod undo;
 pub mod update;
 
 use std::io::{self, IsTerminal};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -35,6 +35,10 @@ use crate::app::App;
 use crate::store::Store;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(500);
+const GIF_WAIT: Duration = Duration::from_millis(30);
+const IMAGE_WAIT: Duration = Duration::from_millis(16);
 
 /// Entry point for the `mach` binary.
 pub fn run() {
@@ -118,6 +122,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     const MAX_EVENTS_PER_TICK: usize = 64;
 
     let mut last_clock = String::new();
+    let mut next_housekeeping = Instant::now();
     loop {
         // Input first so keys are not blocked behind GIF encode on draw.
         // Bound each batch so a continuous mouse/key stream cannot starve
@@ -126,8 +131,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             if !event::poll(Duration::ZERO)? {
                 break;
             }
-            input::handle_event(app, event::read()?);
-            app.mark_dirty();
+            if input::handle_event(app, event::read()?) {
+                app.mark_dirty();
+            }
             if app.should_quit {
                 return Ok(());
             }
@@ -136,12 +142,20 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         if app.poll_update_check() {
             app.mark_dirty();
         }
-        if app.poll_external_changes() {
-            app.mark_dirty();
-        }
-        // Cell pixel size can change without a resize event (e.g. move display).
-        if app.images.recheck_cell_size() {
-            app.mark_dirty();
+        let now = Instant::now();
+        if housekeeping_due(&mut next_housekeeping, now) {
+            if app.poll_external_changes() {
+                app.mark_dirty();
+            }
+            // Cell pixel size can change without a resize event (e.g. move display).
+            if app.images.recheck_cell_size() {
+                app.mark_dirty();
+            }
+            let clock = crate::due::now_string(&app.settings.date_format);
+            if clock != last_clock {
+                last_clock = clock;
+                app.mark_dirty();
+            }
         }
         if app.images.poll_pending() {
             app.mark_dirty();
@@ -153,24 +167,69 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         }
         let need_fast = app.form.as_ref().is_some_and(|f| f.gif_playing());
 
-        let clock = crate::due::now_string(&app.settings.date_format);
-        if clock != last_clock {
-            last_clock = clock;
-            app.mark_dirty();
-        }
-
         if app.dirty {
             terminal.draw(|frame| ui::draw(frame, app))?;
             app.dirty = false;
         }
 
-        let wait = if need_fast {
-            Duration::from_millis(30)
-        } else if app.images.has_pending() {
-            Duration::from_millis(16)
-        } else {
-            Duration::from_millis(500)
-        };
+        let until_housekeeping = next_housekeeping.saturating_duration_since(Instant::now());
+        let wait = loop_wait(need_fast, app.images.has_pending(), until_housekeeping);
         let _ = event::poll(wait)?;
+    }
+}
+
+fn housekeeping_due(next: &mut Instant, now: Instant) -> bool {
+    if now < *next {
+        return false;
+    }
+    *next = now + HOUSEKEEPING_INTERVAL;
+    true
+}
+
+fn loop_wait(need_fast: bool, images_pending: bool, until_housekeeping: Duration) -> Duration {
+    let activity_wait = if need_fast {
+        GIF_WAIT
+    } else if images_pending {
+        IMAGE_WAIT
+    } else {
+        HOUSEKEEPING_INTERVAL
+    };
+    activity_wait.min(until_housekeeping)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{HOUSEKEEPING_INTERVAL, housekeeping_due, loop_wait};
+
+    #[test]
+    fn housekeeping_runs_immediately_then_on_its_interval() {
+        let start = Instant::now();
+        let mut next = start;
+
+        assert!(housekeeping_due(&mut next, start));
+        assert_eq!(next.duration_since(start), HOUSEKEEPING_INTERVAL);
+        assert!(!housekeeping_due(
+            &mut next,
+            start + HOUSEKEEPING_INTERVAL - Duration::from_millis(1),
+        ));
+        assert!(housekeeping_due(&mut next, start + HOUSEKEEPING_INTERVAL,));
+    }
+
+    #[test]
+    fn housekeeping_deadline_caps_animation_and_idle_waits() {
+        assert_eq!(
+            loop_wait(true, false, Duration::from_millis(10)),
+            Duration::from_millis(10),
+        );
+        assert_eq!(
+            loop_wait(true, false, Duration::from_millis(200)),
+            Duration::from_millis(30),
+        );
+        assert_eq!(
+            loop_wait(false, false, Duration::from_millis(200)),
+            Duration::from_millis(200),
+        );
     }
 }

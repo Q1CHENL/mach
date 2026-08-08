@@ -1534,13 +1534,19 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     // Always reserve room for three flags so ≡ / due do not shift when
     // importance changes.
     let flags_width = crate::model::MAX_IMPORTANCE as usize;
-    let (extras_width, due_width) = app.view.iter().fold((0, 0), |(e, d), i| {
-        let task = &app.tasks[*i];
-        (
-            e.max(extras(task).width()),
-            d.max(due::display(&task.due, &app.settings.date_format).width()),
-        )
-    });
+    let mut extras_width = 0;
+    let mut due_width = 0;
+    let presentations: Vec<_> = app
+        .view
+        .iter()
+        .map(|task_index| {
+            let presentation =
+                TaskPresentation::new(&app.tasks[*task_index], &app.settings.date_format);
+            extras_width = extras_width.max(presentation.extras.width());
+            due_width = due_width.max(presentation.due.width());
+            presentation
+        })
+        .collect();
 
     // Preserve a useful title at narrow widths. Optional metadata appears in
     // priority order only when its complete column fits.
@@ -1574,6 +1580,7 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     if columns.flags {
         widths.push(Constraint::Length(flags_width as u16));
     }
+    let mut presentations = presentations.into_iter().enumerate();
     let rows: Vec<Row> = app
         .list_rows
         .iter()
@@ -1583,9 +1590,16 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             crate::app::TaskListRow::Separator { .. } => {
                 Row::new(std::iter::repeat_n(Cell::new(""), widths.len()))
             }
-            crate::app::TaskListRow::Task(view_idx) => task_row(app, theme, *view_idx, columns),
+            crate::app::TaskListRow::Task(view_idx) => {
+                let (presentation_index, presentation) = presentations
+                    .next()
+                    .expect("task rows and task presentations must stay aligned");
+                debug_assert_eq!(*view_idx, presentation_index);
+                task_row(presentation, theme, *view_idx == app.task_index, columns)
+            }
         })
         .collect();
+    debug_assert!(presentations.next().is_none());
     // Selected-row wash stays on during edit; bold only when the list has chrome focus.
     let table = Table::new(rows, widths)
         .block(block)
@@ -1682,6 +1696,31 @@ fn extras(task: &crate::model::Task) -> String {
     }
 }
 
+/// Owned display data derived once for one task during a frame. Column sizing
+/// and row construction share it so due labels and body metadata are not
+/// recomputed while laying out the same table.
+struct TaskPresentation {
+    title: String,
+    extras: String,
+    due: String,
+    flags: String,
+    done: bool,
+    has_due: bool,
+}
+
+impl TaskPresentation {
+    fn new(task: &crate::model::Task, date_format: &str) -> Self {
+        Self {
+            title: task.title.clone(),
+            extras: extras(task),
+            due: due::display(&task.due, date_format),
+            flags: crate::model::importance_marks(task.importance),
+            done: task.done,
+            has_due: !task.due.is_empty(),
+        }
+    }
+}
+
 /// Which of the optional columns the table is laying out this frame.
 #[derive(Clone, Copy)]
 struct Columns {
@@ -1712,17 +1751,23 @@ fn category_rule(title: &str, width: usize, title_x: usize) -> String {
     )
 }
 
-fn task_row(app: &App, theme: &Theme, view_idx: usize, columns: Columns) -> Row<'static> {
-    let task = &app.tasks[app.view[view_idx]];
-    let done = task.done;
+fn task_row(
+    presentation: TaskPresentation,
+    theme: &Theme,
+    selected: bool,
+    columns: Columns,
+) -> Row<'static> {
+    let TaskPresentation {
+        title,
+        extras,
+        due,
+        flags,
+        done,
+        has_due,
+    } = presentation;
     // A finished task is muted — but not on the selected row (even when
     // Categories has focus), where the tick and strikethrough say enough.
-    let selected = view_idx == app.task_index;
-    let due_str = due::display(&task.due, &app.settings.date_format);
-
-    let title = task.title.clone();
-
-    let title_style = if !task.due.is_empty() {
+    let title_style = if has_due {
         let color = if done && !selected {
             theme.dimmed_accent()
         } else {
@@ -1751,22 +1796,18 @@ fn task_row(app: &App, theme: &Theme, view_idx: usize, columns: Columns) -> Row<
     // Order: title · ≡ · due · flags
     if columns.extras {
         cells.push(Cell::new(Span::styled(
-            extras(task),
+            extras,
             Style::new().fg(theme.muted_color()),
         )));
     }
     if columns.due {
         cells.push(Cell::new(Text::from(
-            Line::from(Span::styled(due_str, title_style)).right_aligned(),
+            Line::from(Span::styled(due, title_style)).right_aligned(),
         )));
     }
     if columns.flags {
         cells.push(Cell::new(Text::from(
-            Line::from(Span::styled(
-                crate::model::importance_marks(task.importance),
-                Style::new().fg(theme.error_color()),
-            ))
-            .right_aligned(),
+            Line::from(Span::styled(flags, Style::new().fg(theme.error_color()))).right_aligned(),
         )));
     }
     Row::new(cells)

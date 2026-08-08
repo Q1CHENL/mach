@@ -84,6 +84,42 @@ fn message(app: &App) -> String {
         .unwrap_or_default()
 }
 
+#[test]
+fn ignored_terminal_events_do_not_request_a_redraw() {
+    let mut app = app();
+    let release = KeyEvent {
+        code: KeyCode::Down,
+        modifiers: KeyModifiers::NONE,
+        kind: KeyEventKind::Release,
+        state: KeyEventState::NONE,
+    };
+
+    assert!(!handle_event(&mut app, Event::Key(release)));
+    assert!(!handle_event(&mut app, Event::FocusGained));
+    assert!(!handle_event(&mut app, Event::FocusLost));
+    assert!(!handle_event(&mut app, Event::Paste(String::new())));
+    assert!(!handle_event(
+        &mut app,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }),
+    ));
+}
+
+#[test]
+fn stateful_terminal_events_request_a_redraw() {
+    let mut app = app();
+
+    assert!(handle_event(&mut app, Event::Resize(120, 40)));
+    assert!(handle_event(
+        &mut app,
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+    ));
+}
+
 // ------------------------------------------------------------------ quit
 
 #[test]
