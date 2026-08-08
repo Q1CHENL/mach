@@ -2024,18 +2024,10 @@ fn dropdown_row(
 // -------------------------------------------------------------- overlays
 
 fn draw_help(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
-    let big = area.width >= banner::BANNER_WIDTH + 8;
-    let art: Vec<&str> = if big {
-        banner::BANNER.to_vec()
-    } else {
-        banner::BANNER_SMALL.to_vec()
-    };
-
-    let mut lines: Vec<Line> = Vec::new();
-    for row in &art {
-        lines.push(Line::styled((*row).to_string(), theme.accent_text()).centered());
+    let mut lines = wordmark_lines(theme, area.width);
+    if !lines.is_empty() {
+        lines.push(Line::raw(""));
     }
-    lines.push(Line::raw(""));
     // One logical column keeps every shortcut readable on ordinary 80-column
     // terminals. The two source columns become consecutive sections.
     for side in 0..2 {
@@ -2128,17 +2120,10 @@ fn draw_settings(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 }
 
 fn draw_welcome(f: &mut Frame, theme: &Theme, area: Rect) {
-    let big = area.width >= banner::BANNER_WIDTH + 8;
-    let art: Vec<&str> = if big {
-        banner::BANNER.to_vec()
-    } else {
-        banner::BANNER_SMALL.to_vec()
-    };
-    let mut lines: Vec<Line> = art
-        .iter()
-        .map(|row| Line::styled((*row).to_string(), theme.accent_text()).centered())
-        .collect();
-    lines.push(Line::raw(""));
+    let mut lines = wordmark_lines(theme, area.width);
+    if !lines.is_empty() {
+        lines.push(Line::raw(""));
+    }
     lines.push(
         Line::styled(
             format!("Welcome to mach v{}", crate::VERSION),
@@ -2158,13 +2143,7 @@ fn draw_welcome(f: &mut Frame, theme: &Theme, area: Rect) {
         .centered(),
     );
 
-    let width = (if big {
-        banner::BANNER_WIDTH
-    } else {
-        banner::BANNER_SMALL_WIDTH
-    } + 8)
-        .max(50)
-        .min(area.width);
+    let width = 50.min(area.width);
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2)
@@ -2175,6 +2154,16 @@ fn draw_welcome(f: &mut Frame, theme: &Theme, area: Rect) {
         .border_style(theme.accent_text());
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn wordmark_lines(theme: &Theme, available_width: u16) -> Vec<Line<'static>> {
+    if available_width < banner::BANNER_WIDTH + 8 {
+        return Vec::new();
+    }
+    banner::BANNER
+        .iter()
+        .map(|row| Line::styled(*row, theme.accent_text()).centered())
+        .collect()
 }
 
 fn draw_whats_new(f: &mut Frame, theme: &Theme, area: Rect) {

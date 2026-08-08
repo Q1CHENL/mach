@@ -11,11 +11,6 @@ pub const BANNER: [&str; 6] = [
 
 pub const BANNER_WIDTH: u16 = 35;
 
-/// Fallback wordmark for terminals too narrow for the full banner.
-pub const BANNER_SMALL: [&str; 3] = [r"┏┳┓┏━┓┏━╸╻ ╻", r"┃┃┃┣━┫┃  ┣━┫", r"╹ ╹╹ ╹┗━╸╹ ╹"];
-
-pub const BANNER_SMALL_WIDTH: u16 = 12;
-
 /// Highlights bundled into the binary for the one-time post-upgrade screen.
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
