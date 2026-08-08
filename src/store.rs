@@ -2351,6 +2351,14 @@ fn validate_settings(settings: &Settings) -> Result<(), StoreError> {
         validate_single_line(version, "last-run version")?;
         validate_byte_limit(version, SETTINGS_VALUE_MAX_BYTES, "last-run version")?;
     }
+    if settings
+        .last_update_check_at
+        .is_some_and(|timestamp| timestamp < 0)
+    {
+        return Err(StoreError::Validation(
+            "last update check timestamp cannot be negative".into(),
+        ));
+    }
     if !DATE_FORMATS.contains(&settings.date_format.as_str()) {
         return Err(StoreError::Validation(format!(
             "unknown date format {:?}",

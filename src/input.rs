@@ -187,7 +187,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     match app.mode {
-        Mode::Welcome => {
+        Mode::Welcome | Mode::WhatsNew => {
             app.mode = Mode::Normal;
             if !matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
                 handle_key(app, key);
@@ -751,7 +751,7 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
                 );
             }
         }
-        SlashCommand::Update => app.start_update_check(),
+        SlashCommand::Update => app.start_update_install(),
         SlashCommand::Quit => app.should_quit = true,
     }
 }

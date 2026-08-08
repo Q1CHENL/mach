@@ -140,6 +140,7 @@ fn draws_every_overlay() {
         (Mode::Help, "MOVING AROUND"),
         (Mode::Settings, "Sort"),
         (Mode::Welcome, "Welcome to mach"),
+        (Mode::WhatsNew, "What's new in mach"),
         (Mode::Slash, "search tasks"),
     ] {
         let mut app = sample_app();
@@ -272,6 +273,7 @@ fn survives_sizes_from_tiny_to_wide() {
             Mode::Help,
             Mode::Settings,
             Mode::Welcome,
+            Mode::WhatsNew,
             Mode::Slash,
             Mode::TaskForm,
             Mode::CategoryForm,

@@ -39,6 +39,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(500);
 const GIF_WAIT: Duration = Duration::from_millis(30);
 const IMAGE_WAIT: Duration = Duration::from_millis(16);
+const UPDATE_WAIT: Duration = Duration::from_millis(100);
 
 /// Entry point for the `mach` binary.
 pub fn run() {
@@ -70,6 +71,7 @@ pub fn run_tui(store: Store) -> io::Result<()> {
     app.images = images;
 
     let (mut terminal, _session) = TerminalSession::enter()?;
+    app.start_automatic_update_check();
     event_loop(&mut terminal, &mut app)
 }
 
@@ -139,7 +141,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             }
         }
         let _ = app.expire_message();
-        if app.poll_update_check() {
+        if app.poll_update() {
             app.mark_dirty();
         }
         let now = Instant::now();
@@ -173,7 +175,12 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         }
 
         let until_housekeeping = next_housekeeping.saturating_duration_since(Instant::now());
-        let wait = loop_wait(need_fast, app.images.has_pending(), until_housekeeping);
+        let wait = loop_wait(
+            need_fast,
+            app.images.has_pending(),
+            app.update_work_active(),
+            until_housekeeping,
+        );
         let _ = event::poll(wait)?;
     }
 }
@@ -186,11 +193,18 @@ fn housekeeping_due(next: &mut Instant, now: Instant) -> bool {
     true
 }
 
-fn loop_wait(need_fast: bool, images_pending: bool, until_housekeeping: Duration) -> Duration {
+fn loop_wait(
+    need_fast: bool,
+    images_pending: bool,
+    update_active: bool,
+    until_housekeeping: Duration,
+) -> Duration {
     let activity_wait = if need_fast {
         GIF_WAIT
     } else if images_pending {
         IMAGE_WAIT
+    } else if update_active {
+        UPDATE_WAIT
     } else {
         HOUSEKEEPING_INTERVAL
     };
@@ -201,7 +215,7 @@ fn loop_wait(need_fast: bool, images_pending: bool, until_housekeeping: Duration
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{HOUSEKEEPING_INTERVAL, housekeeping_due, loop_wait};
+    use super::{HOUSEKEEPING_INTERVAL, UPDATE_WAIT, housekeeping_due, loop_wait};
 
     #[test]
     fn housekeeping_runs_immediately_then_on_its_interval() {
@@ -220,16 +234,20 @@ mod tests {
     #[test]
     fn housekeeping_deadline_caps_animation_and_idle_waits() {
         assert_eq!(
-            loop_wait(true, false, Duration::from_millis(10)),
+            loop_wait(true, false, false, Duration::from_millis(10)),
             Duration::from_millis(10),
         );
         assert_eq!(
-            loop_wait(true, false, Duration::from_millis(200)),
+            loop_wait(true, false, false, Duration::from_millis(200)),
             Duration::from_millis(30),
         );
         assert_eq!(
-            loop_wait(false, false, Duration::from_millis(200)),
+            loop_wait(false, false, false, Duration::from_millis(200)),
             Duration::from_millis(200),
+        );
+        assert_eq!(
+            loop_wait(false, false, true, Duration::from_millis(500)),
+            UPDATE_WAIT,
         );
     }
 }

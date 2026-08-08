@@ -3,6 +3,7 @@
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use ratatui::layout::Rect;
 use ratatui::widgets::{ListState, TableState};
 use unicode_segmentation::UnicodeSegmentation;
@@ -14,7 +15,7 @@ use crate::model::{
     ALL_CATEGORY, Category, MAX_CATEGORY_COUNT, MAX_CATEGORY_NAME_LEN, MAX_TASK_COUNT,
     MAX_TITLE_LEN, Task, caseless_key,
 };
-use crate::settings::Settings;
+use crate::settings::{LaunchState, Settings};
 use crate::store::{
     Attachment, CategoryPatch, RelativePosition, Store, StoreData, StoreError, TaskPatch,
 };
@@ -41,6 +42,7 @@ pub enum Mode {
     Help,
     Settings,
     Welcome,
+    WhatsNew,
 }
 
 impl Mode {
@@ -48,7 +50,12 @@ impl Mode {
     pub fn is_overlay(self) -> bool {
         matches!(
             self,
-            Mode::Help | Mode::Settings | Mode::Welcome | Mode::TaskForm | Mode::CategoryForm
+            Mode::Help
+                | Mode::Settings
+                | Mode::Welcome
+                | Mode::WhatsNew
+                | Mode::TaskForm
+                | Mode::CategoryForm
         )
     }
 }
@@ -88,6 +95,36 @@ const CONFIRM_WINDOW: Duration = Duration::from_millis(2000);
 
 /// Idle gap after which type-to-jump starts a new query.
 const TYPEAHEAD_TIMEOUT: Duration = Duration::from_millis(800);
+
+const UPDATE_RESULT_DURATION: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateJobKind {
+    Automatic,
+    Install,
+}
+
+enum UpdateOutcome {
+    Checked(crate::update::CheckResult),
+    UpToDate(crate::update::CheckResult),
+    Installed(crate::update::InstallResult),
+}
+
+enum UpdateEvent {
+    DownloadProgress(crate::update::DownloadProgress),
+    Finished(Result<UpdateOutcome, String>),
+}
+
+struct UpdateJob {
+    rx: Receiver<UpdateEvent>,
+    kind: UpdateJobKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateActivity {
+    Checking,
+    Downloading(crate::update::DownloadProgress),
+}
 
 /// Rects from the last frame, used to hit-test mouse events.
 #[derive(Debug, Default, Clone, Copy)]
@@ -180,8 +217,13 @@ pub struct App {
     /// toggling `done`) are preserved instead of becoming false conflicts.
     task_edit_base: Option<Task>,
     category_edit_base: Option<Category>,
-    /// In-flight `/update` check.
-    update_rx: Option<Receiver<Result<crate::update::CheckResult, String>>>,
+    /// One in-flight automatic check or explicit install.
+    update_job: Option<UpdateJob>,
+    /// Update notices survive ordinary status messages and clear only when the
+    /// user opens the `/` command palette.
+    update_notice: Option<String>,
+    /// Visible work for an explicit `/update` request.
+    update_activity: Option<UpdateActivity>,
     /// Whether persistence polling has failed since its last successful pass.
     /// Repeated failures are quiet so they cannot continuously replace messages
     /// or disarm destructive confirmations; success rearms reporting.
@@ -194,15 +236,13 @@ impl App {
     }
 
     pub fn with_store(version: &str, mut store: Store) -> Result<Self, StoreError> {
-        // Only ever shown once, not again on every upgrade. The transaction
-        // reads fresh state, so two concurrently-starting processes cannot
-        // both treat an existing profile as new.
+        // The transaction reads fresh state, so two concurrently-starting
+        // processes cannot both claim the same first run or upgrade.
         let initial = store.snapshot()?;
-        let (first_run, snapshot) = if initial.settings.last_run_version.as_deref() == Some(version)
-        {
-            (false, initial)
+        let (launch, snapshot) = if initial.settings.last_run_version.as_deref() == Some(version) {
+            (LaunchState::Returning, initial)
         } else {
-            store.update_with_snapshot(|data| Ok(data.settings.take_first_run(version)))?
+            store.update_with_snapshot(|data| Ok(data.settings.record_launch(version)))?
         };
         let StoreData {
             revision,
@@ -224,10 +264,10 @@ impl App {
             categories,
             settings,
             focus: Focus::Tasks,
-            mode: if first_run {
-                Mode::Welcome
-            } else {
-                Mode::Normal
+            mode: match launch {
+                LaunchState::FirstRun => Mode::Welcome,
+                LaunchState::Upgraded => Mode::WhatsNew,
+                LaunchState::Returning => Mode::Normal,
             },
             cat_index: 0,
             task_index: 0,
@@ -260,7 +300,9 @@ impl App {
             preview_gen: 0,
             task_edit_base: None,
             category_edit_base: None,
-            update_rx: None,
+            update_job: None,
+            update_notice: None,
+            update_activity: None,
             external_poll_failed: false,
         };
         app.rebuild_view();
@@ -363,56 +405,152 @@ impl App {
         self.error(format!("{action}: {error}"));
     }
 
-    /// Start a non-blocking GitHub release check (for `/update`).
-    pub fn start_update_check(&mut self) {
-        if self.update_rx.is_some() {
-            self.info("Already checking for updates…");
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
-        match std::thread::Builder::new()
-            .name("mach-update-check".into())
-            .spawn(move || {
-                let _ = tx.send(crate::update::check());
-            }) {
-            Ok(_) => {
-                self.update_rx = Some(rx);
-                self.info("Checking for updates…");
-            }
-            Err(error) => self.error(format!("Could not start update check: {error}")),
+    /// Claim and start the daily background check. Persistence makes the claim
+    /// process-safe across multiple TUI instances sharing one data directory.
+    pub(crate) fn start_automatic_update_check(&mut self) {
+        let now = Utc::now().timestamp();
+        if self.claim_automatic_update_check_at(now) {
+            self.start_update_worker(UpdateJobKind::Automatic);
         }
     }
 
-    /// Apply a finished update check, if any. Returns true when UI should redraw.
-    pub fn poll_update_check(&mut self) -> bool {
-        let Some(rx) = &self.update_rx else {
+    fn claim_automatic_update_check_at(&mut self, now: i64) -> bool {
+        if !self.settings.automatic_update_check_due(now) {
             return false;
+        }
+        self.update_store(|data| Ok(data.settings.take_automatic_update_check(now)))
+            .unwrap_or(false)
+    }
+
+    /// Explicitly check for and install the latest verified release (`/update`).
+    pub(crate) fn start_update_install(&mut self) {
+        self.update_notice = None;
+        if self
+            .update_job
+            .as_ref()
+            .is_some_and(|job| job.kind == UpdateJobKind::Install)
+        {
+            self.info("Already updating…");
+            return;
+        }
+
+        // Explicit user intent supersedes an automatic check. Its detached
+        // worker may finish, but dropping the receiver prevents a stale result
+        // from competing with the install result in the UI.
+        self.update_job = None;
+        self.start_update_worker(UpdateJobKind::Install);
+    }
+
+    fn start_update_worker(&mut self, kind: UpdateJobKind) {
+        let (tx, rx) = mpsc::channel();
+        let thread_name = match kind {
+            UpdateJobKind::Automatic => "mach-update-check",
+            UpdateJobKind::Install => "mach-update-install",
         };
-        match rx.try_recv() {
-            Ok(Ok(info)) => {
-                self.update_rx = None;
-                if info.newer {
-                    self.info(format!(
-                        "v{} → v{} available · run: mach update --install",
-                        info.current, info.latest
-                    ));
-                } else {
-                    self.info(info.summary());
+        match std::thread::Builder::new()
+            .name(thread_name.into())
+            .spawn(move || {
+                let result = crate::update::check().and_then(|info| match kind {
+                    UpdateJobKind::Automatic => Ok(UpdateOutcome::Checked(info)),
+                    UpdateJobKind::Install if info.newer => {
+                        crate::update::install_with_progress(&info, |progress| {
+                            let _ = tx.send(UpdateEvent::DownloadProgress(progress));
+                        })
+                        .map(UpdateOutcome::Installed)
+                    }
+                    UpdateJobKind::Install => Ok(UpdateOutcome::UpToDate(info)),
+                });
+                let _ = tx.send(UpdateEvent::Finished(result));
+            }) {
+            Ok(_) => {
+                self.update_job = Some(UpdateJob { rx, kind });
+                if kind == UpdateJobKind::Install {
+                    self.update_activity = Some(UpdateActivity::Checking);
+                    self.dirty = true;
                 }
-                true
             }
-            Ok(Err(err)) => {
-                self.update_rx = None;
-                self.error(err);
-                true
+            Err(error) if kind == UpdateJobKind::Install => {
+                self.update_activity = None;
+                self.error(format!("Could not start update: {error}"));
             }
-            Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => {
-                self.update_rx = None;
-                self.error("Update check failed");
-                true
+            Err(_) => {}
+        }
+    }
+
+    /// Apply finished update work, if any. Returns true when UI should redraw.
+    pub(crate) fn poll_update(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let event = self
+                .update_job
+                .as_ref()
+                .map(|job| (job.kind, job.rx.try_recv()));
+            match event {
+                None => return changed,
+                Some((_, Ok(UpdateEvent::DownloadProgress(progress)))) => {
+                    let activity = UpdateActivity::Downloading(progress);
+                    if self.update_activity != Some(activity) {
+                        self.update_activity = Some(activity);
+                        changed = true;
+                    }
+                }
+                Some((kind, Ok(UpdateEvent::Finished(result)))) => {
+                    self.update_job = None;
+                    changed |= self.update_activity.take().is_some();
+                    return self.finish_update(kind, result) || changed;
+                }
+                Some((_, Err(TryRecvError::Empty))) => return changed,
+                Some((kind, Err(TryRecvError::Disconnected))) => {
+                    self.update_job = None;
+                    changed |= self.update_activity.take().is_some();
+                    return if kind == UpdateJobKind::Install {
+                        self.show_update_message("Update failed".into(), MessageKind::Error);
+                        true
+                    } else {
+                        changed
+                    };
+                }
             }
         }
+    }
+
+    fn finish_update(
+        &mut self,
+        kind: UpdateJobKind,
+        result: Result<UpdateOutcome, String>,
+    ) -> bool {
+        match result {
+            Ok(UpdateOutcome::Checked(info)) if info.newer => self.set_update_notice(format!(
+                "v{} → v{} available · run /update to install",
+                info.current, info.latest
+            )),
+            Ok(UpdateOutcome::Checked(_)) => false,
+            Ok(UpdateOutcome::UpToDate(info)) => {
+                self.show_update_message(info.summary(), MessageKind::Info);
+                true
+            }
+            Ok(UpdateOutcome::Installed(result)) => {
+                self.set_update_notice(format!("Installed {} · restart mach", result.tag))
+            }
+            Err(error) if kind == UpdateJobKind::Install => {
+                self.show_update_message(error, MessageKind::Error);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn set_update_notice(&mut self, text: String) -> bool {
+        let visible = self.message.is_none();
+        self.update_notice = Some(text);
+        if visible {
+            self.dirty = true;
+        }
+        visible
+    }
+
+    fn show_update_message(&mut self, text: String, kind: MessageKind) {
+        self.set_message_until(text, kind, Instant::now() + UPDATE_RESULT_DURATION);
     }
 
     pub fn mark_dirty(&mut self) {
@@ -1280,9 +1418,11 @@ impl App {
         if self.searching {
             self.end_search();
         }
+        self.update_notice = None;
         self.mode = Mode::Slash;
         self.input = TextInput::new("", 128);
         self.slash_index = 0;
+        self.dirty = true;
     }
 
     /// Enter live search, optionally with an initial query.
@@ -1328,6 +1468,27 @@ impl App {
 
     pub fn error(&mut self, text: impl Into<String>) {
         self.set_message(text.into(), MessageKind::Error, 2500);
+    }
+
+    pub(crate) fn status_message(&self) -> Option<(&str, MessageKind)> {
+        self.message
+            .as_ref()
+            .map(|message| (message.text.as_str(), message.kind))
+            .or_else(|| {
+                self.update_notice
+                    .as_deref()
+                    .map(|text| (text, MessageKind::Info))
+            })
+    }
+
+    pub(crate) fn update_activity(&self) -> Option<UpdateActivity> {
+        self.update_activity
+    }
+
+    pub(crate) fn update_work_active(&self) -> bool {
+        self.update_job
+            .as_ref()
+            .is_some_and(|job| job.kind == UpdateJobKind::Install)
     }
 
     fn set_message(&mut self, text: String, kind: MessageKind, millis: u64) {
@@ -1456,6 +1617,20 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn update_result(newer: bool) -> crate::update::CheckResult {
+        crate::update::CheckResult {
+            current: "0.2.0".into(),
+            latest: if newer { "0.3.0" } else { "0.2.0" }.into(),
+            tag: if newer { "v0.3.0" } else { "v0.2.0" }.into(),
+            newer,
+            prerelease: false,
+            release_url: "https://example.test/release".into(),
+            asset_name: "mach-aarch64-apple-darwin".into(),
+            asset_url: "https://example.test/binary".into(),
+            checksums_url: "https://example.test/SHA256SUMS".into(),
+        }
+    }
+
     #[test]
     fn typeahead_buffer_is_bounded_by_the_longest_searchable_title() {
         let store = Store::open_in_memory_with_paths("/tmp/mach-typeahead-test")
@@ -1471,5 +1646,206 @@ mod tests {
             app.typeahead.graphemes(true).count() <= MAX_TITLE_LEN,
             "a held key must not grow the navigation query without bound"
         );
+    }
+
+    #[test]
+    fn automatic_update_claim_is_persisted_across_app_instances() {
+        let dir = std::env::temp_dir().join(format!(
+            "mach-update-claim-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let now = 1_800_000_000;
+        let mut first = App::with_store("test", Store::open(&dir).unwrap()).unwrap();
+
+        assert!(first.claim_automatic_update_check_at(now));
+        drop(first);
+
+        let mut second = App::with_store("test", Store::open(&dir).unwrap()).unwrap();
+        assert!(!second.claim_automatic_update_check_at(now));
+        assert_eq!(second.settings.last_update_check_at, Some(now));
+        drop(second);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn upgraded_version_shows_whats_new_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "mach-whats-new-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut store = Store::open(&dir).unwrap();
+        store
+            .update(|data| {
+                data.settings.last_run_version = Some("0.1.9".into());
+                Ok(())
+            })
+            .unwrap();
+
+        let first = App::with_store("0.2.0", store).unwrap();
+        assert_eq!(first.mode, Mode::WhatsNew);
+        drop(first);
+
+        let second = App::with_store("0.2.0", Store::open(&dir).unwrap()).unwrap();
+        assert_eq!(second.mode, Mode::Normal);
+        drop(second);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tui_update_install_success_requests_restart() {
+        let store = Store::open_in_memory_with_paths("/tmp/mach-install-success-test").unwrap();
+        let mut app = App::with_store("test", store).unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.update_job = Some(UpdateJob {
+            rx,
+            kind: UpdateJobKind::Install,
+        });
+        app.update_activity = Some(UpdateActivity::Checking);
+        tx.send(UpdateEvent::Finished(Ok(UpdateOutcome::Installed(
+            crate::update::InstallResult {
+                destination: "/tmp/mach-bin/mach".into(),
+                tag: "v0.3.0".into(),
+            },
+        ))))
+        .unwrap();
+
+        assert!(app.poll_update());
+        assert_eq!(
+            app.status_message().map(|(text, _)| text),
+            Some("Installed v0.3.0 · restart mach")
+        );
+        assert!(app.update_activity().is_none());
+
+        assert!(!app.expire_message());
+        assert_eq!(
+            app.status_message().map(|(text, _)| text),
+            Some("Installed v0.3.0 · restart mach")
+        );
+
+        app.open_slash();
+        assert!(app.status_message().is_none());
+    }
+
+    #[test]
+    fn update_download_progress_is_applied_before_the_final_result() {
+        let store = Store::open_in_memory_with_paths("/tmp/mach-install-progress-test").unwrap();
+        let mut app = App::with_store("test", store).unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.update_job = Some(UpdateJob {
+            rx,
+            kind: UpdateJobKind::Install,
+        });
+        app.update_activity = Some(UpdateActivity::Checking);
+        tx.send(UpdateEvent::DownloadProgress(
+            crate::update::DownloadProgress {
+                downloaded: 512,
+                total: Some(1024),
+            },
+        ))
+        .unwrap();
+
+        assert!(app.poll_update());
+        assert_eq!(
+            app.update_activity(),
+            Some(UpdateActivity::Downloading(
+                crate::update::DownloadProgress {
+                    downloaded: 512,
+                    total: Some(1024),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn tui_update_install_error_keeps_the_recovery_command() {
+        let store = Store::open_in_memory_with_paths("/tmp/mach-install-error-test").unwrap();
+        let mut app = App::with_store("test", store).unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.update_job = Some(UpdateJob {
+            rx,
+            kind: UpdateJobKind::Install,
+        });
+        tx.send(UpdateEvent::Finished(Err(
+            "this mach executable is managed by Cargo; run cargo install --locked mach-tui".into(),
+        )))
+        .unwrap();
+
+        assert!(app.poll_update());
+        let message = app.message.as_ref().expect("visible install error");
+        assert_eq!(message.kind, MessageKind::Error);
+        assert!(message.text.contains("cargo install --locked mach-tui"));
+    }
+
+    #[test]
+    fn automatic_update_results_are_silent_unless_a_new_version_exists() {
+        let store = Store::open_in_memory_with_paths("/tmp/mach-auto-update-test").unwrap();
+        let mut app = App::with_store("test", store).unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.update_job = Some(UpdateJob {
+            rx,
+            kind: UpdateJobKind::Automatic,
+        });
+        tx.send(UpdateEvent::Finished(Ok(UpdateOutcome::Checked(
+            update_result(false),
+        ))))
+        .unwrap();
+
+        assert!(!app.poll_update());
+        assert!(app.message.is_none());
+
+        let (tx, rx) = mpsc::channel();
+        app.update_job = Some(UpdateJob {
+            rx,
+            kind: UpdateJobKind::Automatic,
+        });
+        tx.send(UpdateEvent::Finished(Err("offline".into())))
+            .unwrap();
+
+        assert!(!app.poll_update());
+        assert!(app.message.is_none());
+    }
+
+    #[test]
+    fn automatic_update_notice_waits_for_an_active_confirmation() {
+        let store = Store::open_in_memory_with_paths("/tmp/mach-deferred-update-test").unwrap();
+        let mut app = App::with_store("test", store).unwrap();
+        app.ask_confirm(Confirm::Quit, "Press Ctrl+C again to quit");
+        let (tx, rx) = mpsc::channel();
+        app.update_job = Some(UpdateJob {
+            rx,
+            kind: UpdateJobKind::Automatic,
+        });
+        tx.send(UpdateEvent::Finished(Ok(UpdateOutcome::Checked(
+            update_result(true),
+        ))))
+        .unwrap();
+
+        assert!(!app.poll_update());
+        assert_eq!(app.pending_confirmation(), Some(&Confirm::Quit));
+        assert_eq!(
+            app.message.as_ref().map(|message| message.text.as_str()),
+            Some("Press Ctrl+C again to quit")
+        );
+
+        app.cancel_pending();
+        assert!(app.status_message().is_some_and(|(text, _)| {
+            text.contains("v0.2.0 → v0.3.0 available · run /update to install")
+        }));
+
+        app.info("Temporary action result");
+        assert_eq!(
+            app.status_message().map(|(text, _)| text),
+            Some("Temporary action result")
+        );
+        app.message.as_mut().unwrap().until = Instant::now();
+        assert!(app.expire_message());
+        assert!(app.status_message().is_some_and(|(text, _)| {
+            text.contains("v0.2.0 → v0.3.0 available · run /update to install")
+        }));
+
+        app.open_slash();
+        assert!(app.status_message().is_none());
     }
 }

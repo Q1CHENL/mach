@@ -288,6 +288,7 @@ fn legacy_json_is_migrated_once_without_changing_source_files() {
     assert_eq!(data.tasks[0].category_id.as_deref(), Some("work"));
     assert!(data.tasks[0].due.starts_with("20"), "due was not absolute");
     assert_eq!(data.settings.date_format, "D-M-Y");
+    assert_eq!(data.settings.last_update_check_at, None);
 
     assert_eq!(
         std::fs::read_to_string(dir.path().join("categories.json")).unwrap(),
@@ -847,6 +848,14 @@ fn validation_rejects_controls_and_invalid_creation_timestamps() {
         })
         .expect_err("invalid timestamp must be rejected");
     assert!(matches!(timestamp_error, StoreError::Validation(_)));
+
+    let update_check_error = store
+        .update(|data| {
+            data.settings.last_update_check_at = Some(-1);
+            Ok(())
+        })
+        .expect_err("negative update-check timestamp must be rejected");
+    assert!(matches!(update_check_error, StoreError::Validation(_)));
     assert!(store.snapshot().unwrap().tasks.is_empty());
 }
 

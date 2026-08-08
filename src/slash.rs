@@ -1,4 +1,4 @@
-//! The `/` command palette: search, settings, help, copy, done, purge, quit.
+//! The `/` command palette: search, settings, help, copy, done, purge, update, quit.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommand {
@@ -13,7 +13,7 @@ pub enum SlashCommand {
     Done,
     /// Permanently remove done tasks (current category, or all in All Tasks).
     Purge,
-    /// Check GitHub for a newer release.
+    /// Install the latest verified GitHub release.
     Update,
     Quit,
 }
@@ -69,7 +69,7 @@ impl SlashCommand {
             Self::CopyTask => "copy selected task title and body",
             Self::Done => "show or hide completed tasks",
             Self::Purge => "delete completed tasks in this view",
-            Self::Update => "check GitHub for a newer build",
+            Self::Update => "install the latest verified build",
             Self::Quit => "leave mach",
         }
     }

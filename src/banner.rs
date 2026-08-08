@@ -16,6 +16,23 @@ pub const BANNER_SMALL: [&str; 3] = [r"┏┳┓┏━┓┏━╸╻ ╻", r"�
 
 pub const BANNER_SMALL_WIDTH: u16 = 12;
 
+/// Highlights bundled into the binary for the one-time post-upgrade screen.
+/// Update these alongside the package version when preparing a release.
+pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
+    (
+        "Automatic updates",
+        "Daily checks; /update installs the latest release.",
+    ),
+    (
+        "Verified downloads",
+        "SHA-256 is checked before the binary is replaced.",
+    ),
+    (
+        "Visible progress",
+        "The command row becomes a full-width download bar.",
+    ),
+];
+
 /// One row of the two-column key reference. Section headings are marked
 /// rather than guessed from their casing — "COMMANDS (press /)" has
 /// lowercase in it and would not read as a heading otherwise.

@@ -8,14 +8,14 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Text;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Scrollbar,
+    Block, BorderType, Cell, Clear, Gauge, List, ListItem, Padding, Paragraph, Row, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Table,
 };
 use ratatui_image::{Resize, StatefulImage};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Focus, MessageKind, Mode, SETTINGS_ITEMS};
+use crate::app::{App, Focus, MessageKind, Mode, SETTINGS_ITEMS, UpdateActivity};
 use crate::banner;
 use crate::due;
 use crate::form::Field;
@@ -107,6 +107,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Help => draw_help(f, app, &theme, area),
         Mode::Settings => draw_settings(f, app, &theme, area),
         Mode::Welcome => draw_welcome(f, &theme, area),
+        Mode::WhatsNew => draw_whats_new(f, &theme, area),
         Mode::CategoryForm => draw_category_form(f, app, &theme, area),
         Mode::TaskForm => {
             // Already drawn in the preview pane (or as a modal above).
@@ -1819,6 +1820,8 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     // The bar is a panel like the others, minus the name: while a
     // command or a search is being typed it is what has focus.
     let typing = matches!(app.mode, Mode::Slash | Mode::Search);
+    let update_activity = (!typing).then(|| app.update_activity()).flatten();
+    let downloading = matches!(update_activity, Some(UpdateActivity::Downloading(_)));
     let block = Block::bordered()
         .border_type(BorderType::Thick)
         .border_style(if typing {
@@ -1826,10 +1829,19 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         } else {
             Style::new().fg(theme.muted_color())
         })
-        .padding(Padding::horizontal(1));
+        .padding(if downloading {
+            Padding::ZERO
+        } else {
+            Padding::horizontal(1)
+        });
     let inner = block.inner(area);
     f.render_widget(block, area);
     let area = inner;
+
+    if let Some(UpdateActivity::Downloading(progress)) = update_activity {
+        draw_download_progress(f, progress, theme, area);
+        return;
+    }
 
     let right = Line::from(Span::styled(
         due::now_string(&app.settings.date_format),
@@ -1857,15 +1869,18 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             let body = line_with_selection(&view.text, view.sel_cols, Style::new(), theme);
             Line::from([vec![Span::styled("/", theme.accent_text())], body.spans].concat())
         }
-        _ => match &app.message {
-            Some(m) => {
-                let style = match m.kind {
+        _ if update_activity == Some(UpdateActivity::Checking) => {
+            Line::from(Span::styled("Checking for updates…", theme.accent_text()))
+        }
+        _ => match app.status_message() {
+            Some((text, kind)) => {
+                let style = match kind {
                     MessageKind::Error => Style::new()
                         .fg(theme.error_color())
                         .add_modifier(Modifier::BOLD),
                     MessageKind::Info => theme.accent_text(),
                 };
-                Line::from(Span::styled(truncate(&m.text, field), style))
+                Line::from(Span::styled(truncate(text, field), style))
             }
             None => {
                 let hint = if app.searching {
@@ -1882,6 +1897,52 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         },
     };
     f.render_widget(Paragraph::new(left), left_area);
+}
+
+fn draw_download_progress(
+    f: &mut Frame,
+    progress: crate::update::DownloadProgress,
+    theme: &Theme,
+    area: Rect,
+) {
+    let Some(total) = progress.total.filter(|total| *total > 0) else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(
+                    "Downloading update… {}",
+                    readable_bytes(progress.downloaded)
+                ),
+                theme.accent_text(),
+            )))
+            .centered(),
+            area,
+        );
+        return;
+    };
+    let ratio = progress.downloaded.min(total) as f64 / total as f64;
+    let percent = (ratio * 100.0).round() as u64;
+    let label = format!("Downloading update {percent}%");
+    f.render_widget(
+        Gauge::default()
+            .ratio(ratio)
+            .label(label)
+            .use_unicode(true)
+            .style(Style::new().fg(theme.muted_color()))
+            .gauge_style(theme.accent_text().add_modifier(Modifier::BOLD)),
+        area,
+    );
+}
+
+fn readable_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const KIB: u64 = 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Dropdown of `/` commands, drawn upward from the status bar.
@@ -2112,6 +2173,56 @@ fn draw_welcome(f: &mut Frame, theme: &Theme, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Thick)
         .border_style(theme.accent_text());
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn draw_whats_new(f: &mut Frame, theme: &Theme, area: Rect) {
+    let mut lines = vec![
+        Line::styled(
+            format!("What's new in mach v{}", crate::VERSION),
+            Style::new().add_modifier(Modifier::BOLD),
+        )
+        .centered(),
+        Line::raw(""),
+    ];
+    for (index, (title, description)) in banner::WHATS_NEW.into_iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled("• ", theme.accent_text()),
+            Span::styled(title, Style::new().add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::raw(format!("  {description}")));
+        if index + 1 < banner::WHATS_NEW.len() {
+            lines.push(Line::raw(""));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines
+        .push(Line::styled("Full release notes:", Style::new().fg(theme.muted_color())).centered());
+    lines.push(
+        Line::styled(
+            format!("github.com/Q1CHENL/mach/releases/tag/v{}", crate::VERSION),
+            Style::new().fg(theme.muted_color()),
+        )
+        .centered(),
+    );
+    lines.push(
+        Line::styled(
+            "Press Enter or Esc to continue",
+            Style::new().fg(theme.muted_color()),
+        )
+        .centered(),
+    );
+
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(area.height);
+    let rect = centered(area, 62.min(area.width), height);
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text())
+        .padding(Padding::horizontal(2));
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }

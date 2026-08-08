@@ -761,11 +761,13 @@ fn key_repeat_events_keep_navigation_responsive() {
 }
 
 #[test]
-fn welcome_does_not_consume_the_first_command_key() {
-    let mut app = app();
-    app.mode = Mode::Welcome;
-    press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
-    assert_eq!(app.mode, Mode::Slash);
+fn launch_overlays_do_not_consume_the_first_command_key() {
+    for mode in [Mode::Welcome, Mode::WhatsNew] {
+        let mut app = app();
+        app.mode = mode;
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        assert_eq!(app.mode, Mode::Slash);
+    }
 }
 
 #[test]

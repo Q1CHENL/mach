@@ -2,8 +2,8 @@
 //!
 //! Source of truth: GitHub Releases on `Q1CHENL/mach`. Fresh installs use the
 //! release installer; self-updates download and verify the exact release asset
-//! directly. Manual only — nothing runs unless the user asks (`/update` or
-//! `mach update`).
+//! directly. The TUI checks in the background at most once per day; install
+//! remains an explicit action through `/update` or `mach update --install`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -48,6 +48,12 @@ pub struct CheckResult {
 pub struct InstallResult {
     pub destination: PathBuf,
     pub tag: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DownloadProgress {
+    pub(crate) downloaded: u64,
+    pub(crate) total: Option<u64>,
 }
 
 impl CheckResult {
@@ -159,6 +165,13 @@ fn current_asset_name() -> Result<String, String> {
 /// executed. The replacement is written, synced, chmodded, and atomically
 /// renamed within the destination directory before that directory is synced.
 pub fn install(info: &CheckResult) -> Result<InstallResult, String> {
+    install_with_progress(info, |_| {})
+}
+
+pub(crate) fn install_with_progress(
+    info: &CheckResult,
+    progress: impl FnMut(DownloadProgress),
+) -> Result<InstallResult, String> {
     validate_install_info(info)?;
     let destination = install_destination()?;
     let manifest = http_get_text(
@@ -169,7 +182,7 @@ pub fn install(info: &CheckResult) -> Result<InstallResult, String> {
     )
     .map_err(|e| format!("could not download checksums for {}: {e}", info.tag))?;
     let expected_sha = checksum_for_asset(&manifest, &info.asset_name)?;
-    download_verified_binary(&info.asset_url, &expected_sha, &destination)?;
+    download_verified_binary(&info.asset_url, &expected_sha, &destination, progress)?;
     Ok(InstallResult {
         destination,
         tag: info.tag.clone(),
@@ -307,6 +320,7 @@ fn download_verified_binary(
     url: &str,
     expected_sha: &str,
     destination: &Path,
+    progress: impl FnMut(DownloadProgress),
 ) -> Result<(), String> {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(DOWNLOAD_TIMEOUT))
@@ -318,13 +332,28 @@ fn download_verified_binary(
         .header("Accept", "application/octet-stream")
         .call()
         .map_err(map_download_err)?;
-    write_verified_binary(response.body_mut().as_reader(), expected_sha, destination)
+    let total = response.body().content_length();
+    if total.is_some_and(|total| total > MAX_BINARY_BYTES) {
+        return Err(format!(
+            "release binary exceeds the {} MiB safety limit",
+            MAX_BINARY_BYTES / 1024 / 1024
+        ));
+    }
+    write_verified_binary(
+        response.body_mut().as_reader(),
+        expected_sha,
+        destination,
+        total,
+        progress,
+    )
 }
 
 fn write_verified_binary<R: Read>(
     mut source: R,
     expected_sha: &str,
     destination: &Path,
+    expected_total: Option<u64>,
+    mut progress: impl FnMut(DownloadProgress),
 ) -> Result<(), String> {
     #[cfg(not(unix))]
     return Err("self-update is supported only on Unix platforms".into());
@@ -350,9 +379,14 @@ fn write_verified_binary<R: Read>(
             .open(&temp_path)
             .map_err(|e| format!("could not create temporary binary: {e}"))?;
 
+        progress(DownloadProgress {
+            downloaded: 0,
+            total: expected_total,
+        });
+
         let write_result = (|| -> Result<(), String> {
             let mut hasher = Sha256::new();
-            let mut total = 0_u64;
+            let mut downloaded = 0_u64;
             let mut buffer = [0_u8; 64 * 1024];
             loop {
                 let read = source
@@ -361,10 +395,10 @@ fn write_verified_binary<R: Read>(
                 if read == 0 {
                     break;
                 }
-                total = total
+                downloaded = downloaded
                     .checked_add(read as u64)
                     .ok_or_else(|| "release binary is too large".to_string())?;
-                if total > MAX_BINARY_BYTES {
+                if downloaded > MAX_BINARY_BYTES {
                     return Err(format!(
                         "release binary exceeds the {} MiB safety limit",
                         MAX_BINARY_BYTES / 1024 / 1024
@@ -374,6 +408,10 @@ fn write_verified_binary<R: Read>(
                 temp_file
                     .write_all(&buffer[..read])
                     .map_err(|e| format!("could not write temporary binary: {e}"))?;
+                progress(DownloadProgress {
+                    downloaded,
+                    total: expected_total,
+                });
             }
 
             let actual_sha = format!("{:x}", hasher.finalize());
@@ -833,6 +871,8 @@ mod tests {
             std::io::Cursor::new(b"corrupt download"),
             &"0".repeat(64),
             &destination,
+            None,
+            |_| {},
         )
         .unwrap_err();
 
@@ -849,7 +889,14 @@ mod tests {
         let binary = b"verified binary";
         let digest = sha256_hex(binary);
 
-        write_verified_binary(std::io::Cursor::new(binary), &digest, &destination).unwrap();
+        write_verified_binary(
+            std::io::Cursor::new(binary),
+            &digest,
+            &destination,
+            None,
+            |_| {},
+        )
+        .unwrap();
 
         assert_eq!(fs::read(&destination).unwrap(), binary);
         #[cfg(unix)]
@@ -860,6 +907,46 @@ mod tests {
                 0o755
             );
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn verified_replace_reports_monotonic_download_progress() {
+        let dir = std::env::temp_dir().join(format!("mach-update-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let destination = dir.join("mach");
+        let binary = vec![b'x'; 150_000];
+        let digest = sha256_hex(&binary);
+        let mut progress = Vec::new();
+
+        write_verified_binary(
+            std::io::Cursor::new(&binary),
+            &digest,
+            &destination,
+            Some(binary.len() as u64),
+            |event| progress.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(
+            progress.first(),
+            Some(&DownloadProgress {
+                downloaded: 0,
+                total: Some(binary.len() as u64),
+            })
+        );
+        assert_eq!(
+            progress.last(),
+            Some(&DownloadProgress {
+                downloaded: binary.len() as u64,
+                total: Some(binary.len() as u64),
+            })
+        );
+        assert!(
+            progress
+                .windows(2)
+                .all(|pair| pair[0].downloaded <= pair[1].downloaded)
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }
