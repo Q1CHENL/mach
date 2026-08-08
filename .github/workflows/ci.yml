@@ -65,6 +65,32 @@ jobs:
       - name: Test
         run: cargo test --all-targets --locked
 
+      - name: Install TUI end-to-end dependency
+        if: matrix.toolchain == 'stable'
+        run: |
+          if command -v tmux >/dev/null 2>&1; then
+            exit 0
+          fi
+          case "${RUNNER_OS}" in
+            Linux)
+              sudo apt-get update
+              sudo apt-get install -y tmux
+              ;;
+            macOS)
+              HOMEBREW_NO_AUTO_UPDATE=1 brew install tmux
+              ;;
+            *)
+              printf 'unsupported TUI test runner %s\n' "${RUNNER_OS}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: TUI end-to-end
+        if: matrix.toolchain == 'stable'
+        run: |
+          cargo build --locked
+          scripts/e2e-tui.sh target/debug/mach
+
       - name: Documentation
         if: matrix.lint
         env:
