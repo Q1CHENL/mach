@@ -185,7 +185,7 @@ impl Category {
     }
 
     pub fn is_all(&self) -> bool {
-        self.id.is_empty() || self.id == ALL_CATEGORY
+        self.id == ALL_CATEGORY
     }
 }
 

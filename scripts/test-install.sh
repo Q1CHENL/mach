@@ -12,6 +12,14 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+  else
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  fi
+}
+
 case "$(uname -m)" in
   x86_64 | amd64) rust_arch=x86_64 ;;
   arm64 | aarch64) rust_arch=aarch64 ;;
@@ -31,11 +39,8 @@ mkdir -p "$release_dir" "$install_dir"
 
 printf '#!/bin/sh\nprintf "fixture 9.8.7\\n"\n' > "${release_dir}/${asset}"
 chmod 755 "${release_dir}/${asset}"
-if command -v sha256sum >/dev/null 2>&1; then
-  (cd "$release_dir" && sha256sum "$asset" > SHA256SUMS)
-else
-  (cd "$release_dir" && shasum -a 256 "$asset" > SHA256SUMS)
-fi
+printf '%s  %s\n' "$(sha256_file "${release_dir}/${asset}")" "$asset" \
+  > "${release_dir}/SHA256SUMS"
 
 MACH_RELEASE_BASE_URL="file://${tmpdir}/releases" \
 MACH_VERSION="$tag" \
@@ -53,13 +58,7 @@ MACH_INSTALL_DIR="$install_dir" \
   "$test_shell" "$installer" >/dev/null
 cmp "${release_dir}/${asset}" "${install_dir}/mach"
 
-before=$(
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "${install_dir}/mach" | awk '{ print $1 }'
-  else
-    shasum -a 256 "${install_dir}/mach" | awk '{ print $1 }'
-  fi
-)
+before=$(sha256_file "${install_dir}/mach")
 printf 'corrupt\n' >> "${release_dir}/${asset}"
 if MACH_RELEASE_BASE_URL="file://${tmpdir}/releases" \
   MACH_VERSION="$tag" \
@@ -68,23 +67,13 @@ if MACH_RELEASE_BASE_URL="file://${tmpdir}/releases" \
   printf 'installer accepted a checksum mismatch\n' >&2
   exit 1
 fi
-after=$(
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "${install_dir}/mach" | awk '{ print $1 }'
-  else
-    shasum -a 256 "${install_dir}/mach" | awk '{ print $1 }'
-  fi
-)
+after=$(sha256_file "${install_dir}/mach")
 [ "$before" = "$after" ] || {
   printf 'failed verification replaced the installed binary\n' >&2
   exit 1
 }
 
-if command -v sha256sum >/dev/null 2>&1; then
-  malformed_sha=$(sha256sum "${release_dir}/${asset}" | awk '{ print $1 }')
-else
-  malformed_sha=$(shasum -a 256 "${release_dir}/${asset}" | awk '{ print $1 }')
-fi
+malformed_sha=$(sha256_file "${release_dir}/${asset}")
 printf '%s  %s  unexpected-field\n' "$malformed_sha" "$asset" \
   > "${release_dir}/SHA256SUMS"
 if MACH_RELEASE_BASE_URL="file://${tmpdir}/releases" \
@@ -94,23 +83,13 @@ if MACH_RELEASE_BASE_URL="file://${tmpdir}/releases" \
   printf 'installer accepted a checksum entry with extra fields\n' >&2
   exit 1
 fi
-after=$(
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "${install_dir}/mach" | awk '{ print $1 }'
-  else
-    shasum -a 256 "${install_dir}/mach" | awk '{ print $1 }'
-  fi
-)
+after=$(sha256_file "${install_dir}/mach")
 [ "$before" = "$after" ] || {
   printf 'malformed checksum manifest replaced the installed binary\n' >&2
   exit 1
 }
 
-if command -v sha256sum >/dev/null 2>&1; then
-  oversized_sha=$(sha256sum "${release_dir}/${asset}" | awk '{ print $1 }')
-else
-  oversized_sha=$(shasum -a 256 "${release_dir}/${asset}" | awk '{ print $1 }')
-fi
+oversized_sha=$(sha256_file "${release_dir}/${asset}")
 printf '%s  %s\n' "$oversized_sha" "$asset" > "${release_dir}/SHA256SUMS"
 awk 'BEGIN { for (i = 0; i < 1048577; i++) printf "#" }' \
   >> "${release_dir}/SHA256SUMS"
@@ -121,13 +100,7 @@ if MACH_RELEASE_BASE_URL="file://${tmpdir}/releases" \
   printf 'installer accepted an oversized checksum manifest\n' >&2
   exit 1
 fi
-after=$(
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "${install_dir}/mach" | awk '{ print $1 }'
-  else
-    shasum -a 256 "${install_dir}/mach" | awk '{ print $1 }'
-  fi
-)
+after=$(sha256_file "${install_dir}/mach")
 [ "$before" = "$after" ] || {
   printf 'oversized checksum manifest replaced the installed binary\n' >&2
   exit 1

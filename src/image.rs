@@ -119,8 +119,7 @@ pub fn expand(path: &str) -> PathBuf {
 }
 
 pub fn expand_in(path: &str, images_root: &Path) -> PathBuf {
-    let path = reference_path(path).unwrap_or_else(|| path.trim());
-    let path = path.trim();
+    let path = reference_path(path).unwrap_or(path).trim();
     let path = path.strip_prefix("file://").unwrap_or(path);
     let path = path.replace("%20", " ");
     if let Some(rest) = path.strip_prefix("~/")
@@ -410,7 +409,6 @@ pub struct ImageStore {
     queued: VecDeque<PathBuf>,
     /// Encoded GIF frames for the open preview (one encode per frame index).
     gif_protocols: Vec<Option<StatefulProtocol>>,
-    gif_frame_count: usize,
 }
 
 impl Default for ImageStore {
@@ -426,7 +424,6 @@ impl Default for ImageStore {
             pending: HashMap::new(),
             queued: VecDeque::new(),
             gif_protocols: Vec::new(),
-            gif_frame_count: 0,
         }
     }
 }
@@ -679,70 +676,42 @@ impl ImageStore {
             }
             return ImageReady::Loading;
         }
-        if self.cache.get(path).is_some_and(|e| e.is_err()) {
-            let err = match self.cache.get(path) {
-                Some(Err(e)) => e.clone(),
-                _ => "image load failed".into(),
-            };
-            return ImageReady::Failed(err);
+        if let Some(Err(error)) = self.cache.get(path) {
+            return ImageReady::Failed(error.clone());
         }
-
-        // Encode on first use, then keep it: body and preview hold their
-        // own protocol so switching between them costs no re-encode.
-        let need_encode = self.cache.get(path).is_some_and(|e| {
-            e.as_ref().is_ok_and(|c| {
-                if preview {
-                    c.preview_protocol.is_none()
-                } else {
-                    c.protocol.is_none()
-                }
-            })
-        });
-        if need_encode {
-            let image = match self.cache.get(path) {
-                Some(Ok(c)) => Arc::clone(&c.image),
-                _ => return ImageReady::Loading,
-            };
-            let Some(picker) = self.picker.as_mut() else {
-                return ImageReady::Failed("no image support".into());
-            };
-            // new_resize_protocol needs an owned DynamicImage.
-            let protocol = picker.new_resize_protocol((*image).clone());
-            if let Some(Ok(cached)) = self.cache.get_mut(path) {
-                if preview {
-                    cached.preview_protocol = Some(protocol);
-                } else {
-                    cached.protocol = Some(protocol);
-                }
-            }
-        }
-
         self.touch_lru(path);
 
-        match self.cache.get_mut(path) {
-            Some(Ok(cached)) => {
-                let slot = if preview {
-                    cached.preview_protocol.as_mut()
-                } else {
-                    cached.protocol.as_mut()
+        let Self { cache, picker, .. } = self;
+        let Some(Ok(CachedImage {
+            image,
+            protocol,
+            preview_protocol,
+        })) = cache.get_mut(path)
+        else {
+            return ImageReady::Loading;
+        };
+
+        // Body and preview hold separate protocols so switching between them
+        // does not re-encode the decoded image.
+        let slot = if preview { preview_protocol } else { protocol };
+        let protocol = match slot {
+            Some(protocol) => protocol,
+            empty @ None => {
+                let Some(picker) = picker.as_mut() else {
+                    return ImageReady::Failed("no image support".into());
                 };
-                match slot {
-                    Some(protocol) => ImageReady::Ready(protocol),
-                    None => ImageReady::Failed("no image support".into()),
-                }
+                empty.insert(picker.new_resize_protocol((**image).clone()))
             }
-            Some(Err(err)) => ImageReady::Failed(err.clone()),
-            None => ImageReady::Loading,
-        }
+        };
+        ImageReady::Ready(protocol)
     }
 
     /// Protocol for the current GIF frame (encode once per frame index).
     pub fn preview_frame(&mut self, gif: &GifPlayback) -> Result<&mut StatefulProtocol, String> {
         let idx = gif.index;
         let n = gif.frame_count();
-        if self.gif_frame_count != n {
+        if self.gif_protocols.len() != n {
             self.gif_protocols = (0..n).map(|_| None).collect();
-            self.gif_frame_count = n;
         }
         if self.gif_protocols[idx].is_none() {
             let picker = self.picker.as_mut().ok_or("no image support")?;
@@ -756,7 +725,6 @@ impl ImageStore {
 
     pub fn clear_preview(&mut self) {
         self.gif_protocols.clear();
-        self.gif_frame_count = 0;
     }
 
     /// Drop the body protocols (the terminal deletes those pictures) but

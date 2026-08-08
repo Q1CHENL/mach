@@ -807,8 +807,12 @@ fn subtask_body_index(body: &[Block], one_based: usize) -> Result<usize, CliErro
 }
 
 fn subtasks_json(body: &[Block]) -> Vec<Value> {
-    collect_subtasks(body)
-        .into_iter()
+    subtasks_to_json(&collect_subtasks(body))
+}
+
+fn subtasks_to_json(subtasks: &[(usize, &str, bool)]) -> Vec<Value> {
+    subtasks
+        .iter()
         .map(|(index, text, done)| json!({ "index": index, "text": text, "done": done }))
         .collect()
 }
@@ -822,11 +826,12 @@ fn category_name<'a>(categories: &'a [Category], task: &Task) -> Option<&'a str>
 
 fn task_json(categories: &[Category], task: &Task) -> Value {
     let subtasks = collect_subtasks(&task.body);
+    let subtasks_json = subtasks_to_json(&subtasks);
     json!({
         "id": task.id,
         "title": task.title,
         "body": body_to_text(&task.body),
-        "subtasks": subtasks_json(&task.body),
+        "subtasks": subtasks_json,
         "subtasks_done": subtasks.iter().filter(|(_, _, done)| *done).count(),
         "subtasks_total": subtasks.len(),
         "due": task.due,
@@ -1033,59 +1038,63 @@ fn cmd_list(
 
 fn cmd_categories_list(store: &Store, json_mode: bool) -> Result<Rendered, CliError> {
     let data = store.snapshot()?;
-    let categories: Vec<_> = data
+    let stats: Vec<_> = data
         .categories
         .iter()
         .map(|category| {
-            let tasks: Vec<_> = data
+            let (done, total) = data
                 .tasks
                 .iter()
                 .filter(|task| task.category_id.as_deref() == Some(category.id.as_str()))
-                .collect();
+                .fold((0, 0), |(done, total), task| {
+                    (done + usize::from(task.done), total + 1)
+                });
+            (category, done, total)
+        })
+        .collect();
+    let categories: Vec<_> = stats
+        .iter()
+        .map(|(category, done, total)| {
             json!({
                 "id": category.id,
                 "name": category.name,
                 "description": category.description,
-                "total": tasks.len(),
-                "done": tasks.iter().filter(|task| task.done).count(),
+                "total": total,
+                "done": done,
             })
         })
         .collect();
-    let uncategorized: Vec<_> = data
+    let (uncategorized_done, uncategorized_total) = data
         .tasks
         .iter()
         .filter(|task| task.category_id.is_none())
-        .collect();
+        .fold((0, 0), |(done, total), task| {
+            (done + usize::from(task.done), total + 1)
+        });
     let value = json!({
         "categories": categories,
         "uncategorized": {
-            "total": uncategorized.len(),
-            "done": uncategorized.iter().filter(|task| task.done).count(),
+            "total": uncategorized_total,
+            "done": uncategorized_done,
         },
     });
     let mut plain = String::new();
     if data.categories.is_empty() {
         plain.push_str("(no categories)\n");
     } else {
-        for category in &data.categories {
-            let tasks: Vec<_> = data
-                .tasks
-                .iter()
-                .filter(|task| task.category_id.as_deref() == Some(category.id.as_str()))
-                .collect();
+        for (category, done, total) in &stats {
             plain.push_str(&format!(
                 "{}  {}/{}\n",
                 terminal_text(&category.name),
-                tasks.iter().filter(|task| task.done).count(),
-                tasks.len()
+                done,
+                total
             ));
         }
     }
-    if !uncategorized.is_empty() {
+    if uncategorized_total > 0 {
         plain.push_str(&format!(
             "— uncategorized  {}/{}\n",
-            uncategorized.iter().filter(|task| task.done).count(),
-            uncategorized.len()
+            uncategorized_done, uncategorized_total
         ));
     }
     Ok(rendered(json_mode, value, plain))
@@ -1318,11 +1327,11 @@ fn cmd_set_done(
     json_mode: bool,
 ) -> Result<Rendered, CliError> {
     let query = query.to_string();
-    let (task, categories) = store.update(|data| {
+    let (task, snapshot) = store.update_with_snapshot(|data| {
         let id = data.resolve_task_id(&query)?;
-        let task = data.set_task_done(&id, done)?;
-        Ok((task, data.categories.clone()))
+        data.set_task_done(&id, done)
     })?;
+    let categories = snapshot.categories;
     Ok(rendered(
         json_mode,
         task_json(&categories, &task),
@@ -1337,11 +1346,11 @@ fn cmd_set_done(
 
 fn cmd_delete(store: &mut Store, query: &str, json_mode: bool) -> Result<Rendered, CliError> {
     let query = query.to_string();
-    let (task, categories) = store.update(|data| {
+    let (task, snapshot) = store.update_with_snapshot(|data| {
         let id = data.resolve_task_id(&query)?;
-        let task = data.delete_task(&id)?;
-        Ok((task, data.categories.clone()))
+        data.delete_task(&id)
     })?;
+    let categories = snapshot.categories;
     Ok(rendered(
         json_mode,
         task_json(&categories, &task),
@@ -1371,13 +1380,14 @@ fn cmd_move(
     };
     let query = query.to_string();
     let target_query = target_query.to_string();
-    let (task, target, categories) = store.update(|data| {
+    let ((task, target), snapshot) = store.update_with_snapshot(|data| {
         let id = data.resolve_task_id(&query)?;
         let target_id = data.resolve_task_id(&target_query)?;
         let target = data.task(&target_id)?.clone();
         let task = data.move_task_relative(&id, &target_id, position)?;
-        Ok((task, target, data.categories.clone()))
+        Ok((task, target))
     })?;
+    let categories = snapshot.categories;
     let value = json!({
         "moved": task_json(&categories, &task),
         "relation": relation,
@@ -1403,14 +1413,14 @@ fn cmd_purge(
         ));
     }
     let category = category.map(str::to_string);
-    let (removed, categories) = store.update(|data| {
+    let (removed, snapshot) = store.update_with_snapshot(|data| {
         let scope = match category.as_deref() {
             Some(query) => PurgeScope::Category(data.resolve_category_id(query)?),
             None => PurgeScope::All,
         };
-        let removed = data.purge_completed(&scope)?;
-        Ok((removed, data.categories.clone()))
+        data.purge_completed(&scope)
     })?;
+    let categories = snapshot.categories;
     let value = json!({
         "purged": removed
             .iter()

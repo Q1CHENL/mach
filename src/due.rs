@@ -233,7 +233,11 @@ fn relative_day(due: &str) -> Option<i64> {
         return Some(0);
     }
     let (y, mo, d, _, _) = sort_key(due)?;
-    let date = NaiveDate::from_ymd_opt(y, mo, d)?;
+    relative_date(y, mo, d)
+}
+
+fn relative_date(year: i32, month: u32, day: u32) -> Option<i64> {
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
     Some((date - Local::now().date_naive()).num_days())
 }
 
@@ -247,7 +251,12 @@ pub fn display(due: &str, date_format: &str) -> String {
     let Some((y, mo, d, h, mi)) = sort_key(due) else {
         return format!("[{due}]");
     };
-    let label = match relative_day(due) {
+    let relative = if due.len() == 5 && due.contains(':') {
+        Some(0)
+    } else {
+        relative_date(y, mo, d)
+    };
+    let label = match relative {
         Some(0) => "Today".to_string(),
         Some(1) => "Tomorrow".to_string(),
         Some(-1) => "Yesterday".to_string(),

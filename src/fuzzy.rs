@@ -7,12 +7,15 @@ fn folded(value: &str) -> Vec<char> {
 /// Score how well `query` fuzzy-matches `text` (case-insensitive).
 /// Higher is better. `None` if `query` is not a subsequence of `text`.
 pub fn score(query: &str, text: &str) -> Option<i32> {
+    let query = folded(query);
+    score_folded(&query, text)
+}
+
+fn score_folded(query: &[char], text: &str) -> Option<i32> {
     if query.is_empty() {
         return None;
     }
 
-    // Query is short (typeahead); materialize once. Text is streamed.
-    let q = folded(query);
     let mut qi = 0;
     let mut total = 0i32;
     let mut prev_match: Option<usize> = None;
@@ -20,9 +23,9 @@ pub fn score(query: &str, text: &str) -> Option<i32> {
     let mut prev_char: Option<char> = None;
     let mut t_len = 0usize;
 
-    for (ti, tc) in folded(text).into_iter().enumerate() {
+    for (ti, tc) in crate::model::caseless_key(text).chars().enumerate() {
         t_len = ti + 1;
-        if qi < q.len() && tc == q[qi] {
+        if qi < query.len() && tc == query[qi] {
             let mut points = 1;
             if ti == 0 {
                 points += 8;
@@ -49,7 +52,7 @@ pub fn score(query: &str, text: &str) -> Option<i32> {
         prev_char = Some(tc);
     }
 
-    if qi < q.len() {
+    if qi < query.len() {
         return None;
     }
     // Slight preference for shorter titles when the match is otherwise equal.
@@ -63,9 +66,10 @@ pub fn best_index<'a, I>(query: &str, titles: I) -> Option<usize>
 where
     I: IntoIterator<Item = &'a str>,
 {
+    let query = folded(query);
     let mut best: Option<(i32, usize)> = None;
     for (i, title) in titles.into_iter().enumerate() {
-        let Some(s) = score(query, title) else {
+        let Some(s) = score_folded(&query, title) else {
             continue;
         };
         match best {

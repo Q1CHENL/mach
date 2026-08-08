@@ -273,6 +273,12 @@ fn line_from_block(block: &Block, line_max_len: usize) -> Line {
     }
 }
 
+fn block_from_input(input: &TextInput, make: impl FnOnce(&str) -> Block) -> Option<Block> {
+    let value = input.value();
+    let value = value.trim_end();
+    (!value.trim().is_empty()).then(|| make(value))
+}
+
 fn resolve_image_reference(
     reference: &str,
     image_root: &Path,
@@ -357,6 +363,15 @@ pub struct Placed {
     /// Whether the cursor is on this block. A picture cannot hold a text
     /// cursor, so this is how it shows that it is the one selected.
     pub selected: bool,
+}
+
+struct LineLayout {
+    number: Option<usize>,
+    wraps: Vec<(usize, usize)>,
+    start: usize,
+    rows: usize,
+    selection: Option<(usize, usize)>,
+    selected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,23 +533,14 @@ impl BodyEditor {
         self.lines
             .iter()
             .filter_map(|line| match line {
-                Line::Text(text) if !text.value().trim().is_empty() => {
-                    Some(Block::text(text.value().trim_end()))
+                Line::Text(text) => block_from_input(text, Block::text),
+                Line::Todo { text, done } => {
+                    block_from_input(text, |value| Block::todo(value, *done))
                 }
-                Line::Todo { text, done } if !text.value().trim().is_empty() => {
-                    Some(Block::todo(text.value().trim_end(), *done))
-                }
-                Line::Bullet(text) if !text.value().trim().is_empty() => {
-                    Some(Block::bullet(text.value().trim_end()))
-                }
-                Line::Number(text) if !text.value().trim().is_empty() => {
-                    Some(Block::number(text.value().trim_end()))
-                }
-                Line::Link(text) if !text.value().trim().is_empty() => {
-                    Some(Block::link(text.value().trim_end()))
-                }
+                Line::Bullet(text) => block_from_input(text, Block::bullet),
+                Line::Number(text) => block_from_input(text, Block::number),
+                Line::Link(text) => block_from_input(text, Block::link),
                 Line::Image { path } => Some(Block::image(path)),
-                _ => None,
             })
             .collect()
     }
@@ -694,17 +700,6 @@ impl BodyEditor {
     fn copy_lines_between(&self, al: usize, ac: usize, bl: usize, bc: usize) -> Vec<CopyLine> {
         let mut out = Vec::new();
         if al == bl {
-            if self.is_image_line(al) {
-                // Unreachable via ordered_selection (a == b), but keep safe.
-                if let Line::Image { path } = &self.lines[al] {
-                    out.push(CopyLine::Image(resolve_image_reference(
-                        path,
-                        &self.image_root,
-                        &self.attachments,
-                    )));
-                }
-                return out;
-            }
             let s = self.line_text_value(al);
             let chars: Vec<&str> = s.graphemes(true).collect();
             let lo = ac.min(chars.len());
@@ -873,10 +868,6 @@ impl BodyEditor {
                 }
             }
             self.sel_anchor = None;
-            if self.lines.is_empty() {
-                self.lines.push(self.empty_line());
-                self.cursor = 0;
-            }
             return true;
         }
         if let Some(input) = self.input() {
@@ -1948,55 +1939,48 @@ impl BodyEditor {
         self.layout_width = width;
 
         let numbers = number_runs(&self.lines);
-
-        // One wrap pass per line (shared by height, cursor, and paint).
-        let wraps: Vec<Option<Vec<(usize, usize)>>> = self
+        let mut total = 0usize;
+        let layouts: Vec<LineLayout> = self
             .lines
             .iter()
             .enumerate()
             .map(|(i, line)| {
-                let indent = numbers[i]
-                    .map(number_indent)
-                    .unwrap_or_else(|| line.indent());
+                let number = numbers[i];
+                let indent = number.map(number_indent).unwrap_or_else(|| line.indent());
                 let field = width.saturating_sub(indent).max(1);
-                line.input_ref().map(|t| t.wrap_breaks(field))
+                let wraps = line
+                    .input_ref()
+                    .map(|text| text.wrap_breaks(field))
+                    .unwrap_or_default();
+                let rows = if matches!(line, Line::Image { .. }) {
+                    usize::from(IMAGE_ROWS)
+                } else {
+                    wraps.len().max(1)
+                };
+                let layout = LineLayout {
+                    number,
+                    wraps,
+                    start: total,
+                    rows,
+                    selection: self
+                        .char_sel_on_line(i)
+                        .or_else(|| line.input_ref().and_then(TextInput::selection_range)),
+                    selected: i == self.cursor || self.line_in_selection(i),
+                };
+                total = total.saturating_add(rows);
+                layout
             })
             .collect();
-
-        let heights: Vec<usize> = self
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(i, line)| match line {
-                Line::Image { .. } => usize::from(IMAGE_ROWS),
-                _ => wraps[i]
-                    .as_ref()
-                    .map(|b| b.len().max(1))
-                    .unwrap_or(1)
-                    .max(1),
-            })
-            .collect();
-        let starts: Vec<usize> = heights
-            .iter()
-            .scan(0usize, |row, &h| {
-                let start = *row;
-                *row = row.saturating_add(h);
-                Some(start)
-            })
-            .collect();
-        let total = heights.iter().copied().fold(0usize, usize::saturating_add);
         self.content_height = total;
 
         // Keep the caret's visual row on screen (not just the block).
         let cursor_visual = {
-            let row_in_block = match (
-                self.lines[self.cursor].input_ref(),
-                wraps[self.cursor].as_ref(),
-            ) {
-                (Some(t), Some(b)) => t.wrap_cursor_from_breaks(b).0,
-                _ => 0,
-            };
-            starts[self.cursor].saturating_add(row_in_block)
+            let layout = &layouts[self.cursor];
+            let row_in_block = self.lines[self.cursor]
+                .input_ref()
+                .map(|text| text.wrap_cursor_from_breaks(&layout.wraps).0)
+                .unwrap_or(0);
+            layout.start.saturating_add(row_in_block)
         };
         if cursor_visual < self.scroll {
             self.scroll = cursor_visual;
@@ -2005,39 +1989,25 @@ impl BodyEditor {
         }
         self.scroll = self.scroll.min(total.saturating_sub(usize::from(height)));
 
-        // Char selections per line (body multi-line or in-line).
-        let line_sels: Vec<Option<(usize, usize)>> = (0..self.lines.len())
-            .map(|i| {
-                self.char_sel_on_line(i)
-                    .or_else(|| self.lines[i].input_ref().and_then(|t| t.selection_range()))
-            })
-            .collect();
-        // Picture frames: cursor line or covered by the body selection.
-        let line_selected: Vec<bool> = (0..self.lines.len())
-            .map(|i| i == self.cursor || self.line_in_selection(i))
-            .collect();
-
         let mut placed = Vec::new();
         let mut cursor_at = None;
-        for (i, line) in self.lines.iter_mut().enumerate() {
-            let start = starts[i];
-            let rows = heights[i];
+        for (i, (line, layout)) in self.lines.iter_mut().zip(&layouts).enumerate() {
             // Intersection with the viewport — clip top and bottom the same
             // way so a tall block (picture) shrinks until it disappears when
             // scrolled off either edge, instead of painting full-height at y=0
             // and overlapping the next block.
-            let Some((y, vis_rows, skip)) = visible_band(start, rows, self.scroll, height) else {
+            let Some((y, vis_rows, skip)) =
+                visible_band(layout.start, layout.rows, self.scroll, height)
+            else {
                 continue;
             };
-            let n = numbers[i];
-            let kind = match (&*line, n) {
-                (Line::Todo { done, .. }, _) => TextKind::Todo { done: *done },
-                (Line::Bullet(_), _) => TextKind::Bullet,
-                (Line::Number(_), Some(n)) => TextKind::Number(n),
-                (Line::Number(_), None) => TextKind::Number(1),
-                (Line::Link(_), _) => TextKind::Link,
-                (Line::Text(_), _) => TextKind::Plain,
-                (Line::Image { path }, _) => {
+            let (text, kind) = match line {
+                Line::Todo { text, done } => (text, TextKind::Todo { done: *done }),
+                Line::Bullet(text) => (text, TextKind::Bullet),
+                Line::Number(text) => (text, TextKind::Number(layout.number.unwrap_or(1))),
+                Line::Link(text) => (text, TextKind::Link),
+                Line::Text(text) => (text, TextKind::Plain),
+                Line::Image { path } => {
                     placed.push(Placed {
                         block: Painted::Image(resolve_image_reference(
                             path,
@@ -2047,18 +2017,13 @@ impl BodyEditor {
                         line: i,
                         y,
                         rows: vis_rows,
-                        selected: line_selected[i],
+                        selected: layout.selected,
                     });
                     continue;
                 }
             };
             let indent = kind.indent();
-            let sel = line_sels[i];
-            let breaks = wraps[i].as_deref().unwrap_or(&[]);
-            let Some(text) = line.input() else {
-                continue;
-            };
-            let view = text.wrapped_from_breaks(breaks, sel);
+            let view = text.wrapped_from_breaks(&layout.wraps, layout.selection);
             if i == self.cursor {
                 let row = usize::from(view.cursor_row).saturating_sub(skip) as u16;
                 cursor_at = Some((y.saturating_add(row), view.cursor_col + indent as u16));
@@ -2081,7 +2046,7 @@ impl BodyEditor {
                 line: i,
                 y,
                 rows: vis_rows,
-                selected: line_selected[i],
+                selected: layout.selected,
             });
         }
         (placed, cursor_at)

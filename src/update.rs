@@ -71,7 +71,7 @@ impl CheckResult {
 
 /// Built-in version of this binary.
 pub fn current_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    crate::VERSION
 }
 
 /// Ask GitHub what the latest release is and compare to this binary.
@@ -511,10 +511,8 @@ fn map_ureq_err(e: ureq::Error) -> String {
 
 /// Strip one conventional leading `v` and whitespace.
 pub fn normalize_tag(tag: &str) -> String {
-    tag.trim()
-        .strip_prefix('v')
-        .unwrap_or_else(|| tag.trim())
-        .to_string()
+    let tag = tag.trim();
+    tag.strip_prefix('v').unwrap_or(tag).to_string()
 }
 
 /// True when `latest` is a higher semantic version than `current`.

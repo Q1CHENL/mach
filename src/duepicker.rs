@@ -51,9 +51,6 @@ pub struct DuePicker {
     /// Digits typed into the focused hour/minute field (0–2).
     entry: Vec<u8>,
     original: String,
-    had_date: bool,
-    had_year: bool,
-    had_time: bool,
     date_changed: bool,
     time_changed: bool,
     /// Last drawn positions for hit-testing.
@@ -78,12 +75,6 @@ impl DuePicker {
             focus: PickerFocus::Calendar,
             entry: Vec::new(),
             original: current.to_string(),
-            had_date: current.contains('-'),
-            had_year: current
-                .split_whitespace()
-                .next()
-                .is_some_and(|date| date.split('-').next().is_some_and(|year| year.len() == 4)),
-            had_time: current.contains(':'),
             date_changed: false,
             time_changed: false,
             layout: PickerLayout::default(),
@@ -159,24 +150,25 @@ impl DuePicker {
                 self.minute
             );
         }
-        let include_date = self.had_date || self.date_changed;
-        let include_time = self.had_time || self.time_changed;
-        match (include_date, include_time) {
-            (true, true) => format!(
-                "{} {:02}:{:02}",
-                self.day.format("%Y-%m-%d"),
-                self.hour,
-                self.minute
-            ),
-            (true, false) => {
-                if self.had_date && !self.had_year {
-                    self.day.format("%m-%d").to_string()
-                } else {
-                    self.day.format("%Y-%m-%d").to_string()
-                }
+        let (had_date, had_year, had_time) = original_shape(&self.original);
+        let include_date = had_date || self.date_changed;
+        let include_time = had_time || self.time_changed;
+        if include_date {
+            if include_time {
+                format!(
+                    "{} {:02}:{:02}",
+                    self.day.format("%Y-%m-%d"),
+                    self.hour,
+                    self.minute
+                )
+            } else if had_date && !had_year {
+                self.day.format("%m-%d").to_string()
+            } else {
+                self.day.format("%Y-%m-%d").to_string()
             }
-            (false, true) => format!("{:02}:{:02}", self.hour, self.minute),
-            (false, false) => String::new(),
+        } else {
+            debug_assert!(include_time);
+            format!("{:02}:{:02}", self.hour, self.minute)
         }
     }
 
@@ -308,6 +300,15 @@ impl DuePicker {
             self.time_changed = true;
         }
     }
+}
+
+fn original_shape(original: &str) -> (bool, bool, bool) {
+    let had_date = original.contains('-');
+    let had_year = original
+        .split_whitespace()
+        .next()
+        .is_some_and(|date| date.split('-').next().is_some_and(|year| year.len() == 4));
+    (had_date, had_year, original.contains(':'))
 }
 
 fn hit(r: Rect, x: u16, y: u16) -> bool {

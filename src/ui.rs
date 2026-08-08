@@ -291,7 +291,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
     let box_inner = render_field_box(f, field_block("Body", focused, progress, theme), body_box);
     form.areas.body = box_inner;
     draw_body(f, form, store, theme, box_inner, focused);
-    field_scrollbar(
+    scrollbar(
         f,
         theme,
         body_box,
@@ -584,7 +584,7 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     if focused {
         draw_slash_menu(f, &form.description, theme, box_inner, cursor);
     }
-    field_scrollbar(
+    scrollbar(
         f,
         theme,
         text_box,
@@ -1379,19 +1379,6 @@ fn panel<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
 
 /// Panel scrollbar (right border). Accent when focused, grey otherwise.
 fn scrollbar(
-    f: &mut Frame,
-    theme: &Theme,
-    area: Rect,
-    total: usize,
-    visible: usize,
-    offset: usize,
-    focused: bool,
-) {
-    paint_scrollbar(f, theme, area, total, visible, offset, focused, 1);
-}
-
-/// Scrollbar on a field box (Body / Description), same rules as panels.
-fn field_scrollbar(
     f: &mut Frame,
     theme: &Theme,
     area: Rect,

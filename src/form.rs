@@ -105,8 +105,7 @@ impl CategoryForm {
     }
 
     pub fn toggle_field(&mut self) {
-        self.history.break_coalesce();
-        self.on_description = !self.on_description;
+        self.set_description_focus(!self.on_description);
     }
 
     /// Focus a particular field while preserving undo coalescing boundaries.
@@ -139,12 +138,18 @@ impl CategoryForm {
 
     /// Snapshot before a content edit.
     pub fn before_edit(&mut self, kind: EditKind) {
-        if self.history.will_coalesce(kind) {
-            self.history.touch_coalesce();
-            return;
-        }
-        let snap = self.snap();
-        self.history.push(snap, kind);
+        let Self {
+            name,
+            description,
+            on_description,
+            history,
+            ..
+        } = self;
+        history.before_edit_with(kind, || CategorySnap {
+            name: name.clone(),
+            description: description.clone(),
+            on_description: *on_description,
+        });
     }
 
     pub fn break_coalesce(&mut self) {
@@ -594,12 +599,24 @@ impl TaskForm {
 
     /// Snapshot before a content edit (call before mutating).
     pub fn before_edit(&mut self, kind: EditKind) {
-        if self.history.will_coalesce(kind) {
-            self.history.touch_coalesce();
-            return;
-        }
-        let snap = self.snap();
-        self.history.push(snap, kind);
+        let Self {
+            title,
+            category_id,
+            due,
+            importance,
+            body,
+            field,
+            history,
+            ..
+        } = self;
+        history.before_edit_with(kind, || TaskSnap {
+            title: title.clone(),
+            category_id: category_id.clone(),
+            due: due.clone(),
+            importance: *importance,
+            body: body.clone(),
+            field: *field,
+        });
     }
 
     pub fn break_coalesce(&mut self) {
@@ -641,8 +658,8 @@ impl TaskForm {
 
     /// Steps importance up, wrapping back to none after three.
     pub fn cycle_importance(&mut self) {
-        self.before_edit(EditKind::Atomic);
-        self.importance = (self.importance + 1) % (crate::model::MAX_IMPORTANCE + 1);
+        let next = (self.importance + 1) % (crate::model::MAX_IMPORTANCE + 1);
+        self.set_importance(next);
     }
 
     pub fn set_importance(&mut self, importance: u8) {

@@ -153,9 +153,6 @@ pub struct App {
     /// First help content row currently visible.
     pub help_scroll: usize,
     pub message: Option<Message>,
-    /// Whether the visible status message belongs to `pending`. A later
-    /// informational/error message replaces it independently.
-    message_is_confirmation: bool,
     /// Pending entity-bound destructive action and its deadline.
     pub pending: Option<(Confirm, Instant)>,
     /// Last click `(time, panel, row)` for double-click detection.
@@ -201,12 +198,12 @@ impl App {
         // reads fresh state, so two concurrently-starting processes cannot
         // both treat an existing profile as new.
         let initial = store.snapshot()?;
-        let first_run = if initial.settings.last_run_version.as_deref() == Some(version) {
-            false
+        let (first_run, snapshot) = if initial.settings.last_run_version.as_deref() == Some(version)
+        {
+            (false, initial)
         } else {
-            store.update(|data| Ok(data.settings.take_first_run(version)))?
+            store.update_with_snapshot(|data| Ok(data.settings.take_first_run(version)))?
         };
-        let snapshot = store.snapshot()?;
         let StoreData {
             revision,
             categories: real_cats,
@@ -247,7 +244,6 @@ impl App {
             settings_index: 0,
             help_scroll: 0,
             message: None,
-            message_is_confirmation: false,
             pending: None,
             last_click: None,
             should_quit: false,
@@ -347,7 +343,6 @@ impl App {
         if let Some(id) = selected_task {
             self.select_task_by_id(id);
         }
-        self.recompute_cat_progress();
         self.dirty = true;
     }
 
@@ -600,7 +595,7 @@ impl App {
         match self.settings.sort.as_str() {
             "important" => view.sort_by_key(|i| std::cmp::Reverse(self.tasks[*i].importance)),
             "done" => view.sort_by_key(|i| self.tasks[*i].done),
-            "due" => view.sort_by_key(|i| {
+            "due" => view.sort_by_cached_key(|i| {
                 let due = &self.tasks[*i].due;
                 (due.is_empty(), due::sort_key(due))
             }),
@@ -632,12 +627,7 @@ impl App {
         }
         let last = self.view.len() - 1;
         let next = (self.task_index as isize + delta).clamp(0, last as isize) as usize;
-        if next != self.task_index {
-            self.task_index = next;
-            self.cancel_pending();
-            self.clear_typeahead();
-            self.dirty = true;
-        }
+        self.select_task(next);
     }
 
     pub fn select_task(&mut self, pos: usize) {
@@ -675,22 +665,17 @@ impl App {
         }
         self.typeahead_at = Some(now);
 
-        let query = self.typeahead.clone();
         match self.focus {
             Focus::Tasks => {
-                let titles: Vec<&str> = self
-                    .view
-                    .iter()
-                    .map(|&i| self.tasks[i].title.as_str())
-                    .collect();
-                if let Some(pos) = crate::fuzzy::best_index(&query, titles) {
+                let titles = self.view.iter().map(|&i| self.tasks[i].title.as_str());
+                if let Some(pos) = crate::fuzzy::best_index(&self.typeahead, titles) {
                     self.task_index = pos;
                     self.cancel_pending();
                 }
             }
             Focus::Sidebar => {
-                let names: Vec<&str> = self.categories.iter().map(|c| c.name.as_str()).collect();
-                if let Some(pos) = crate::fuzzy::best_index(&query, names)
+                let names = self.categories.iter().map(|c| c.name.as_str());
+                if let Some(pos) = crate::fuzzy::best_index(&self.typeahead, names)
                     && pos != self.cat_index
                 {
                     self.cat_index = pos;
@@ -707,12 +692,7 @@ impl App {
         }
         let last = self.categories.len() - 1;
         let next = (self.cat_index as isize + delta).clamp(0, last as isize) as usize;
-        if next != self.cat_index {
-            self.cat_index = next;
-            self.cancel_pending();
-            self.clear_typeahead();
-            self.on_category_changed();
-        }
+        self.select_category(next);
     }
 
     /// ↑/↓ stay inside the focused panel. Cross-panel moves use ←/→ or Tab.
@@ -777,13 +757,9 @@ impl App {
     }
 
     pub fn cancel_pending(&mut self) {
-        if self.pending.take().is_some()
-            && self.message_is_confirmation
-            && self.message.take().is_some()
-        {
+        if self.pending.take().is_some() && self.message.take().is_some() {
             self.dirty = true;
         }
-        self.message_is_confirmation = false;
     }
 
     fn clear_typeahead(&mut self) {
@@ -1364,7 +1340,6 @@ impl App {
         // the pending destructive action as part of the same state change.
         self.pending = None;
         self.message = Some(Message { text, kind, until });
-        self.message_is_confirmation = false;
         self.dirty = true;
     }
 
@@ -1373,11 +1348,8 @@ impl App {
         if let Some(m) = &self.message
             && Instant::now() >= m.until
         {
-            if self.message_is_confirmation {
-                self.pending = None;
-            }
+            self.pending = None;
             self.message = None;
-            self.message_is_confirmation = false;
             self.dirty = true;
             return true;
         }
@@ -1389,7 +1361,6 @@ impl App {
         let until = Instant::now() + CONFIRM_WINDOW;
         self.set_message_until(prompt.into(), MessageKind::Info, until);
         self.pending = Some((confirm, until));
-        self.message_is_confirmation = true;
     }
 
     /// Whether `confirm` is armed and still inside its window.

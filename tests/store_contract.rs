@@ -4,29 +4,8 @@ use mach::model::{Category, Task};
 use mach::store::{PurgeScope, RelativePosition, Store, StoreError, TaskPatch};
 use sha2::{Digest, Sha256};
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "mach-{label}-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&path).expect("create temporary data directory");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+mod common;
+use common::TempDir;
 
 fn write_test_png(path: &Path, color: [u8; 4]) {
     let image = image::RgbaImage::from_pixel(2, 2, image::Rgba(color));

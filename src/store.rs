@@ -25,7 +25,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::due;
 use crate::model::{
-    ALL_CATEGORY, Block, Category, MAX_BODY_LINES, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN,
+    Block, Category, MAX_BODY_LINES, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN,
     MAX_CATEGORY_DESC_LINES, MAX_CATEGORY_NAME_LEN, MAX_IMPORTANCE, MAX_NOTES_LINE_LEN,
     MAX_TASK_COUNT, MAX_TITLE_LEN, SCHEMA_VERSION, Task, caseless_key, text_byte_limit,
 };
@@ -992,7 +992,11 @@ impl Store {
         }
 
         let existing = load_snapshot(&tx)?;
-        if !existing.categories.is_empty() || !existing.tasks.is_empty() || existing.revision != 0 {
+        if !existing.categories.is_empty()
+            || !existing.tasks.is_empty()
+            || !existing.attachments.is_empty()
+            || existing.revision != 0
+        {
             return Err(StoreError::Corrupt(
                 "database contains data but has no completed legacy migration marker".into(),
             ));
@@ -1010,7 +1014,7 @@ impl Store {
         let has_legacy = categories_file.is_some() || tasks_file.is_some() || settings.is_some();
         if has_legacy {
             let mut data = StoreData {
-                revision: 0,
+                revision: 1,
                 categories: categories_file
                     .map(|file| {
                         file.categories
@@ -1032,7 +1036,7 @@ impl Store {
                 DueMode::LegacyMigration,
                 AttachmentMode::Persisted,
             )?;
-            persist_initial_snapshot(&tx, &data, 1)?;
+            persist_diff(&tx, &existing, &data)?;
         }
         tx.execute(
             "INSERT INTO metadata(key, value) VALUES (?1, '1')",
@@ -1403,73 +1407,6 @@ fn validate_stored_position(stored: i64, expected: usize, entity: &str) -> Resul
             "{entity} position {stored} is not contiguous (expected {expected})"
         )));
     }
-    Ok(())
-}
-
-fn persist_initial_snapshot(
-    tx: &Transaction<'_>,
-    data: &StoreData,
-    revision: u64,
-) -> Result<(), StoreError> {
-    {
-        let mut statement = tx.prepare(
-            "INSERT INTO categories(id, position, name, name_key, description)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
-        for (position, category) in data.categories.iter().enumerate() {
-            statement.execute(params![
-                category.id,
-                i64::try_from(position)
-                    .map_err(|_| StoreError::Validation("too many categories".into()))?,
-                category.name,
-                category_name_key(&category.name),
-                category.description,
-            ])?;
-        }
-    }
-    {
-        let mut statement = tx.prepare(
-            "INSERT INTO attachments(id, sha256, media_type, byte_len, storage_name)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
-        for attachment in &data.attachments {
-            statement.execute(params![
-                attachment.id,
-                attachment.sha256,
-                attachment.media_type,
-                sqlite_attachment_size(attachment.byte_len)?,
-                attachment.storage_name,
-            ])?;
-        }
-    }
-    {
-        let mut statement = tx.prepare(
-            "INSERT INTO tasks(
-                id, position, title, body_json, due, created, done, importance, category_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )?;
-        for (position, task) in data.tasks.iter().enumerate() {
-            let body_json = serde_json::to_string(&task.body).map_err(|error| {
-                StoreError::Corrupt(format!("could not encode task {:?}: {error}", task.id))
-            })?;
-            statement.execute(params![
-                task.id,
-                i64::try_from(position)
-                    .map_err(|_| StoreError::Validation("too many tasks".into()))?,
-                task.title,
-                body_json,
-                task.due,
-                task.created,
-                i64::from(task.done),
-                i64::from(task.importance),
-                task.category_id,
-            ])?;
-        }
-    }
-    for task in &data.tasks {
-        insert_task_attachment_rows(tx, task)?;
-    }
-    persist_app_state(tx, revision, Some(&data.settings))?;
     Ok(())
 }
 
@@ -2114,7 +2051,7 @@ fn normalize_and_validate(
     for category in &data.categories {
         validate_single_line(&category.id, "category id")?;
         validate_byte_limit(&category.id, ID_MAX_BYTES, "category id")?;
-        if category.id.is_empty() || category.id == ALL_CATEGORY {
+        if category.is_all() {
             return Err(StoreError::Validation(
                 "real category id cannot be empty".into(),
             ));
