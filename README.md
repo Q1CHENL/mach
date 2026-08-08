@@ -12,17 +12,33 @@ agents can drive.
 ## Install
 
 ```sh
-# 1. binary → ~/.local/bin
+# 1. latest verified release binary → ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/Q1CHENL/mach/main/install.sh | sh
 
-# 2. crates.io → ~/.cargo/bin  (needs rustup)
-cargo install mach-tui
+# 2. crates.io → ~/.cargo/bin (Rust 1.90+)
+cargo install --locked mach-tui
 
 # 3. local clone
-git clone https://github.com/Q1CHENL/mach.git && cd mach && cargo install --path .
+git clone https://github.com/Q1CHENL/mach.git && cd mach && cargo install --locked --path .
 ```
 
 Crate name **`mach-tui`**, binary **`mach`**.
+
+The release installer supports POSIX `sh`, verifies the selected binary against
+the release's `SHA256SUMS`, and replaces an existing install atomically. Pin an
+exact stable release when reproducibility matters:
+
+```sh
+tag=v0.2.0
+curl -fsSL "https://raw.githubusercontent.com/Q1CHENL/mach/${tag}/install.sh" \
+  | MACH_VERSION="${tag}" sh
+```
+
+Release builds declare macOS 10.12 as their minimum on Intel and macOS 11 on
+Apple Silicon. Linux binaries are built and runtime-smoked on glibc 2.28, with
+their imported GLIBC symbol floor checked before publishing. Other operating
+systems, CPU architectures, and musl-based distributions fail before
+installation instead of receiving an incompatible binary.
 
 ## CLI
 

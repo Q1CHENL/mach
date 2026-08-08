@@ -1,0 +1,50 @@
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "simplest-path"
+skip = [
+    { crate = "getrandom@0.2.17", reason = "ring and ratatui-image have not converged on getrandom 0.4" },
+    { crate = "hashbrown@0.16.1", reason = "ratatui's kasuari and lru dependencies require adjacent hashbrown releases" },
+    { crate = "linux-raw-sys@0.4.15", reason = "ratatui-image still requires rustix 0.38" },
+    { crate = "rand@0.8.7", reason = "ratatui-image still uses rand 0.8 while its quantette path uses rand 0.9" },
+    { crate = "rand_core@0.6.4", reason = "allowed with the reviewed rand 0.8 dependency" },
+    { crate = "rustix@0.38.44", reason = "ratatui-image has not converged on rustix 1" },
+    { crate = "syn@2.0.119", reason = "transitive proc macros have not all migrated to syn 3" },
+    { crate = "thiserror@1.0.69", reason = "ratatui-image still requires thiserror 1" },
+    { crate = "thiserror-impl@1.0.69", reason = "allowed with the reviewed thiserror 1 dependency" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

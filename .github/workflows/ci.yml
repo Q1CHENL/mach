@@ -6,32 +6,98 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   test:
-    name: test
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux stable
+            os: ubuntu-22.04
+            toolchain: stable
+            lint: true
+          - name: Linux MSRV 1.90
+            os: ubuntu-22.04
+            toolchain: 1.90.0
+            lint: false
+          - name: macOS stable
+            os: macos-15
+            toolchain: stable
+            lint: false
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ci-${{ matrix.os }}-${{ matrix.toolchain }}
 
-      - name: fmt
+      - name: Format
+        if: matrix.lint
         run: cargo fmt --all -- --check
 
-      - name: clippy
+      - name: Clippy
+        if: matrix.lint
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: test
-        run: cargo test --locked
+      - name: Test
+        run: cargo test --all-targets --locked
 
-      - name: release build
+      - name: Documentation
+        if: matrix.lint
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --locked
+
+      - name: Package
+        if: matrix.lint
+        run: cargo package --locked
+
+      - name: Release build
         run: cargo build --release --locked
+
+      - name: Installer contract
+        env:
+          TEST_SHELL: ${{ runner.os == 'Linux' && 'dash' || 'sh' }}
+        run: scripts/test-install.sh
+
+      - name: ShellCheck
+        if: matrix.lint
+        run: shellcheck install.sh scripts/*.sh
+
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: 1.90.0
+          command-arguments: --hide-inclusion-graph

@@ -5,77 +5,207 @@ on:
     tags: ["v*.*.*"]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RELEASE_RUST: 1.90.0
 
 jobs:
-  build:
+  verify:
+    name: verify tag and release contract
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: 1.90.0
+          command-arguments: --hide-inclusion-graph
+
+      - name: Install Rust ${{ env.RELEASE_RUST }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ env.RELEASE_RUST }}
+          components: rustfmt, clippy
+
+      - name: Verify tag, version, and main ancestry
+        run: |
+          version="$(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -er '.packages | map(select(.name == "mach-tui")) | if length == 1 then .[0].version else error("expected exactly one mach-tui package") end'
+          )"
+          printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          test "${GITHUB_REF_NAME}" = "v${version}"
+          git fetch --no-tags origin +main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD origin/main
+
+      - name: Verify source contract
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --all-targets --locked
+          RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --locked
+          cargo package --locked
+          cargo build --release --locked
+
+      - name: Verify installer contract
+        env:
+          TEST_SHELL: dash
+        run: |
+          shellcheck install.sh scripts/*.sh
+          scripts/test-install.sh
+
+  build-linux:
     name: ${{ matrix.target }}
+    needs: verify
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    container:
+      image: almalinux:8-minimal@sha256:4178368be5c3b49bd1c5708e3a217e837eefa6576226524fe11ae98cb0004846
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          # Both Mac targets on arm runners (x86_64 is cross-compiled).
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          microdnf install -y bash binutils ca-certificates curl gcc gcc-c++ git jq make pkgconf-pkg-config tar xz
+          microdnf clean all
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RELEASE_RUST }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ env.RELEASE_RUST }}
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
-
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package
+      - name: Build and smoke-test compatible binary
         run: |
-          src="target/${{ matrix.target }}/release/mach"
-          out="mach-${{ matrix.target }}"
-          cp "${src}" "${out}"
-          chmod +x "${out}"
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          cargo build --release --locked --target "${{ matrix.target }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/mach" "dist/mach-${{ matrix.target }}"
+          chmod 755 "dist/mach-${{ matrix.target }}"
+          version="$(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -er '.packages | map(select(.name == "mach-tui")) | if length == 1 then .[0].version else error("expected exactly one mach-tui package") end'
+          )"
+          scripts/smoke-release.sh "dist/mach-${{ matrix.target }}" "${{ matrix.target }}" "$version" 2.28
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mach-${{ matrix.target }}
-          path: mach-${{ matrix.target }}
+          path: dist/mach-${{ matrix.target }}
+          if-no-files-found: error
+
+  build-macos:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            deployment_target: "10.12"
+          - os: macos-15
+            target: aarch64-apple-darwin
+            deployment_target: "11.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RELEASE_RUST }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ env.RELEASE_RUST }}
+          targets: ${{ matrix.target }}
+
+      - name: Build and smoke-test compatible binary
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        run: |
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          cargo build --release --locked --target "${{ matrix.target }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/mach" "dist/mach-${{ matrix.target }}"
+          chmod 755 "dist/mach-${{ matrix.target }}"
+          version="$(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -er '.packages | map(select(.name == "mach-tui")) | if length == 1 then .[0].version else error("expected exactly one mach-tui package") end'
+          )"
+          scripts/smoke-release.sh "dist/mach-${{ matrix.target }}" "${{ matrix.target }}" "$version" "${{ matrix.deployment_target }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mach-${{ matrix.target }}
+          path: dist/mach-${{ matrix.target }}
           if-no-files-found: error
 
   publish:
-    name: publish release
-    needs: build
-    runs-on: ubuntu-latest
+    name: publish verified release
+    needs: [verify, build-linux, build-macos]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
-
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
 
-      - name: List assets
-        run: ls -la dist
+      - name: Verify artifact set and generate checksums
+        run: |
+          for target in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin
+          do
+            test -f "dist/mach-${target}"
+          done
+          test "$(find dist -maxdepth 1 -type f -name 'mach-*' | wc -l)" -eq 4
+          (cd dist && sha256sum mach-* > SHA256SUMS && sha256sum -c SHA256SUMS)
+
+      - name: Attest binary provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          files: dist/mach-*
+          files: |
+            dist/mach-*
+            dist/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
