@@ -773,6 +773,15 @@ impl StoreData {
         Ok(self.settings.clone())
     }
 
+    pub(crate) fn validate_as_stored(&mut self) -> Result<(), StoreError> {
+        normalize_and_validate(
+            self,
+            Local::now().naive_local(),
+            DueMode::Stored,
+            AttachmentMode::Persisted,
+        )
+    }
+
     fn normalize_and_validate_new_write(&mut self) -> Result<(), StoreError> {
         normalize_and_validate(
             self,
@@ -880,6 +889,18 @@ impl Store {
 
     pub fn database_path(&self) -> &Path {
         &self.paths.database
+    }
+
+    pub(crate) fn import_attachment_from(
+        &self,
+        source_path: &Path,
+    ) -> Result<Attachment, StoreError> {
+        if !self.persistent_attachments {
+            return Err(StoreError::Validation(
+                "image attachments require a persistent store".into(),
+            ));
+        }
+        import_attachment_from_path(source_path, &self.paths.images)
     }
 
     /// Cheap external-change probe for a long-running TUI.
@@ -1339,13 +1360,7 @@ fn load_snapshot(connection: &Connection) -> Result<StoreData, StoreError> {
         settings,
         attachments,
     };
-    normalize_and_validate(
-        &mut data,
-        Local::now().naive_local(),
-        DueMode::Stored,
-        AttachmentMode::Persisted,
-    )
-    .map_err(|error| match error {
+    data.validate_as_stored().map_err(|error| match error {
         StoreError::Validation(message) => StoreError::Corrupt(message),
         other => other,
     })?;
@@ -1849,11 +1864,18 @@ fn import_task_attachments(
 
 fn import_attachment(reference: &str, images_root: &Path) -> Result<Attachment, StoreError> {
     let source_path = crate::image::expand_in(reference, images_root);
-    let mut source = fs::File::open(&source_path)
-        .map_err(|error| StoreError::io("open image attachment", &source_path, error))?;
+    import_attachment_from_path(&source_path, images_root)
+}
+
+fn import_attachment_from_path(
+    source_path: &Path,
+    images_root: &Path,
+) -> Result<Attachment, StoreError> {
+    let mut source = fs::File::open(source_path)
+        .map_err(|error| StoreError::io("open image attachment", source_path, error))?;
     let metadata = source
         .metadata()
-        .map_err(|error| StoreError::io("inspect image attachment", &source_path, error))?;
+        .map_err(|error| StoreError::io("inspect image attachment", source_path, error))?;
     if !metadata.is_file() {
         return Err(StoreError::Validation(format!(
             "image attachment {} is not a regular file",
@@ -1873,7 +1895,7 @@ fn import_attachment(reference: &str, images_root: &Path) -> Result<Attachment, 
         loop {
             let read = source
                 .read(&mut buffer)
-                .map_err(|error| StoreError::io("read image attachment", &source_path, error))?;
+                .map_err(|error| StoreError::io("read image attachment", source_path, error))?;
             if read == 0 {
                 break;
             }

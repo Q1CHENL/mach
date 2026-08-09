@@ -10,6 +10,10 @@ pub enum SlashCommand {
     CopyTitle,
     /// Copy the selected task's title and body to the clipboard.
     CopyTask,
+    /// Export every task, category, and image to a portable archive.
+    Export,
+    /// Safely merge a portable archive into the current store.
+    Import,
     /// Toggle whether completed tasks are shown in the list.
     Done,
     /// Permanently remove done tasks (current category, or all in All Tasks).
@@ -21,13 +25,15 @@ pub enum SlashCommand {
 
 impl SlashCommand {
     /// Fixed palette order. Search is first when the menu opens empty.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Search,
         Self::Settings,
         Self::Help,
         Self::WhatsNew,
         Self::CopyTitle,
         Self::CopyTask,
+        Self::Export,
+        Self::Import,
         Self::Done,
         Self::Purge,
         Self::Update,
@@ -42,10 +48,19 @@ impl SlashCommand {
             Self::WhatsNew => "whatsnew",
             Self::CopyTitle => "copytitle",
             Self::CopyTask => "copy",
+            Self::Export => "export",
+            Self::Import => "import",
             Self::Done => "done",
             Self::Purge => "purge",
             Self::Update => "update",
             Self::Quit => "quit",
+        }
+    }
+
+    pub fn usage(self) -> &'static str {
+        match self {
+            Self::Import => "import <FILE>",
+            _ => self.id(),
         }
     }
 
@@ -57,6 +72,8 @@ impl SlashCommand {
             Self::WhatsNew => "What's new",
             Self::CopyTitle => "Copy title",
             Self::CopyTask => "Copy task",
+            Self::Export => "Export archive",
+            Self::Import => "Import archive",
             Self::Done => "Done tasks",
             Self::Purge => "Purge done",
             Self::Update => "Update",
@@ -72,6 +89,8 @@ impl SlashCommand {
             Self::WhatsNew => "release highlights",
             Self::CopyTitle => "copy selected task title",
             Self::CopyTask => "copy selected task title and body",
+            Self::Export => "save timestamped archive to ./",
+            Self::Import => "merge the specified archive",
             Self::Done => "show or hide completed tasks",
             Self::Purge => "delete completed tasks in this view",
             Self::Update => "install the latest verified build",
@@ -87,6 +106,8 @@ impl SlashCommand {
             Self::WhatsNew => &["whatsnew"],
             Self::CopyTitle => &["copytitle"],
             Self::CopyTask => &["copy", "copytask"],
+            Self::Export => &["export", "backup"],
+            Self::Import => &["import", "restore"],
             Self::Done => &["done", "hide", "show"],
             Self::Purge => &["purge"],
             Self::Update => &["update", "upgrade", "version"],
@@ -235,5 +256,17 @@ mod tests {
         let m = matching("copyt");
         assert!(m.contains(&SlashCommand::CopyTitle));
         assert!(m.contains(&SlashCommand::CopyTask));
+    }
+
+    #[test]
+    fn archive_commands_match_and_preserve_path_arguments() {
+        assert_eq!(matching("export"), vec![SlashCommand::Export]);
+        assert_eq!(matching("backup"), vec![SlashCommand::Export]);
+        assert_eq!(matching("import"), vec![SlashCommand::Import]);
+        assert_eq!(matching("restore"), vec![SlashCommand::Import]);
+        assert_eq!(
+            args_for(SlashCommand::Import, "import ~/My Tasks.mach"),
+            "~/My Tasks.mach"
+        );
     }
 }

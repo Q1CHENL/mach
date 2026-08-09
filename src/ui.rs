@@ -1940,7 +1940,11 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         due::now_string(&app.settings.date_format),
         Style::new().fg(theme.muted_color()),
     ));
-    let right_width = right.width() as u16;
+    // A transient message owns the status row. Its result or recovery detail
+    // is more useful for these few seconds than a clock that is always there
+    // otherwise. Persistent update notices still share the row with the time.
+    let show_clock = typing || update_activity.is_some() || app.message.is_none();
+    let right_width = if show_clock { right.width() as u16 } else { 0 };
     let [left_area, right_area] = Layout::horizontal([
         Constraint::Min(0),
         Constraint::Length(right_width.min(area.width)),
@@ -1949,7 +1953,9 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     // The clock is display-only, but it is still part of the command bar's
     // mouse target. A click there focuses the input and lands at its end.
     app.areas.command_bar = area;
-    f.render_widget(Paragraph::new(right), right_area);
+    if show_clock {
+        f.render_widget(Paragraph::new(right), right_area);
+    }
 
     let field = left_area.width.saturating_sub(2) as usize;
     let left = match app.mode {
@@ -1974,7 +1980,7 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                     MessageKind::Error => Style::new()
                         .fg(theme.error_color())
                         .add_modifier(Modifier::BOLD),
-                    MessageKind::Info => theme.accent_text(),
+                    MessageKind::Info => theme.plain(),
                 };
                 Line::from(Span::styled(truncate(text, field), style))
             }
@@ -2060,16 +2066,25 @@ fn draw_slash_palette(f: &mut Frame, app: &mut App, theme: &Theme, status: Rect)
         height,
     };
     app.areas.slash_menu = rect;
+    let visible_rows = usize::from(height.saturating_sub(2));
+    let selected_index = app.slash_index.min(commands.len() - 1);
+    let start = selected_index
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(commands.len().saturating_sub(visible_rows));
+    app.areas.slash_menu_start = start;
     let row_width = width.saturating_sub(2) as usize;
     let lines: Vec<Line> = commands
         .iter()
         .enumerate()
-        .map(|(i, cmd)| {
-            let selected = i == app.slash_index.min(commands.len() - 1);
+        .skip(start)
+        .take(visible_rows)
+        .map(|(index, cmd)| {
+            let selected = index == selected_index;
             dropdown_row(
                 theme,
                 selected,
-                &format!("/{:<12}", cmd.id()),
+                &format!("/{:<15}", cmd.usage()),
                 cmd.hint(),
                 row_width,
             )

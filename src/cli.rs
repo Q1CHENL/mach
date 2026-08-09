@@ -85,6 +85,12 @@ const HELP: &str = "\
       -t, --text TEXT
     delete INDEX         later indexes shift down
 
+  export [FILE]          portable .mach archive (tasks, categories, images)
+                         default: ./mach-export-YYYYMMDD-HHMMSS.mach
+
+  import FILE            safely merge a .mach archive
+                         identical records are skipped; conflicts abort
+
   update                 check GitHub for a newer release
     --install            verify and install release binary to ~/.local/bin
 
@@ -199,6 +205,18 @@ enum Command {
         task: String,
         #[command(subcommand)]
         action: Option<SubAction>,
+    },
+    /// Export tasks, categories, and images to a portable archive
+    Export {
+        /// Output file (default ./mach-export-YYYYMMDD-HHMMSS.mach)
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+    },
+    /// Safely merge a portable archive
+    Import {
+        /// Archive file
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
     },
     /// Check GitHub for a newer release (optional install)
     Update {
@@ -391,6 +409,15 @@ impl From<StoreError> for CliError {
         };
         Self {
             kind,
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<crate::archive::ArchiveError> for CliError {
+    fn from(error: crate::archive::ArchiveError) -> Self {
+        Self {
+            kind: error.kind(),
             message: error.to_string(),
         }
     }
@@ -622,11 +649,70 @@ fn dispatch(store: &mut Store, command: Command, json_mode: bool) -> Result<Rend
             ),
             Some(SubAction::Delete { index }) => cmd_subtask_delete(store, &task, index, json_mode),
         },
+        Command::Export { file } => cmd_export(store, file.as_deref(), json_mode),
+        Command::Import { file } => cmd_import(store, &file, json_mode),
         Command::Update { .. } => Err(CliError {
             kind: "internal",
             message: "update command crossed the data-command boundary".into(),
         }),
     }
+}
+
+fn cmd_export(
+    store: &Store,
+    path: Option<&std::path::Path>,
+    json_mode: bool,
+) -> Result<Rendered, CliError> {
+    let summary = crate::archive::export(store, path)?;
+    let value = json!({
+        "ok": true,
+        "archive": summary.path.display().to_string(),
+        "tasks": summary.tasks,
+        "categories": summary.categories,
+        "images": summary.images,
+    });
+    let contents =
+        crate::archive::content_count_text(summary.tasks, summary.categories, summary.images);
+    let plain = format!(
+        "exported {contents} to {}\n",
+        terminal_text(&summary.path.display().to_string())
+    );
+    Ok(rendered(json_mode, value, plain))
+}
+
+fn cmd_import(
+    store: &mut Store,
+    path: &std::path::Path,
+    json_mode: bool,
+) -> Result<Rendered, CliError> {
+    let outcome = crate::archive::import(store, path)?;
+    let summary = outcome.summary;
+    let value = json!({
+        "ok": true,
+        "archive": summary.path.display().to_string(),
+        "tasks_added": summary.tasks_added,
+        "tasks_unchanged": summary.tasks_unchanged,
+        "categories_added": summary.categories_added,
+        "categories_unchanged": summary.categories_unchanged,
+        "images_added": summary.images_added,
+        "images_unchanged": summary.images_unchanged,
+    });
+    let added = crate::archive::content_count_text(
+        summary.tasks_added,
+        summary.categories_added,
+        summary.images_added,
+    );
+    let unchanged = crate::archive::content_count_text(
+        summary.tasks_unchanged,
+        summary.categories_unchanged,
+        summary.images_unchanged,
+    );
+    let plain = if summary.tasks_added + summary.categories_added + summary.images_added == 0 {
+        format!("nothing imported; {unchanged} already present\n")
+    } else {
+        format!("imported {added}; {unchanged} already present\n")
+    };
+    Ok(rendered(json_mode, value, plain))
 }
 
 fn cmd_update(do_install: bool, json_mode: bool) -> Result<Rendered, CliError> {

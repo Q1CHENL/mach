@@ -37,6 +37,22 @@ mach --help
 Agents work well against the same CLI — stable flags, unique ID prefixes,
 and JSON output when you need it.
 
+Export every task, category and referenced image to one portable archive, then
+safely merge it into another mach data directory:
+
+```sh
+mach export tasks.mach
+mach --dir ~/restored-mach import tasks.mach
+```
+
+The TUI uses `/export` to create a timestamped `.mach` archive in the current
+directory and `/import <FILE>` to restore a specified archive. The CLI also
+accepts `mach export [FILE]`; without a file it uses the current directory.
+Export never overwrites an existing file.
+Re-importing identical records is a no-op. An ID, category-name or attachment
+metadata conflict aborts the whole merge before tasks, categories or attachment
+records change.
+
 The TUI checks in the background, including while it stays open. A successful
 check schedules the next one 24 hours later. Failed checks retry after an hour
 by default and honor server-provided backoff. Run `/update` to download,
@@ -51,6 +67,11 @@ appear in the running app.
 
 Existing JSON data is imported automatically on first launch and left
 untouched. Back up the whole directory while mach is closed.
+
+Portable `.mach` archives contain versioned JSON data plus the exact managed
+image bytes referenced by those tasks. Import verifies the archive structure,
+image format, size and SHA-256 before committing. App preferences and the
+separate update schedule are not part of a task archive.
 
 Another folder: `--dir PATH` or `MACH_DIR`.
 

@@ -54,7 +54,7 @@ const fn heading(left: &'static str, right: &'static str) -> HelpRow {
 }
 
 /// Two-column key reference. Empty strings are gaps.
-pub const HELP_COLUMNS: [HelpRow; 16] = [
+pub const HELP_COLUMNS: [HelpRow; 17] = [
     heading("MOVING AROUND", "TASKS & CATEGORIES"),
     row(
         "← →          between the two panels",
@@ -87,6 +87,7 @@ pub const HELP_COLUMNS: [HelpRow; 16] = [
         "/copy  /copytitle · /done",
         "Enter        calendar · new line · open",
     ),
+    row("/export  /import <FILE>", ""),
     row("/purge  /update  /quit", "Ctrl+Z / ⇧Z  undo · redo"),
     row("? this page", "Esc          back to the task list"),
 ];

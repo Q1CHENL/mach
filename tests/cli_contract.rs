@@ -508,3 +508,177 @@ fn move_and_purge_expose_manual_order_and_completed_cleanup() {
     let purged: serde_json::Value = serde_json::from_slice(&purged.stdout).unwrap();
     assert_eq!(purged["count"], 1);
 }
+
+#[test]
+fn archive_round_trip_preserves_tasks_categories_and_images() {
+    let source = TempDir::new("archive-source");
+    let destination = TempDir::new("archive-destination");
+    let output = TempDir::new("archive-output");
+    let archive = output.path().join("tasks.mach");
+    let screenshot = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/screenshot.png");
+    let body = format!(
+        "notes\n[ ] open step\n- bullet\n1. numbered\nhttps://example.com\n[image:{}]",
+        screenshot.display()
+    );
+
+    assert!(
+        mach(
+            source.path(),
+            &["categories", "add", "Work", "--description", "work notes",],
+        )
+        .status
+        .success()
+    );
+    assert!(
+        mach(
+            source.path(),
+            &[
+                "categories",
+                "add",
+                "Empty",
+                "--description",
+                "kept without tasks",
+            ],
+        )
+        .status
+        .success()
+    );
+    let added = mach(
+        source.path(),
+        &[
+            "--json",
+            "add",
+            "portable task",
+            "--category",
+            "Work",
+            "--body",
+            &body,
+            "--due",
+            "2026-08-10",
+            "--importance",
+            "2",
+        ],
+    );
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let added: serde_json::Value = serde_json::from_slice(&added.stdout).unwrap();
+    let task_id = added["id"].as_str().unwrap();
+    assert!(mach(source.path(), &["done", task_id]).status.success());
+
+    let exported = mach(
+        source.path(),
+        &["--json", "export", archive.to_str().unwrap()],
+    );
+    assert!(
+        exported.status.success(),
+        "export failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&exported.stdout),
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let exported: serde_json::Value = serde_json::from_slice(&exported.stdout).unwrap();
+    assert_eq!(exported["tasks"], 1);
+    assert_eq!(exported["categories"], 2);
+    assert_eq!(exported["images"], 1);
+
+    let imported = mach(
+        destination.path(),
+        &["--json", "import", archive.to_str().unwrap()],
+    );
+    assert!(
+        imported.status.success(),
+        "import failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&imported.stdout),
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let imported: serde_json::Value = serde_json::from_slice(&imported.stdout).unwrap();
+    assert_eq!(imported["tasks_added"], 1);
+    assert_eq!(imported["categories_added"], 2);
+    assert_eq!(imported["images_added"], 1);
+
+    let source_store = Store::open(source.path()).unwrap();
+    let source_snapshot = source_store.snapshot().unwrap();
+    let destination_store = Store::open(destination.path()).unwrap();
+    let destination_snapshot = destination_store.snapshot().unwrap();
+    assert_eq!(destination_snapshot.categories, source_snapshot.categories);
+    assert_eq!(destination_snapshot.tasks, source_snapshot.tasks);
+    assert_eq!(
+        destination_snapshot.attachments(),
+        source_snapshot.attachments()
+    );
+    let image = &destination_snapshot.attachments()[0];
+    assert_eq!(
+        std::fs::read(destination_store.images_dir().join(&image.storage_name)).unwrap(),
+        std::fs::read(screenshot).unwrap()
+    );
+}
+
+#[test]
+fn archive_import_is_idempotent_and_rejects_conflicting_ids_atomically() {
+    let source = TempDir::new("archive-merge-source");
+    let destination = TempDir::new("archive-merge-destination");
+    let output = TempDir::new("archive-merge-output");
+    let archive = output.path().join("tasks.mach");
+
+    let added = mach(source.path(), &["--json", "add", "from archive"]);
+    let added: serde_json::Value = serde_json::from_slice(&added.stdout).unwrap();
+    let imported_id = added["id"].as_str().unwrap();
+    assert!(
+        mach(source.path(), &["export", archive.to_str().unwrap()],)
+            .status
+            .success()
+    );
+    assert!(
+        mach(destination.path(), &["add", "already here"])
+            .status
+            .success()
+    );
+
+    let first = mach(
+        destination.path(),
+        &["--json", "import", archive.to_str().unwrap()],
+    );
+    assert!(first.status.success());
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["tasks_added"], 1);
+    assert_eq!(first["tasks_unchanged"], 0);
+    let after_first = Store::open(destination.path()).unwrap().snapshot().unwrap();
+
+    let second = mach(
+        destination.path(),
+        &["--json", "import", archive.to_str().unwrap()],
+    );
+    assert!(second.status.success());
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["tasks_added"], 0);
+    assert_eq!(second["tasks_unchanged"], 1);
+    let after_second = Store::open(destination.path()).unwrap().snapshot().unwrap();
+    assert_eq!(after_second.revision, after_first.revision);
+    assert_eq!(after_second.tasks, after_first.tasks);
+
+    assert!(
+        mach(
+            destination.path(),
+            &["edit", imported_id, "--title", "changed locally"],
+        )
+        .status
+        .success()
+    );
+    let before = Store::open(destination.path()).unwrap().snapshot().unwrap();
+    let conflicted = mach(
+        destination.path(),
+        &["--json", "import", archive.to_str().unwrap()],
+    );
+    assert!(!conflicted.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&conflicted.stdout).unwrap();
+    assert_eq!(error["kind"], "conflict");
+    assert!(error["error"].as_str().unwrap().contains(imported_id));
+
+    let after = Store::open(destination.path()).unwrap().snapshot().unwrap();
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.categories, before.categories);
+    assert_eq!(after.tasks, before.tasks);
+    assert_eq!(after.attachments(), before.attachments());
+}

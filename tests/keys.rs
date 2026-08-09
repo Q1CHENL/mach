@@ -1,5 +1,7 @@
 //! Key and mouse handling, driven through the real event entry point.
 
+use std::process::Command;
+
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{
@@ -9,11 +11,14 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 
 use mach::app::{App, Confirm, Focus, Mode};
-use mach::form::TaskForm;
+use mach::form::{TaskDraft, TaskForm};
 use mach::input::handle_event;
 use mach::model::{Category, Task};
 use mach::store::Store;
 use mach::ui;
+
+mod common;
+use common::TempDir;
 
 fn app() -> App {
     let mut store = Store::open_in_memory_with_paths(
@@ -535,6 +540,71 @@ fn slash_free_text_is_not_search() {
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(app.mode, Mode::Normal);
     assert!(!app.searching, "unknown slash text must not start search");
+}
+
+#[test]
+fn slash_export_rejects_a_path_argument() {
+    let mut app = app();
+    let output = TempDir::new("keys-export-argument");
+    let archive = output.path().join("not-allowed.mach");
+
+    press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+    for character in format!("export {}", archive.display()).chars() {
+        press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    assert_eq!(message(&app), "Usage: /export");
+    assert!(!archive.exists());
+}
+
+#[test]
+fn slash_import_uses_the_specified_archive_path() {
+    let (mut source, source_dir) = file_app();
+    source
+        .create_task(&TaskDraft::new("portable from TUI"))
+        .expect("create source task");
+    let archive_dir = TempDir::new("keys-import-archive");
+    let archive = archive_dir.path().join("tasks.mach");
+    let exported = Command::new(env!("CARGO_BIN_EXE_mach"))
+        .arg("--dir")
+        .arg(&source_dir)
+        .arg("export")
+        .arg(&archive)
+        .output()
+        .expect("export archive through CLI");
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+
+    let (mut destination, destination_dir) = file_app();
+    press(&mut destination, KeyCode::Char('/'), KeyModifiers::NONE);
+    for character in format!("import {}", archive.display()).chars() {
+        press(
+            &mut destination,
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        );
+    }
+    press(&mut destination, KeyCode::Enter, KeyModifiers::NONE);
+
+    assert_eq!(destination.tasks.len(), 1, "{}", message(&destination));
+    assert_eq!(destination.tasks[0].title, "portable from TUI");
+    assert!(message(&destination).contains("Imported 1 task"));
+    let remaining = destination
+        .message
+        .as_ref()
+        .unwrap()
+        .until
+        .saturating_duration_since(std::time::Instant::now());
+    assert!(remaining >= std::time::Duration::from_secs(7));
+
+    drop(source);
+    drop(destination);
+    let _ = std::fs::remove_dir_all(source_dir);
+    let _ = std::fs::remove_dir_all(destination_dir);
 }
 
 #[test]

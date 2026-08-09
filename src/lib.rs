@@ -1,6 +1,7 @@
 //! mach — a powerful yet easy-to-use todo TUI, built with ratatui.
 
 pub mod app;
+mod archive;
 pub mod banner;
 pub mod body;
 pub mod cli;

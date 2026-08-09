@@ -55,6 +55,7 @@ unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 ureq = "3"
 uuid = { version = "1.24.0", features = ["v4"] }
+zip = { version = "8.6.0", default-features = false }
 
 [profile.release]
 strip = true

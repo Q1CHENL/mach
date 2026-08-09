@@ -731,6 +731,59 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
             }
             None => app.info("No task selected"),
         },
+        SlashCommand::Export => {
+            let argument = args_for(cmd, query);
+            if !argument.is_empty() {
+                app.error("Usage: /export");
+                return;
+            }
+            match app.export_archive() {
+                Ok(summary) => {
+                    let contents = crate::archive::content_count_text(
+                        summary.tasks,
+                        summary.categories,
+                        summary.images,
+                    );
+                    app.archive_result(format!(
+                        "Exported to {} · {contents}",
+                        summary.short_path()
+                    ));
+                }
+                Err(error) => app.error(format!("Could not export: {error}")),
+            }
+        }
+        SlashCommand::Import => {
+            let argument = args_for(cmd, query);
+            if argument.is_empty() {
+                app.error("Usage: /import <FILE>");
+            } else {
+                match app.import_archive(std::path::Path::new(&argument)) {
+                    Ok(summary) => {
+                        let added = crate::archive::content_count_text(
+                            summary.tasks_added,
+                            summary.categories_added,
+                            summary.images_added,
+                        );
+                        let unchanged = crate::archive::content_count_text(
+                            summary.tasks_unchanged,
+                            summary.categories_unchanged,
+                            summary.images_unchanged,
+                        );
+                        let message = if summary.tasks_added
+                            + summary.categories_added
+                            + summary.images_added
+                            == 0
+                        {
+                            format!("Nothing imported; {unchanged} already present")
+                        } else {
+                            format!("Imported {added}; {unchanged} already present")
+                        };
+                        app.archive_result(message);
+                    }
+                    Err(error) => app.error(format!("Could not import: {error}")),
+                }
+            }
+        }
         SlashCommand::Done => {
             if let Some(hidden) = app.toggle_hide_done() {
                 if hidden {
@@ -1558,10 +1611,11 @@ fn handle_slash_mouse(app: &mut App, mouse: MouseEvent) {
                 && mouse.row + 1 < rect.bottom()
             {
                 let row = (mouse.row - rect.y - 1) as usize;
+                let index = app.areas.slash_menu_start + row;
                 let query = app.input.value();
                 let commands = crate::slash::matching(&query);
-                if let Some(command) = commands.get(row).copied() {
-                    app.slash_index = row;
+                if let Some(command) = commands.get(index).copied() {
+                    app.slash_index = index;
                     close_slash(app);
                     run_slash(app, command, &query);
                 }

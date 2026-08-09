@@ -77,6 +77,23 @@ pub enum MessageKind {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageLifetime {
+    Brief,
+    Standard,
+    Long,
+}
+
+impl MessageLifetime {
+    const fn duration(self) -> Duration {
+        match self {
+            Self::Brief => Duration::from_secs(2),
+            Self::Standard => Duration::from_secs(4),
+            Self::Long => Duration::from_secs(8),
+        }
+    }
+}
+
 pub struct Message {
     pub text: String,
     pub kind: MessageKind,
@@ -101,13 +118,10 @@ pub enum Confirm {
     Quit,
 }
 
-/// How long a double-press confirm stays armed.
-const CONFIRM_WINDOW: Duration = Duration::from_millis(2000);
-
 /// Idle gap after which type-to-jump starts a new query.
 const TYPEAHEAD_TIMEOUT: Duration = Duration::from_millis(800);
-
-const UPDATE_RESULT_DURATION: Duration = Duration::from_secs(10);
+/// Bound free-form commands while leaving room for full filesystem paths.
+const MAX_SLASH_INPUT_LEN: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateJobKind {
@@ -172,6 +186,8 @@ pub struct Areas {
     pub done_x: Option<u16>,
     /// Open top-level command palette, including its border.
     pub slash_menu: Rect,
+    /// Index of the first command drawn inside a clipped command palette.
+    pub slash_menu_start: usize,
 }
 
 pub const SETTINGS_ITEMS: [&str; 4] = ["Sort", "Theme", "Date format", "Task preview"];
@@ -454,6 +470,27 @@ impl App {
             self.select_task_by_id(id);
         }
         self.dirty = true;
+    }
+
+    pub(crate) fn export_archive(
+        &self,
+    ) -> Result<crate::archive::ExportSummary, crate::archive::ArchiveError> {
+        crate::archive::export(&self.store, None)
+    }
+
+    pub(crate) fn import_archive(
+        &mut self,
+        path: &Path,
+    ) -> Result<crate::archive::ImportSummary, crate::archive::ArchiveError> {
+        let selected_category = self.current_category_id().to_string();
+        let selected_task = self.selected_task().map(|task| task.id.clone());
+        let outcome = crate::archive::import(&mut self.store, path)?;
+        self.apply_snapshot(
+            outcome.snapshot,
+            &selected_category,
+            selected_task.as_deref(),
+        );
+        Ok(outcome.summary)
     }
 
     /// Commit against the transaction's fresh snapshot and apply the exact
@@ -814,7 +851,7 @@ impl App {
     }
 
     fn show_update_message(&mut self, text: String, kind: MessageKind) {
-        self.set_message_until(text, kind, Instant::now() + UPDATE_RESULT_DURATION);
+        self.set_message(text, kind, MessageLifetime::Long);
     }
 
     pub fn mark_dirty(&mut self) {
@@ -1691,7 +1728,7 @@ impl App {
         }
         self.update_notice = None;
         self.mode = Mode::Slash;
-        self.input = TextInput::new("", 128);
+        self.input = TextInput::new("", MAX_SLASH_INPUT_LEN);
         self.slash_index = 0;
         self.dirty = true;
     }
@@ -1745,11 +1782,15 @@ impl App {
     // ------------------------------------------------------------ messages
 
     pub fn info(&mut self, text: impl Into<String>) {
-        self.set_message(text.into(), MessageKind::Info, 2000);
+        self.set_message(text.into(), MessageKind::Info, MessageLifetime::Brief);
+    }
+
+    pub(crate) fn archive_result(&mut self, text: impl Into<String>) {
+        self.set_message(text.into(), MessageKind::Info, MessageLifetime::Long);
     }
 
     pub fn error(&mut self, text: impl Into<String>) {
-        self.set_message(text.into(), MessageKind::Error, 2500);
+        self.set_message(text.into(), MessageKind::Error, MessageLifetime::Standard);
     }
 
     pub(crate) fn status_message(&self) -> Option<(&str, MessageKind)> {
@@ -1773,8 +1814,8 @@ impl App {
             .is_some_and(|job| job.kind == UpdateJobKind::Install)
     }
 
-    fn set_message(&mut self, text: String, kind: MessageKind, millis: u64) {
-        self.set_message_until(text, kind, Instant::now() + Duration::from_millis(millis));
+    fn set_message(&mut self, text: String, kind: MessageKind, lifetime: MessageLifetime) {
+        self.set_message_until(text, kind, Instant::now() + lifetime.duration());
     }
 
     fn set_message_until(&mut self, text: String, kind: MessageKind, until: Instant) {
@@ -1801,7 +1842,7 @@ impl App {
 
     /// Arm a destructive key on its second press, and say so.
     pub fn ask_confirm(&mut self, confirm: Confirm, prompt: impl Into<String>) {
-        let until = Instant::now() + CONFIRM_WINDOW;
+        let until = Instant::now() + MessageLifetime::Brief.duration();
         self.set_message_until(prompt.into(), MessageKind::Info, until);
         self.pending = Some((confirm, until));
     }
@@ -1899,6 +1940,20 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn assert_message_lifetime(app: &App, expected: Duration) {
+        let remaining = app
+            .message
+            .as_ref()
+            .expect("temporary message")
+            .until
+            .saturating_duration_since(Instant::now());
+        assert!(remaining <= expected, "{remaining:?} exceeds {expected:?}");
+        assert!(
+            remaining >= expected.saturating_sub(Duration::from_millis(100)),
+            "{remaining:?} is shorter than {expected:?}"
+        );
+    }
+
     fn update_result(newer: bool) -> crate::update::CheckResult {
         crate::update::CheckResult {
             current: "0.2.0".into(),
@@ -1959,6 +2014,28 @@ mod tests {
             app.typeahead.graphemes(true).count() <= MAX_TITLE_LEN,
             "a held key must not grow the navigation query without bound"
         );
+    }
+
+    #[test]
+    fn transient_messages_use_three_shared_lifetimes() {
+        let store = Store::open_in_memory_with_paths("/tmp/mach-message-lifetime-test")
+            .expect("open in-memory store");
+        let mut app = App::with_store("test", store).expect("build app");
+
+        app.info("brief info");
+        assert_message_lifetime(&app, Duration::from_secs(2));
+
+        app.ask_confirm(Confirm::Quit, "brief confirmation");
+        assert_message_lifetime(&app, Duration::from_secs(2));
+
+        app.error("standard error");
+        assert_message_lifetime(&app, Duration::from_secs(4));
+
+        app.archive_result("long archive result");
+        assert_message_lifetime(&app, Duration::from_secs(8));
+
+        app.show_update_message("long update result".into(), MessageKind::Info);
+        assert_message_lifetime(&app, Duration::from_secs(8));
     }
 
     #[test]
