@@ -408,7 +408,7 @@ impl BodyEditor {
     /// or pictures — `/` only offers a bullet.
     pub fn plain(text: &str) -> Self {
         let blocks: Vec<Block> = text
-            .lines()
+            .split('\n')
             .map(|line| match line.strip_prefix("- ") {
                 Some(rest) => Block::bullet(rest),
                 None => Block::text(line),
@@ -528,12 +528,16 @@ impl BodyEditor {
             .join("\n")
     }
 
-    /// The blocks worth saving: blank lines are dropped.
+    /// The blocks worth saving. Empty prose lines are layout and round-trip
+    /// with surrounding content; an entirely empty editor stays an empty body.
     pub fn value(&self) -> Vec<Block> {
+        if self.is_empty() {
+            return Vec::new();
+        }
         self.lines
             .iter()
             .filter_map(|line| match line {
-                Line::Text(text) => block_from_input(text, Block::text),
+                Line::Text(text) => Some(Block::text(text.value().trim_end())),
                 Line::Todo { text, done } => {
                     block_from_input(text, |value| Block::todo(value, *done))
                 }
@@ -1803,7 +1807,7 @@ impl BodyEditor {
                 input.backspace();
             }
         }
-        match command {
+        let payload = match command {
             Command::Copy => Some(CopyPayload::Text(self.text_for_copy())),
             Command::CopyImage => self.image_for_copy().map(CopyPayload::Image),
             Command::CopyAll => Some(CopyPayload::All(self.lines_for_copy_all())),
@@ -1828,7 +1832,15 @@ impl BodyEditor {
                 };
                 None
             }
+        };
+        if matches!(
+            command,
+            Command::Copy | Command::CopyImage | Command::CopyAll
+        ) && self.input().is_some_and(|input| input.is_empty())
+        {
+            self.remove_block();
         }
+        payload
     }
 
     /// Puts a block in at the cursor, replacing the line when it is an
@@ -2116,6 +2128,28 @@ mod tests {
         e.newline();
         type_in(&mut e, "second");
         assert_eq!(e.value(), vec![Block::text("first"), Block::text("second")]);
+    }
+
+    #[test]
+    fn body_value_round_trips_blank_rows_around_content() {
+        let mut e = editor(&[]);
+        assert!(e.newline());
+        type_in(&mut e, "first");
+        assert!(e.newline());
+        assert!(e.newline());
+        type_in(&mut e, "second");
+        assert!(e.newline());
+
+        let expected = vec![
+            Block::text(""),
+            Block::text("first"),
+            Block::text(""),
+            Block::text("second"),
+            Block::text(""),
+        ];
+        assert_eq!(e.value(), expected);
+        assert_eq!(editor(&e.value()).value(), expected);
+        assert!(editor(&[]).value().is_empty());
     }
 
     #[test]
@@ -2433,6 +2467,18 @@ mod tests {
         let e = BodyEditor::plain("intro\n- first\n- second");
         assert_eq!(e.value().len(), 3);
         assert_eq!(e.plain_value(), "intro\n- first\n- second");
+    }
+
+    #[test]
+    fn plain_description_round_trips_blank_rows() {
+        let description = "\nfirst\n\nsecond\n";
+        let e = BodyEditor::plain(description);
+
+        assert_eq!(e.plain_value(), description);
+        assert_eq!(
+            BodyEditor::plain(&e.plain_value()).plain_value(),
+            description
+        );
     }
 
     #[test]
