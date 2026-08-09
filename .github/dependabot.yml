@@ -4,13 +4,25 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      cargo-patch-updates:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        # Cargo has many 0.x crates where a minor bump can break APIs.
+        # Keep those upgrades isolated and group only low-risk patches.
+        update-types:
+          - patch
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
+      interval: monthly
+    open-pull-requests-limit: 1
+    groups:
+      github-actions-updates:
+        applies-to: version-updates
+        patterns:
+          - "*"
