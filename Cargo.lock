@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "mach-tui"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "arboard",
  "base64",

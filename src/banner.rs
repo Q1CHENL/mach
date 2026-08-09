@@ -15,16 +15,16 @@ pub const BANNER_WIDTH: u16 = 35;
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
     (
-        "Responsive task preview",
-        "Narrow panes stack fields so editing stays in place.",
+        "Updates that keep checking",
+        "Mach checks again while it stays open.",
     ),
     (
-        "Clickable command bar",
-        "Click the command bar or clock to focus it.",
+        "Smarter retries",
+        "Failed checks retry sooner and honor GitHub's wait time.",
     ),
     (
-        "Consistent forms",
-        "Category and task editors now share the same spacing.",
+        "Consistent update notices",
+        "Every data store sees the same available update.",
     ),
 ];
 
