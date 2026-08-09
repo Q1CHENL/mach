@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use chrono::NaiveTime;
+use chrono::{NaiveTime, Utc};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
@@ -630,12 +630,38 @@ fn dispatch(store: &mut Store, command: Command, json_mode: bool) -> Result<Rend
 }
 
 fn cmd_update(do_install: bool, json_mode: bool) -> Result<Rendered, CliError> {
-    let info = crate::update::check().map_err(CliError::update)?;
-    let install = if do_install && info.newer {
-        Some(crate::update::install(&info).map_err(CliError::update)?)
-    } else {
-        None
+    let now = Utc::now().timestamp();
+    let mut update_state = crate::update_state::UpdateStateStore::open_default().ok();
+    let lease = update_state
+        .as_mut()
+        .and_then(|store| store.claim_manual(now).ok());
+    let checked = match crate::update::check_with_etag(None) {
+        Ok(crate::update::CheckResponse::Modified { info, etag }) => (info, etag),
+        Ok(crate::update::CheckResponse::NotModified) => {
+            if let (Some(store), Some(lease)) = (update_state.as_mut(), lease.as_ref()) {
+                let _ = store.finish_failure(lease, Utc::now().timestamp(), None);
+            }
+            return Err(CliError::update(
+                "GitHub returned 304 without a conditional request",
+            ));
+        }
+        Err(error) => {
+            if let (Some(store), Some(lease)) = (update_state.as_mut(), lease.as_ref()) {
+                let _ = store.finish_failure(lease, Utc::now().timestamp(), error.retry_at);
+            }
+            return Err(CliError::update(error.message));
+        }
     };
+    let (info, etag) = checked;
+    let install = if do_install && info.newer {
+        crate::update::install(&info).map(Some)
+    } else {
+        Ok(None)
+    };
+    if let (Some(store), Some(lease)) = (update_state.as_mut(), lease.as_ref()) {
+        let _ = store.finish_modified(lease, Utc::now().timestamp(), etag.as_deref(), &info.latest);
+    }
+    let install = install.map_err(CliError::update)?;
 
     let value = json!({
         "ok": true,

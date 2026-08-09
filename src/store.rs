@@ -92,7 +92,7 @@ impl StoreError {
         Self::Validation(message.into())
     }
 
-    fn io(operation: &'static str, path: &Path, source: std::io::Error) -> Self {
+    pub(crate) fn io(operation: &'static str, path: &Path, source: std::io::Error) -> Self {
         Self::Io {
             operation,
             path: path.to_path_buf(),
@@ -1094,7 +1094,7 @@ fn expand_user_with_home(path: PathBuf, home: Option<&Path>) -> Result<PathBuf, 
     Ok(path)
 }
 
-fn configure_connection(connection: &Connection) -> Result<(), StoreError> {
+pub(crate) fn configure_connection(connection: &Connection) -> Result<(), StoreError> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     let mode: String = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
@@ -1106,7 +1106,7 @@ fn configure_connection(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn configure_resource_limits(connection: &Connection) -> Result<(), StoreError> {
+pub(crate) fn configure_resource_limits(connection: &Connection) -> Result<(), StoreError> {
     connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
     Ok(())
 }
@@ -2033,6 +2033,9 @@ fn normalize_and_validate(
     due_mode: DueMode,
     attachment_mode: AttachmentMode,
 ) -> Result<(), StoreError> {
+    // This compatibility-only field moved to the application-level updater
+    // store. Never let it re-enter persisted task settings.
+    data.settings.last_update_check_at = None;
     if data.categories.len() > MAX_CATEGORY_COUNT {
         return Err(StoreError::Validation(format!(
             "category limit is {MAX_CATEGORY_COUNT}"
@@ -2351,14 +2354,6 @@ fn validate_settings(settings: &Settings) -> Result<(), StoreError> {
         validate_single_line(version, "last-run version")?;
         validate_byte_limit(version, SETTINGS_VALUE_MAX_BYTES, "last-run version")?;
     }
-    if settings
-        .last_update_check_at
-        .is_some_and(|timestamp| timestamp < 0)
-    {
-        return Err(StoreError::Validation(
-            "last update check timestamp cannot be negative".into(),
-        ));
-    }
     if !DATE_FORMATS.contains(&settings.date_format.as_str()) {
         return Err(StoreError::Validation(format!(
             "unknown date format {:?}",
@@ -2436,7 +2431,7 @@ struct CategoriesFile {
     categories: Vec<Category>,
 }
 
-fn ensure_private_directory(path: &Path) -> Result<(), StoreError> {
+pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), StoreError> {
     let created = match fs::create_dir(path) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => false,
@@ -2474,7 +2469,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn prepare_private_database_file(path: &Path) -> Result<(), StoreError> {
+pub(crate) fn prepare_private_database_file(path: &Path) -> Result<(), StoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -2494,7 +2489,7 @@ fn prepare_private_database_file(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn set_private_file(path: &Path) -> Result<(), StoreError> {
+pub(crate) fn set_private_file(path: &Path) -> Result<(), StoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

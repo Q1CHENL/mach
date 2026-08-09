@@ -2,14 +2,16 @@
 //!
 //! Source of truth: GitHub Releases on `Q1CHENL/mach`. Fresh installs use the
 //! release installer; self-updates download and verify the exact release asset
-//! directly. The TUI checks in the background at most once per day; install
+//! directly. The TUI schedules its next background check one day after success;
+//! failures retry after an hour by default and honor server backoff. Install
 //! remains an explicit action through `/update` or `mach update --install`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
+use chrono::Utc;
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -42,6 +44,30 @@ pub struct CheckResult {
     pub asset_name: String,
     pub asset_url: String,
     pub checksums_url: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum CheckResponse {
+    Modified {
+        info: CheckResult,
+        etag: Option<String>,
+    },
+    NotModified,
+}
+
+#[derive(Debug)]
+pub(crate) struct CheckFailure {
+    pub(crate) message: String,
+    pub(crate) retry_at: Option<i64>,
+}
+
+impl CheckFailure {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retry_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,29 +112,46 @@ pub fn current_version() -> &'static str {
 /// binary and its checksum manifest. Requiring those assets excludes the
 /// disconnected legacy Python releases without blocking legitimate majors.
 pub fn check() -> Result<CheckResult, String> {
+    match check_with_etag(None).map_err(|error| error.message)? {
+        CheckResponse::Modified { info, .. } => Ok(info),
+        CheckResponse::NotModified => {
+            Err("GitHub returned 304 without a conditional request".into())
+        }
+    }
+}
+
+/// Conditional release check used by the long-running TUI scheduler.
+pub(crate) fn check_with_etag(etag: Option<&str>) -> Result<CheckResponse, CheckFailure> {
     let current = current_version().to_string();
-    let body = http_get(RELEASES_URL)?;
+    let ReleaseDocument::Modified { body, etag } = fetch_releases(RELEASES_URL, etag)? else {
+        return Ok(CheckResponse::NotModified);
+    };
     let releases: Vec<GhRelease> = serde_json::from_str(&body)
-        .map_err(|e| format!("could not parse GitHub release JSON: {e}"))?;
-    let asset_name = current_asset_name()?;
+        .map_err(|e| CheckFailure::new(format!("could not parse GitHub release JSON: {e}")))?;
+    let asset_name = current_asset_name().map_err(CheckFailure::new)?;
     let selected = select_release(&releases, &asset_name).ok_or_else(|| {
-        format!("no stable GitHub release ships both {asset_name} and {CHECKSUMS_ASSET}")
+        CheckFailure::new(format!(
+            "no stable GitHub release ships both {asset_name} and {CHECKSUMS_ASSET}"
+        ))
     })?;
     let latest = selected.version.to_string();
     let newer = selected.version
         > Version::parse(&current)
-            .map_err(|e| format!("invalid current version {current:?}: {e}"))?;
+            .map_err(|e| CheckFailure::new(format!("invalid current version {current:?}: {e}")))?;
 
-    Ok(CheckResult {
-        current,
-        latest,
-        tag: selected.tag,
-        newer,
-        prerelease: false,
-        release_url: selected.release_url,
-        asset_name,
-        asset_url: selected.asset_url,
-        checksums_url: selected.checksums_url,
+    Ok(CheckResponse::Modified {
+        info: CheckResult {
+            current,
+            latest,
+            tag: selected.tag,
+            newer,
+            prerelease: false,
+            release_url: selected.release_url,
+            asset_name,
+            asset_url: selected.asset_url,
+            checksums_url: selected.checksums_url,
+        },
+        etag,
     })
 }
 
@@ -482,8 +525,94 @@ struct GhAsset {
     browser_download_url: String,
 }
 
-fn http_get(url: &str) -> Result<String, String> {
-    http_get_text(url, TIMEOUT, "application/vnd.github+json", map_ureq_err)
+#[derive(Debug)]
+enum ReleaseDocument {
+    Modified { body: String, etag: Option<String> },
+    NotModified,
+}
+
+fn fetch_releases(url: &str, etag: Option<&str>) -> Result<ReleaseDocument, CheckFailure> {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(TIMEOUT))
+        .http_status_as_error(false)
+        .build();
+    let agent: ureq::Agent = config.into();
+    let mut request = agent
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/vnd.github+json");
+    if let Some(etag) = etag {
+        request = request.header("If-None-Match", etag);
+    }
+    let mut response = request
+        .call()
+        .map_err(|error| CheckFailure::new(map_ureq_err(error)))?;
+    let status = response.status().as_u16();
+    if status == 304 {
+        return Ok(ReleaseDocument::NotModified);
+    }
+    if status != 200 {
+        let now = Utc::now().timestamp();
+        let retry_at = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_retry_after(value, now))
+            .or_else(|| {
+                let remaining = response
+                    .headers()
+                    .get("X-RateLimit-Remaining")
+                    .and_then(|value| value.to_str().ok());
+                (remaining == Some("0"))
+                    .then(|| {
+                        response
+                            .headers()
+                            .get("X-RateLimit-Reset")
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(parse_nonnegative_decimal)
+                    })
+                    .flatten()
+            });
+        let message = if status == 404 {
+            "no GitHub releases yet — publish one, or install from git".into()
+        } else {
+            format!("GitHub API HTTP {status}")
+        };
+        return Err(CheckFailure { message, retry_at });
+    }
+    let response_etag = response
+        .headers()
+        .get("ETag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = read_bounded_text(response.body_mut().as_reader(), MAX_TEXT_BYTES)
+        .map_err(CheckFailure::new)?;
+    Ok(ReleaseDocument::Modified {
+        body,
+        etag: response_etag,
+    })
+}
+
+fn parse_retry_after(value: &str, now: i64) -> Option<i64> {
+    let value = value.trim();
+    if let Some(seconds) = parse_nonnegative_decimal(value) {
+        return Some(now.saturating_add(seconds));
+    }
+    let timestamp = httpdate::parse_http_date(value).ok()?;
+    let seconds = timestamp.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(i64::try_from(seconds).unwrap_or(i64::MAX))
+}
+
+fn parse_nonnegative_decimal(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(value.bytes().fold(0_i64, |number, byte| {
+        number
+            .saturating_mul(10)
+            .saturating_add(i64::from(byte - b'0'))
+    }))
 }
 
 fn http_get_text(
@@ -563,6 +692,30 @@ pub fn is_newer(latest: &str, current: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    fn serve_once(response: impl Into<String>) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        let response = response.into();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let _ = request_tx.send(String::from_utf8(request).unwrap());
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}/releases"), request_rx)
+    }
 
     fn release(tag: &str, prerelease: bool, assets: &[(&str, &str)]) -> GhRelease {
         GhRelease {
@@ -615,6 +768,87 @@ mod tests {
         assert_eq!(is_newer("0.1.0", "0.2.0"), Some(false));
         assert_eq!(is_newer("1.0.0", "0.9.9"), Some(true));
         assert_eq!(is_newer("0.1.1-rc.1", "0.1.0"), Some(true));
+    }
+
+    #[test]
+    fn conditional_release_request_reuses_etag_and_accepts_not_modified() {
+        let (url, request) = serve_once(
+            "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+
+        assert!(matches!(
+            fetch_releases(&url, Some("\"release-etag\"")).unwrap(),
+            ReleaseDocument::NotModified
+        ));
+        assert!(
+            request
+                .recv()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("if-none-match: \"release-etag\"")
+        );
+    }
+
+    #[test]
+    fn modified_release_response_captures_the_new_etag() {
+        let (url, _) = serve_once(
+            "HTTP/1.1 200 OK\r\nETag: \"next-etag\"\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+        );
+
+        let ReleaseDocument::Modified { body, etag } = fetch_releases(&url, None).unwrap() else {
+            panic!("a 200 response must carry a release document");
+        };
+        assert_eq!(body, "[]");
+        assert_eq!(etag.as_deref(), Some("\"next-etag\""));
+    }
+
+    #[test]
+    fn rate_limited_release_request_preserves_retry_after() {
+        let (url, _) = serve_once(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let before = Utc::now().timestamp();
+
+        let error = fetch_releases(&url, None).expect_err("rate limit should fail the check");
+
+        assert_eq!(error.message, "GitHub API HTTP 429");
+        assert!(error.retry_at.is_some_and(|retry_at| {
+            retry_at >= before + 120 && retry_at <= Utc::now().timestamp() + 120
+        }));
+    }
+
+    #[test]
+    fn retry_after_accepts_every_http_date_form() {
+        let expected = 784_111_777;
+        for value in [
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+        ] {
+            let (url, _) = serve_once(format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {value}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ));
+
+            let error = fetch_releases(&url, None).expect_err("rate limit should fail the check");
+
+            assert_eq!(error.retry_at, Some(expected), "failed to parse {value}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_reset_is_used_only_when_the_budget_is_exhausted() {
+        let reset = Utc::now().timestamp() + 3_600;
+        let (url, _) = serve_once(format!(
+            "HTTP/1.1 500 Internal Server Error\r\nX-RateLimit-Remaining: 1\r\nX-RateLimit-Reset: {reset}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let error = fetch_releases(&url, None).expect_err("server error should fail the check");
+        assert_eq!(error.retry_at, None);
+
+        let (url, _) = serve_once(format!(
+            "HTTP/1.1 429 Too Many Requests\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {reset}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let error = fetch_releases(&url, None).expect_err("rate limit should fail the check");
+        assert_eq!(error.retry_at, Some(reset));
     }
 
     #[test]

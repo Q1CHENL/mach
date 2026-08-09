@@ -20,6 +20,7 @@ pub mod theme;
 pub mod ui;
 pub mod undo;
 pub mod update;
+mod update_state;
 
 use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
@@ -61,7 +62,12 @@ pub fn run_tui(store: Store) -> io::Result<()> {
     // Load and validate persistent state before changing terminal modes. A bad
     // data file must never strand the user's shell in the alternate screen.
     let images_root = store.images_dir().to_path_buf();
-    let mut app = App::with_store(VERSION, store).map_err(io::Error::other)?;
+    let mut app = App::with_store_and_update_state(
+        VERSION,
+        store,
+        update_state::UpdateStateStore::open_default(),
+    )
+    .map_err(io::Error::other)?;
 
     // Probe graphics support before the event loop takes stdin.
     // (ratatui-image prefers the alternate screen; answers are the same either way.)
@@ -71,7 +77,7 @@ pub fn run_tui(store: Store) -> io::Result<()> {
     app.images = images;
 
     let (mut terminal, _session) = TerminalSession::enter()?;
-    app.start_automatic_update_check();
+    app.poll_automatic_update_schedule();
     event_loop(&mut terminal, &mut app)
 }
 
@@ -146,6 +152,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         }
         let now = Instant::now();
         if housekeeping_due(&mut next_housekeeping, now) {
+            if app.poll_automatic_update_schedule() {
+                app.mark_dirty();
+            }
             if app.poll_external_changes() {
                 app.mark_dirty();
             }

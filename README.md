@@ -37,8 +37,11 @@ mach --help
 Agents work well against the same CLI — stable flags, unique ID prefixes,
 and JSON output when you need it.
 
-The TUI checks for updates daily. Run `/update` to download, verify, and install
-the latest release, or use `mach update --install` from the shell.
+The TUI checks in the background, including while it stays open. A successful
+check schedules the next one 24 hours later. Failed checks retry after an hour
+by default and honor server-provided backoff. Run `/update` to download,
+verify, and install the latest release, or use `mach update --install` from the
+shell.
 
 ## Data
 
@@ -50,6 +53,10 @@ Existing JSON data is imported automatically on first launch and left
 untouched. Back up the whole directory while mach is closed.
 
 Another folder: `--dir PATH` or `MACH_DIR`.
+
+Update scheduling and discovered releases are shared separately in
+`~/.mach/update.db`, so changing the task data directory does not duplicate or
+suppress application updates.
 
 ## License
 

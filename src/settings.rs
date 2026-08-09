@@ -12,8 +12,6 @@ pub const PREVIEW_POSITIONS: [&str; 2] = ["bottom", "right"];
 /// categories in sidebar order; this only rearranges rows within a group.
 pub const SORTS: [&str; 4] = ["manual", "important", "done", "due"];
 
-const AUTOMATIC_UPDATE_CHECK_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaunchState {
     FirstRun,
@@ -66,9 +64,10 @@ pub struct Settings {
     pub hide_done: bool,
     #[serde(default)]
     pub last_run_version: Option<String>,
-    /// Unix timestamp of the last automatic update-check attempt. Manual
-    /// checks are never rate-limited and do not change this value.
-    #[serde(default)]
+    /// Legacy task-store field retained for source compatibility. Update
+    /// scheduling no longer reads it, and new settings writes omit it.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
     pub last_update_check_at: Option<i64>,
 }
 
@@ -106,6 +105,7 @@ impl Settings {
         if !PREVIEW_POSITIONS.contains(&self.preview_position.as_str()) {
             self.preview_position = default_preview_position();
         }
+        self.last_update_check_at = None;
         self
     }
 
@@ -123,25 +123,6 @@ impl Settings {
         };
         self.last_run_version = Some(version.to_string());
         state
-    }
-
-    pub(crate) fn automatic_update_check_due(&self, now: i64) -> bool {
-        match self.last_update_check_at {
-            None => true,
-            // A wall-clock rollback must not suppress checks indefinitely.
-            Some(last) if now < last => true,
-            Some(last) => now.saturating_sub(last) >= AUTOMATIC_UPDATE_CHECK_INTERVAL_SECONDS,
-        }
-    }
-
-    /// Claim one automatic check at `now`, returning false while the previous
-    /// attempt is still inside the daily interval.
-    pub(crate) fn take_automatic_update_check(&mut self, now: i64) -> bool {
-        if !self.automatic_update_check_due(now) {
-            return false;
-        }
-        self.last_update_check_at = Some(now);
-        true
     }
 }
 
@@ -201,26 +182,20 @@ mod tests {
     }
 
     #[test]
-    fn automatic_update_checks_are_claimed_once_per_day() {
-        let mut settings = Settings::default();
-        let now = 1_800_000_000;
+    fn legacy_task_store_update_timestamp_is_read_but_not_written() {
+        let settings: Settings = serde_json::from_str(
+            r#"{
+                "date_format":"Y-M-D",
+                "selected_color":"white",
+                "sort":"manual",
+                "preview_position":"bottom",
+                "last_update_check_at":1800000000
+            }"#,
+        )
+        .unwrap();
 
-        assert!(settings.take_automatic_update_check(now));
-        assert_eq!(settings.last_update_check_at, Some(now));
-        assert!(!settings.take_automatic_update_check(now + 86_399));
-        assert_eq!(settings.last_update_check_at, Some(now));
-        assert!(settings.take_automatic_update_check(now + 86_400));
-        assert_eq!(settings.last_update_check_at, Some(now + 86_400));
-    }
-
-    #[test]
-    fn automatic_update_check_recovers_from_clock_rollback() {
-        let mut settings = Settings {
-            last_update_check_at: Some(1_900_000_000),
-            ..Settings::default()
-        };
-
-        assert!(settings.take_automatic_update_check(1_800_000_000));
         assert_eq!(settings.last_update_check_at, Some(1_800_000_000));
+        let encoded = serde_json::to_value(settings).unwrap();
+        assert!(encoded.get("last_update_check_at").is_none());
     }
 }

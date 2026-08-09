@@ -12,8 +12,9 @@ duplicated here.
   `mach`.
 - The minimum supported Rust version is 1.90. Keep the edition, MSRV, lockfile,
   CI, and release workflow compatible with that toolchain.
-- SQLite under the selected data directory is the authoritative store. The
-  default directory is `~/.mach`.
+- SQLite under the selected data directory is the authoritative task store.
+  The default directory is `~/.mach`. Application-wide update scheduling is
+  separate in `~/.mach/update.db` and never follows `--dir` or `MACH_DIR`.
 
 ## Start with the real state
 
@@ -53,6 +54,8 @@ rewrite real user data as part of development.
   protocols.
 - `src/update.rs`: GitHub Release selection, checksum verification, and atomic
   self-update installation.
+- `src/update_state.rs`: global update deadlines, retry state, ETag cache,
+  latest release cache, and cross-process leases.
 - `src/banner.rs`, `src/slash.rs`, `src/settings.rs`, `src/theme.rs`: help and
   release copy, commands, persisted preferences, and presentation policy.
 

@@ -85,6 +85,7 @@ start_tui() {
   # The quoted program is expanded by the shell running inside the tmux pane.
   # shellcheck disable=SC2016
   MACH_DIR="$data_dir" \
+  MACH_UPDATE_STATE_DIR="${tmpdir}/update-state" \
   MACH_E2E_BINARY="$binary" \
   MACH_E2E_STATUS="$terminal_status" \
     tmux -S "$socket" new-session -d -x 120 -y 40 -s "$session" \

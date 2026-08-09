@@ -22,6 +22,11 @@ use crate::store::{
 };
 use crate::text_input::TextInput;
 use crate::theme::Theme;
+use crate::update::{CheckFailure, CheckResponse};
+use crate::update_state::{
+    AutomaticClaim, FAILURE_RETRY_SECONDS, LEASE_SECONDS, UpdateLease, UpdateState,
+    UpdateStateStore,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -111,19 +116,37 @@ enum UpdateJobKind {
 }
 
 enum UpdateOutcome {
-    Checked(crate::update::CheckResult),
-    UpToDate(crate::update::CheckResult),
-    Installed(crate::update::InstallResult),
+    Automatic(CheckResponse),
+    UpToDate {
+        info: crate::update::CheckResult,
+        etag: Option<String>,
+    },
+    Installed {
+        result: crate::update::InstallResult,
+        info: crate::update::CheckResult,
+        etag: Option<String>,
+    },
+    InstallFailed {
+        message: String,
+        info: crate::update::CheckResult,
+        etag: Option<String>,
+    },
 }
 
 enum UpdateEvent {
     DownloadProgress(crate::update::DownloadProgress),
-    Finished(Result<UpdateOutcome, String>),
+    Finished(Box<Result<UpdateOutcome, CheckFailure>>),
 }
 
 struct UpdateJob {
     rx: Receiver<UpdateEvent>,
     kind: UpdateJobKind,
+    lease: Option<UpdateLease>,
+}
+
+struct UpdateNotice {
+    text: String,
+    available_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +189,7 @@ pub enum TaskListRow {
 
 pub struct App {
     store: Store,
+    version: String,
     store_revision: u64,
     pub tasks: Vec<Task>,
     pub categories: Vec<Category>,
@@ -227,9 +251,16 @@ pub struct App {
     category_edit_base: Option<Category>,
     /// One in-flight automatic check or explicit install.
     update_job: Option<UpdateJob>,
+    /// Application-level update scheduling state, independent of task data.
+    update_state: Option<UpdateStateStore>,
+    /// Wall-clock deadline for the next cheap state refresh.
+    next_update_state_poll_at: i64,
     /// Update notices survive ordinary status messages and clear only when the
     /// user opens the `/` command palette.
-    update_notice: Option<String>,
+    update_notice: Option<UpdateNotice>,
+    /// An available version dismissed in this process stays dismissed until a
+    /// newer release is discovered.
+    dismissed_update_version: Option<String>,
     /// Visible work for an explicit `/update` request.
     update_activity: Option<UpdateActivity>,
     /// Whether persistence polling has failed since its last successful pass.
@@ -240,10 +271,22 @@ pub struct App {
 
 impl App {
     pub fn new(version: &str) -> Result<Self, StoreError> {
-        Self::with_store(version, Store::open_default(None)?)
+        Self::with_store_and_update_state(
+            version,
+            Store::open_default(None)?,
+            UpdateStateStore::open_default(),
+        )
     }
 
-    pub fn with_store(version: &str, mut store: Store) -> Result<Self, StoreError> {
+    pub fn with_store(version: &str, store: Store) -> Result<Self, StoreError> {
+        Self::with_store_and_update_state(version, store, UpdateStateStore::open_in_memory())
+    }
+
+    pub(crate) fn with_store_and_update_state(
+        version: &str,
+        mut store: Store,
+        update_state: Result<UpdateStateStore, StoreError>,
+    ) -> Result<Self, StoreError> {
         // The transaction reads fresh state, so two concurrently-starting
         // processes cannot both claim the same first run or upgrade.
         let initial = store.snapshot()?;
@@ -264,9 +307,14 @@ impl App {
         categories.extend(real_cats);
         let mut images = ImageStore::with_root(store.images_dir().to_path_buf());
         images.set_attachments(&attachments);
+        let (update_state, update_state_error) = match update_state {
+            Ok(store) => (Some(store), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
 
         let mut app = Self {
             store,
+            version: version.to_string(),
             store_revision: revision,
             tasks,
             categories,
@@ -309,11 +357,19 @@ impl App {
             task_edit_base: None,
             category_edit_base: None,
             update_job: None,
+            update_state,
+            next_update_state_poll_at: 0,
             update_notice: None,
+            dismissed_update_version: None,
             update_activity: None,
             external_poll_failed: false,
         };
         app.rebuild_view();
+        if let Some(error) = update_state_error {
+            app.error(format!("Automatic update checks unavailable: {error}"));
+        } else {
+            app.refresh_update_state(Utc::now().timestamp());
+        }
         Ok(app)
     }
 
@@ -417,21 +473,78 @@ impl App {
         self.error(format!("{action}: {error}"));
     }
 
-    /// Claim and start the daily background check. Persistence makes the claim
-    /// process-safe across multiple TUI instances sharing one data directory.
-    pub(crate) fn start_automatic_update_check(&mut self) {
-        let now = Utc::now().timestamp();
-        if self.claim_automatic_update_check_at(now) {
-            self.start_update_worker(UpdateJobKind::Automatic);
+    /// Refresh global state and start a due automatic check. The event loop
+    /// calls this throughout the process lifetime; local polling is capped at
+    /// once per minute while the SQLite deadline remains the source of truth.
+    pub(crate) fn poll_automatic_update_schedule(&mut self) -> bool {
+        self.poll_automatic_update_schedule_at(Utc::now().timestamp())
+    }
+
+    fn poll_automatic_update_schedule_at(&mut self, now: i64) -> bool {
+        if now < self.next_update_state_poll_at {
+            return false;
+        }
+        if self.update_job.is_some() {
+            self.next_update_state_poll_at = now.saturating_add(1);
+            return false;
+        }
+        let claim = match self
+            .update_state
+            .as_mut()
+            .map(|store| store.try_claim_automatic(now))
+        {
+            Some(Ok(claim)) => claim,
+            Some(Err(_)) => {
+                self.next_update_state_poll_at = now.saturating_add(FAILURE_RETRY_SECONDS);
+                return false;
+            }
+            None => {
+                self.next_update_state_poll_at = i64::MAX;
+                return false;
+            }
+        };
+        match claim {
+            AutomaticClaim::Claimed(lease) => {
+                self.next_update_state_poll_at = now.saturating_add(LEASE_SECONDS);
+                self.start_update_worker(UpdateJobKind::Automatic, Some(lease));
+                false
+            }
+            AutomaticClaim::Waiting(state) => self.apply_update_state(state, now),
         }
     }
 
-    fn claim_automatic_update_check_at(&mut self, now: i64) -> bool {
-        if !self.settings.automatic_update_check_due(now) {
-            return false;
-        }
-        self.update_store(|data| Ok(data.settings.take_automatic_update_check(now)))
-            .unwrap_or(false)
+    fn refresh_update_state(&mut self, now: i64) -> bool {
+        let state = match self.update_state.as_ref().map(UpdateStateStore::snapshot) {
+            Some(Ok(state)) => state,
+            Some(Err(_)) => {
+                self.next_update_state_poll_at = now.saturating_add(FAILURE_RETRY_SECONDS);
+                return false;
+            }
+            None => {
+                self.next_update_state_poll_at = i64::MAX;
+                return false;
+            }
+        };
+        self.apply_update_state(state, now)
+    }
+
+    fn apply_update_state(&mut self, state: UpdateState, now: i64) -> bool {
+        let changed = self.sync_available_update(state.latest_version.as_deref());
+        self.schedule_update_state_poll(&state, now);
+        changed
+    }
+
+    fn schedule_update_state_poll(&mut self, state: &UpdateState, now: i64) {
+        const STATE_REFRESH_SECONDS: i64 = 60;
+        let deadline = if state.automatic_check_due(now) {
+            state
+                .lease_until
+                .filter(|_| state.lease_active(now))
+                .unwrap_or(now)
+        } else {
+            state.next_check_at.unwrap_or(now)
+        };
+        self.next_update_state_poll_at = deadline.min(now.saturating_add(STATE_REFRESH_SECONDS));
     }
 
     /// Explicitly check for and install the latest verified release (`/update`).
@@ -450,42 +563,73 @@ impl App {
         // worker may finish, but dropping the receiver prevents a stale result
         // from competing with the install result in the UI.
         self.update_job = None;
-        self.start_update_worker(UpdateJobKind::Install);
+        let now = Utc::now().timestamp();
+        let lease = self
+            .update_state
+            .as_mut()
+            .and_then(|store| store.claim_manual(now).ok());
+        self.start_update_worker(UpdateJobKind::Install, lease);
     }
 
-    fn start_update_worker(&mut self, kind: UpdateJobKind) {
+    fn start_update_worker(&mut self, kind: UpdateJobKind, lease: Option<UpdateLease>) {
         let (tx, rx) = mpsc::channel();
         let thread_name = match kind {
             UpdateJobKind::Automatic => "mach-update-check",
             UpdateJobKind::Install => "mach-update-install",
         };
+        let conditional_etag = lease.as_ref().and_then(|lease| lease.etag.clone());
         match std::thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
-                let result = crate::update::check().and_then(|info| match kind {
-                    UpdateJobKind::Automatic => Ok(UpdateOutcome::Checked(info)),
-                    UpdateJobKind::Install if info.newer => {
-                        crate::update::install_with_progress(&info, |progress| {
-                            let _ = tx.send(UpdateEvent::DownloadProgress(progress));
-                        })
-                        .map(UpdateOutcome::Installed)
+                let result = (|| -> Result<UpdateOutcome, CheckFailure> {
+                    match kind {
+                        UpdateJobKind::Automatic => {
+                            crate::update::check_with_etag(conditional_etag.as_deref())
+                                .map(UpdateOutcome::Automatic)
+                        }
+                        UpdateJobKind::Install => {
+                            let CheckResponse::Modified { info, etag } =
+                                crate::update::check_with_etag(None)?
+                            else {
+                                return Err(CheckFailure {
+                                    message: "GitHub returned 304 without a conditional request"
+                                        .into(),
+                                    retry_at: None,
+                                });
+                            };
+                            if !info.newer {
+                                return Ok(UpdateOutcome::UpToDate { info, etag });
+                            }
+                            let install = crate::update::install_with_progress(&info, |progress| {
+                                let _ = tx.send(UpdateEvent::DownloadProgress(progress));
+                            });
+                            Ok(match install {
+                                Ok(result) => UpdateOutcome::Installed { result, info, etag },
+                                Err(message) => UpdateOutcome::InstallFailed {
+                                    message,
+                                    info,
+                                    etag,
+                                },
+                            })
+                        }
                     }
-                    UpdateJobKind::Install => Ok(UpdateOutcome::UpToDate(info)),
-                });
-                let _ = tx.send(UpdateEvent::Finished(result));
+                })();
+                let _ = tx.send(UpdateEvent::Finished(Box::new(result)));
             }) {
             Ok(_) => {
-                self.update_job = Some(UpdateJob { rx, kind });
+                self.update_job = Some(UpdateJob { rx, kind, lease });
                 if kind == UpdateJobKind::Install {
                     self.update_activity = Some(UpdateActivity::Checking);
                     self.dirty = true;
                 }
             }
-            Err(error) if kind == UpdateJobKind::Install => {
-                self.update_activity = None;
-                self.error(format!("Could not start update: {error}"));
+            Err(error) => {
+                self.finish_update_state_failure(lease.as_ref(), Utc::now().timestamp(), None);
+                if kind == UpdateJobKind::Install {
+                    self.update_activity = None;
+                    self.error(format!("Could not start update: {error}"));
+                }
             }
-            Err(_) => {}
         }
     }
 
@@ -507,14 +651,15 @@ impl App {
                     }
                 }
                 Some((kind, Ok(UpdateEvent::Finished(result)))) => {
-                    self.update_job = None;
+                    let lease = self.update_job.take().and_then(|job| job.lease);
                     changed |= self.update_activity.take().is_some();
-                    return self.finish_update(kind, result) || changed;
+                    return self.finish_update(kind, lease.as_ref(), *result) || changed;
                 }
                 Some((_, Err(TryRecvError::Empty))) => return changed,
                 Some((kind, Err(TryRecvError::Disconnected))) => {
-                    self.update_job = None;
+                    let lease = self.update_job.take().and_then(|job| job.lease);
                     changed |= self.update_activity.take().is_some();
+                    self.finish_update_state_failure(lease.as_ref(), Utc::now().timestamp(), None);
                     return if kind == UpdateJobKind::Install {
                         self.show_update_message("Update failed".into(), MessageKind::Error);
                         true
@@ -529,32 +674,139 @@ impl App {
     fn finish_update(
         &mut self,
         kind: UpdateJobKind,
-        result: Result<UpdateOutcome, String>,
+        lease: Option<&UpdateLease>,
+        result: Result<UpdateOutcome, CheckFailure>,
     ) -> bool {
+        let now = Utc::now().timestamp();
         match result {
-            Ok(UpdateOutcome::Checked(info)) if info.newer => self.set_update_notice(format!(
-                "v{} → v{} available · run /update to install",
-                info.current, info.latest
-            )),
-            Ok(UpdateOutcome::Checked(_)) => false,
-            Ok(UpdateOutcome::UpToDate(info)) => {
+            Ok(UpdateOutcome::Automatic(CheckResponse::Modified { info, etag })) => {
+                let (committed, changed) =
+                    self.finish_update_state_modified(lease, now, etag.as_deref(), &info.latest);
+                if !committed {
+                    return changed;
+                }
+                if info.newer {
+                    self.set_available_update_notice(&info.latest) || changed
+                } else {
+                    self.sync_available_update(None) || changed
+                }
+            }
+            Ok(UpdateOutcome::Automatic(CheckResponse::NotModified)) => {
+                if let (Some(store), Some(lease)) = (self.update_state.as_mut(), lease) {
+                    let _ = store.finish_not_modified(lease, now);
+                }
+                self.refresh_update_state(now)
+            }
+            Ok(UpdateOutcome::UpToDate { info, etag }) => {
+                self.finish_update_state_modified(lease, now, etag.as_deref(), &info.latest);
                 self.show_update_message(info.summary(), MessageKind::Info);
                 true
             }
-            Ok(UpdateOutcome::Installed(result)) => {
-                self.set_update_notice(format!("Installed {} · restart mach", result.tag))
+            Ok(UpdateOutcome::Installed { result, info, etag }) => {
+                self.finish_update_state_modified(lease, now, etag.as_deref(), &info.latest);
+                self.set_update_notice(UpdateNotice {
+                    text: format!("Installed {} · restart mach", result.tag),
+                    available_version: None,
+                })
             }
-            Err(error) if kind == UpdateJobKind::Install => {
-                self.show_update_message(error, MessageKind::Error);
+            Ok(UpdateOutcome::InstallFailed {
+                message,
+                info,
+                etag,
+            }) => {
+                self.finish_update_state_modified(lease, now, etag.as_deref(), &info.latest);
+                self.show_update_message(message, MessageKind::Error);
                 true
             }
-            Err(_) => false,
+            Err(error) if kind == UpdateJobKind::Install => {
+                self.finish_update_state_failure(lease, now, error.retry_at);
+                self.show_update_message(error.message, MessageKind::Error);
+                true
+            }
+            Err(error) => {
+                self.finish_update_state_failure(lease, now, error.retry_at);
+                false
+            }
         }
     }
 
-    fn set_update_notice(&mut self, text: String) -> bool {
+    fn finish_update_state_modified(
+        &mut self,
+        lease: Option<&UpdateLease>,
+        now: i64,
+        etag: Option<&str>,
+        latest_version: &str,
+    ) -> (bool, bool) {
+        let committed = match (self.update_state.as_mut(), lease) {
+            (Some(store), Some(lease)) => store
+                .finish_modified(lease, now, etag, latest_version)
+                .unwrap_or(false),
+            // Manual checks remain useful when application-level persistence
+            // is unavailable; automatic workers always carry a lease.
+            _ => true,
+        };
+        (committed, self.refresh_update_state(now))
+    }
+
+    fn finish_update_state_failure(
+        &mut self,
+        lease: Option<&UpdateLease>,
+        now: i64,
+        retry_at: Option<i64>,
+    ) {
+        if let (Some(store), Some(lease)) = (self.update_state.as_mut(), lease) {
+            let _ = store.finish_failure(lease, now, retry_at);
+        }
+        self.refresh_update_state(now);
+    }
+
+    fn sync_available_update(&mut self, available_version: Option<&str>) -> bool {
+        let available_version = available_version
+            .filter(|version| crate::update::is_newer(version, &self.version) == Some(true));
+        let Some(version) = available_version else {
+            if self
+                .update_notice
+                .as_ref()
+                .is_some_and(|notice| notice.available_version.is_some())
+            {
+                self.update_notice = None;
+                self.dirty = true;
+                return true;
+            }
+            return false;
+        };
+        if self.dismissed_update_version.as_deref() == Some(version)
+            || self
+                .update_notice
+                .as_ref()
+                .is_some_and(|notice| notice.available_version.is_none())
+        {
+            return false;
+        }
+        self.set_available_update_notice(version)
+    }
+
+    fn set_available_update_notice(&mut self, latest: &str) -> bool {
+        if self
+            .update_notice
+            .as_ref()
+            .and_then(|notice| notice.available_version.as_deref())
+            == Some(latest)
+        {
+            return false;
+        }
+        self.set_update_notice(UpdateNotice {
+            text: format!(
+                "v{} → v{} available · run /update to install",
+                self.version, latest
+            ),
+            available_version: Some(latest.to_string()),
+        })
+    }
+
+    fn set_update_notice(&mut self, notice: UpdateNotice) -> bool {
         let visible = self.message.is_none();
-        self.update_notice = Some(text);
+        self.update_notice = Some(notice);
         if visible {
             self.dirty = true;
         }
@@ -1430,6 +1682,13 @@ impl App {
         if self.searching {
             self.end_search();
         }
+        if let Some(version) = self
+            .update_notice
+            .as_ref()
+            .and_then(|notice| notice.available_version.clone())
+        {
+            self.dismissed_update_version = Some(version);
+        }
         self.update_notice = None;
         self.mode = Mode::Slash;
         self.input = TextInput::new("", 128);
@@ -1499,8 +1758,8 @@ impl App {
             .map(|message| (message.text.as_str(), message.kind))
             .or_else(|| {
                 self.update_notice
-                    .as_deref()
-                    .map(|text| (text, MessageKind::Info))
+                    .as_ref()
+                    .map(|notice| (notice.text.as_str(), MessageKind::Info))
             })
     }
 
@@ -1654,6 +1913,37 @@ mod tests {
         }
     }
 
+    fn automatic_outcome(newer: bool) -> UpdateOutcome {
+        UpdateOutcome::Automatic(CheckResponse::Modified {
+            info: update_result(newer),
+            etag: None,
+        })
+    }
+
+    fn update_failure(message: &str) -> CheckFailure {
+        CheckFailure {
+            message: message.into(),
+            retry_at: None,
+        }
+    }
+
+    fn finished(result: Result<UpdateOutcome, CheckFailure>) -> UpdateEvent {
+        UpdateEvent::Finished(Box::new(result))
+    }
+
+    fn claim_automatic_lease(app: &mut App, now: i64) -> UpdateLease {
+        let AutomaticClaim::Claimed(lease) = app
+            .update_state
+            .as_mut()
+            .expect("test update state")
+            .try_claim_automatic(now)
+            .unwrap()
+        else {
+            panic!("automatic update should be due");
+        };
+        lease
+    }
+
     #[test]
     fn typeahead_buffer_is_bounded_by_the_longest_searchable_title() {
         let store = Store::open_in_memory_with_paths("/tmp/mach-typeahead-test")
@@ -1672,23 +1962,207 @@ mod tests {
     }
 
     #[test]
-    fn automatic_update_claim_is_persisted_across_app_instances() {
-        let dir = std::env::temp_dir().join(format!(
+    fn automatic_update_claim_is_shared_across_task_stores() {
+        let root = std::env::temp_dir().join(format!(
             "mach-update-claim-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
         let now = 1_800_000_000;
-        let mut first = App::with_store("test", Store::open(&dir).unwrap()).unwrap();
+        let state_path = root.join("global").join("update.db");
+        let mut first = App::with_store_and_update_state(
+            "test",
+            Store::open(root.join("one")).unwrap(),
+            UpdateStateStore::open(&state_path),
+        )
+        .unwrap();
 
-        assert!(first.claim_automatic_update_check_at(now));
+        assert!(matches!(
+            first
+                .update_state
+                .as_mut()
+                .unwrap()
+                .try_claim_automatic(now)
+                .unwrap(),
+            AutomaticClaim::Claimed(_)
+        ));
         drop(first);
 
-        let mut second = App::with_store("test", Store::open(&dir).unwrap()).unwrap();
-        assert!(!second.claim_automatic_update_check_at(now));
-        assert_eq!(second.settings.last_update_check_at, Some(now));
+        let mut second = App::with_store_and_update_state(
+            "test",
+            Store::open(root.join("two")).unwrap(),
+            UpdateStateStore::open(&state_path),
+        )
+        .unwrap();
+        assert!(matches!(
+            second
+                .update_state
+                .as_mut()
+                .unwrap()
+                .try_claim_automatic(now)
+                .unwrap(),
+            AutomaticClaim::Waiting(_)
+        ));
         drop(second);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_automatic_update_check_retries_before_the_daily_interval() {
+        let store = Store::open_in_memory_with_paths("/tmp/mach-update-retry-test").unwrap();
+        let mut app = App::with_store("test", store).unwrap();
+        let now = Utc::now().timestamp();
+
+        let lease = claim_automatic_lease(&mut app, now);
+        let (tx, rx) = mpsc::channel();
+        app.update_job = Some(UpdateJob {
+            rx,
+            kind: UpdateJobKind::Automatic,
+            lease: Some(lease),
+        });
+        tx.send(finished(Err(update_failure("offline")))).unwrap();
+
+        assert!(!app.poll_update());
+        let retry_at = app
+            .update_state
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .next_check_at
+            .expect("failed check schedules a retry");
+        assert!(retry_at < now + 24 * 60 * 60);
+        assert!(matches!(
+            app.update_state
+                .as_mut()
+                .unwrap()
+                .try_claim_automatic(retry_at)
+                .unwrap(),
+            AutomaticClaim::Claimed(_)
+        ));
+    }
+
+    #[test]
+    fn available_update_notice_survives_reopening_the_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "mach-update-notice-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let state_path = dir.join("global-update.db");
+        let mut app = App::with_store_and_update_state(
+            "0.2.0",
+            Store::open(dir.join("tasks")).unwrap(),
+            UpdateStateStore::open(&state_path),
+        )
+        .unwrap();
+        let lease = claim_automatic_lease(&mut app, Utc::now().timestamp());
+        let (tx, rx) = mpsc::channel();
+        app.update_job = Some(UpdateJob {
+            rx,
+            kind: UpdateJobKind::Automatic,
+            lease: Some(lease),
+        });
+        tx.send(finished(Ok(automatic_outcome(true)))).unwrap();
+
+        assert!(app.poll_update());
+        drop(app);
+
+        let reopened = App::with_store_and_update_state(
+            "0.2.0",
+            Store::open(dir.join("tasks")).unwrap(),
+            UpdateStateStore::open(&state_path),
+        )
+        .unwrap();
+        assert!(
+            reopened
+                .status_message()
+                .is_some_and(|(text, _)| { text.contains("v0.2.0 → v0.3.0 available") })
+        );
+        drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn available_update_notice_reaches_an_already_running_instance() {
+        let root = std::env::temp_dir().join(format!(
+            "mach-running-update-notice-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let state_path = root.join("global-update.db");
+        let mut checker = App::with_store_and_update_state(
+            "0.2.0",
+            Store::open(root.join("tasks-one")).unwrap(),
+            UpdateStateStore::open(&state_path),
+        )
+        .unwrap();
+        let mut observer = App::with_store_and_update_state(
+            "0.2.0",
+            Store::open(root.join("tasks-two")).unwrap(),
+            UpdateStateStore::open(&state_path),
+        )
+        .unwrap();
+        let now = Utc::now().timestamp();
+        let lease = claim_automatic_lease(&mut checker, now);
+        let (tx, rx) = mpsc::channel();
+        checker.update_job = Some(UpdateJob {
+            rx,
+            kind: UpdateJobKind::Automatic,
+            lease: Some(lease),
+        });
+        tx.send(finished(Ok(automatic_outcome(true)))).unwrap();
+
+        assert!(checker.poll_update());
+        assert!(observer.poll_automatic_update_schedule_at(now + 1));
+        assert!(
+            observer
+                .status_message()
+                .is_some_and(|(text, _)| { text.contains("v0.2.0 → v0.3.0 available") })
+        );
+        drop(checker);
+        drop(observer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_latest_release_is_compared_per_running_binary() {
+        let root = std::env::temp_dir().join(format!(
+            "mach-multiple-binaries-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let state_path = root.join("global-update.db");
+        let now = 1_800_000_000;
+        let mut state = UpdateStateStore::open(&state_path).unwrap();
+        let AutomaticClaim::Claimed(lease) = state.try_claim_automatic(now).unwrap() else {
+            panic!("first check should be due");
+        };
+        state.finish_modified(&lease, now, None, "0.3.0").unwrap();
+        drop(state);
+
+        let current = App::with_store_and_update_state(
+            "0.3.0",
+            Store::open(root.join("current-tasks")).unwrap(),
+            UpdateStateStore::open(&state_path),
+        )
+        .unwrap();
+        assert!(current.status_message().is_none());
+        drop(current);
+
+        let older = App::with_store_and_update_state(
+            "0.2.0",
+            Store::open(root.join("older-tasks")).unwrap(),
+            UpdateStateStore::open(&state_path),
+        )
+        .unwrap();
+        assert!(
+            older
+                .status_message()
+                .is_some_and(|(text, _)| { text.contains("v0.2.0 → v0.3.0 available") })
+        );
+        drop(older);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1724,14 +2198,17 @@ mod tests {
         app.update_job = Some(UpdateJob {
             rx,
             kind: UpdateJobKind::Install,
+            lease: None,
         });
         app.update_activity = Some(UpdateActivity::Checking);
-        tx.send(UpdateEvent::Finished(Ok(UpdateOutcome::Installed(
-            crate::update::InstallResult {
+        tx.send(finished(Ok(UpdateOutcome::Installed {
+            result: crate::update::InstallResult {
                 destination: "/tmp/mach-bin/mach".into(),
                 tag: "v0.3.0".into(),
             },
-        ))))
+            info: update_result(true),
+            etag: None,
+        })))
         .unwrap();
 
         assert!(app.poll_update());
@@ -1759,6 +2236,7 @@ mod tests {
         app.update_job = Some(UpdateJob {
             rx,
             kind: UpdateJobKind::Install,
+            lease: None,
         });
         app.update_activity = Some(UpdateActivity::Checking);
         tx.send(UpdateEvent::DownloadProgress(
@@ -1789,10 +2267,15 @@ mod tests {
         app.update_job = Some(UpdateJob {
             rx,
             kind: UpdateJobKind::Install,
+            lease: None,
         });
-        tx.send(UpdateEvent::Finished(Err(
-            "this mach executable is managed by Cargo; run cargo install --locked mach-tui".into(),
-        )))
+        tx.send(finished(Ok(UpdateOutcome::InstallFailed {
+            message:
+                "this mach executable is managed by Cargo; run cargo install --locked mach-tui"
+                    .into(),
+            info: update_result(true),
+            etag: None,
+        })))
         .unwrap();
 
         assert!(app.poll_update());
@@ -1804,16 +2287,14 @@ mod tests {
     #[test]
     fn automatic_update_results_are_silent_unless_a_new_version_exists() {
         let store = Store::open_in_memory_with_paths("/tmp/mach-auto-update-test").unwrap();
-        let mut app = App::with_store("test", store).unwrap();
+        let mut app = App::with_store("0.2.0", store).unwrap();
         let (tx, rx) = mpsc::channel();
         app.update_job = Some(UpdateJob {
             rx,
             kind: UpdateJobKind::Automatic,
+            lease: None,
         });
-        tx.send(UpdateEvent::Finished(Ok(UpdateOutcome::Checked(
-            update_result(false),
-        ))))
-        .unwrap();
+        tx.send(finished(Ok(automatic_outcome(false)))).unwrap();
 
         assert!(!app.poll_update());
         assert!(app.message.is_none());
@@ -1822,9 +2303,9 @@ mod tests {
         app.update_job = Some(UpdateJob {
             rx,
             kind: UpdateJobKind::Automatic,
+            lease: None,
         });
-        tx.send(UpdateEvent::Finished(Err("offline".into())))
-            .unwrap();
+        tx.send(finished(Err(update_failure("offline")))).unwrap();
 
         assert!(!app.poll_update());
         assert!(app.message.is_none());
@@ -1833,17 +2314,15 @@ mod tests {
     #[test]
     fn automatic_update_notice_waits_for_an_active_confirmation() {
         let store = Store::open_in_memory_with_paths("/tmp/mach-deferred-update-test").unwrap();
-        let mut app = App::with_store("test", store).unwrap();
+        let mut app = App::with_store("0.2.0", store).unwrap();
         app.ask_confirm(Confirm::Quit, "Press Ctrl+C again to quit");
         let (tx, rx) = mpsc::channel();
         app.update_job = Some(UpdateJob {
             rx,
             kind: UpdateJobKind::Automatic,
+            lease: None,
         });
-        tx.send(UpdateEvent::Finished(Ok(UpdateOutcome::Checked(
-            update_result(true),
-        ))))
-        .unwrap();
+        tx.send(finished(Ok(automatic_outcome(true)))).unwrap();
 
         assert!(!app.poll_update());
         assert_eq!(app.pending_confirmation(), Some(&Confirm::Quit));

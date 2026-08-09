@@ -849,13 +849,6 @@ fn validation_rejects_controls_and_invalid_creation_timestamps() {
         .expect_err("invalid timestamp must be rejected");
     assert!(matches!(timestamp_error, StoreError::Validation(_)));
 
-    let update_check_error = store
-        .update(|data| {
-            data.settings.last_update_check_at = Some(-1);
-            Ok(())
-        })
-        .expect_err("negative update-check timestamp must be rejected");
-    assert!(matches!(update_check_error, StoreError::Validation(_)));
     assert!(store.snapshot().unwrap().tasks.is_empty());
 }
 
