@@ -237,11 +237,15 @@ fn relative_day(due: &str) -> Option<i64> {
 }
 
 fn relative_date(year: i32, month: u32, day: u32) -> Option<i64> {
-    let date = NaiveDate::from_ymd_opt(year, month, day)?;
-    Some((date - Local::now().date_naive()).num_days())
+    relative_date_from(year, month, day, Local::now().date_naive())
 }
 
-/// The bracketed string shown at the right edge of a task row.
+fn relative_date_from(year: i32, month: u32, day: u32, today: NaiveDate) -> Option<i64> {
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    Some((date - today).num_days())
+}
+
+/// The bracketed full string shown in the preview and CLI output.
 /// Date order follows `date_format` (`Y-M-D` / `D-M-Y` / `M-D-Y`).
 /// Nearby days use Today / Tomorrow / Yesterday.
 pub fn display(due: &str, date_format: &str) -> String {
@@ -270,11 +274,67 @@ pub fn display(due: &str, date_format: &str) -> String {
     format!("[{text}]")
 }
 
+/// The shorter due label used inside a task-list row.
+///
+/// Relative dates stay readable. Other dates omit the current year and use
+/// two digits for a different year; the preview and CLI keep using [`display`]
+/// so the full value is always available outside the compact list.
+pub fn display_compact(due: &str, date_format: &str) -> String {
+    display_compact_at(due, date_format, Local::now().date_naive())
+}
+
+fn display_compact_at(due: &str, date_format: &str, today: NaiveDate) -> String {
+    if due.is_empty() {
+        return String::new();
+    }
+    let Some((y, mo, d, h, mi)) = sort_key(due) else {
+        return due.to_string();
+    };
+    let relative = if due.len() == 5 && due.contains(':') {
+        Some(0)
+    } else {
+        relative_date_from(y, mo, d, today)
+    };
+    let label = match relative {
+        Some(0) => "Today".to_string(),
+        Some(1) => "Tomorrow".to_string(),
+        Some(-1) => "Yesterday".to_string(),
+        _ => format_compact_date(y, mo, d, date_format, today.year()),
+    };
+    if due.contains(':') {
+        format!("{label} {h:02}:{mi:02}")
+    } else {
+        label
+    }
+}
+
 fn format_date(year: i32, month: u32, day: u32, date_format: &str) -> String {
     match date_format {
         "D-M-Y" => format!("{day:02}-{month:02}-{year}"),
         "M-D-Y" => format!("{month:02}-{day:02}-{year}"),
         _ => format!("{year}-{month:02}-{day:02}"),
+    }
+}
+
+fn format_compact_date(
+    year: i32,
+    month: u32,
+    day: u32,
+    date_format: &str,
+    current_year: i32,
+) -> String {
+    if year == current_year {
+        return match date_format {
+            "D-M-Y" => format!("{day:02}-{month:02}"),
+            _ => format!("{month:02}-{day:02}"),
+        };
+    }
+
+    let year = year.rem_euclid(100);
+    match date_format {
+        "D-M-Y" => format!("{day:02}-{month:02}-{year:02}"),
+        "M-D-Y" => format!("{month:02}-{day:02}-{year:02}"),
+        _ => format!("{year:02}-{month:02}-{day:02}"),
     }
 }
 
@@ -500,5 +560,29 @@ mod tests {
             display(&format!("{yest} 18:00"), "D-M-Y"),
             "[Yesterday 18:00]"
         );
+    }
+
+    #[test]
+    fn compact_display_keeps_relative_dates_and_shortens_calendar_dates() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 9).unwrap();
+
+        assert_eq!(display_compact_at("2026-08-09", "Y-M-D", today), "Today");
+        assert_eq!(
+            display_compact_at("2026-08-10 09:00", "Y-M-D", today),
+            "Tomorrow 09:00"
+        );
+        assert_eq!(
+            display_compact_at("2026-08-08 18:00", "Y-M-D", today),
+            "Yesterday 18:00"
+        );
+
+        assert_eq!(
+            display_compact_at("2026-08-14 18:25", "Y-M-D", today),
+            "08-14 18:25"
+        );
+        assert_eq!(display_compact_at("2026-08-14", "D-M-Y", today), "14-08");
+        assert_eq!(display_compact_at("2027-01-02", "Y-M-D", today), "27-01-02");
+        assert_eq!(display_compact_at("2027-01-02", "D-M-Y", today), "02-01-27");
+        assert_eq!(display_compact_at("", "M-D-Y", today), "");
     }
 }

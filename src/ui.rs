@@ -1529,58 +1529,35 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         return;
     }
 
-    // The trailing columns are as wide as their widest entry, so dates
-    // and markers line up down the panel. Category is shown as a section
-    // header row in All Tasks / search, not a per-task suffix.
-    // Always reserve room for three flags so ≡ / due do not shift when
-    // importance changes.
+    // Category is shown as a section header row in All Tasks / search, not a
+    // per-task suffix. Flags keep a fixed right edge; due dates and body
+    // markers live inside each task's content cell so metadata on one task
+    // cannot shorten every other title in the list.
     let flags_width = crate::model::MAX_IMPORTANCE as usize;
-    let mut extras_width = 0;
-    let mut due_width = 0;
     let presentations: Vec<_> = app
         .view
         .iter()
-        .map(|task_index| {
-            let presentation =
-                TaskPresentation::new(&app.tasks[*task_index], &app.settings.date_format);
-            extras_width = extras_width.max(presentation.extras.width());
-            due_width = due_width.max(presentation.due.width());
-            presentation
-        })
+        .map(|task_index| TaskPresentation::new(&app.tasks[*task_index], &app.settings.date_format))
         .collect();
 
-    // Preserve a useful title at narrow widths. Optional metadata appears in
-    // priority order only when its complete column fits.
+    // Preserve a useful title at narrow widths. Flags stay aligned when the
+    // panel can afford them; row-local metadata decides independently whether
+    // its complete value fits beside that task's title.
     const TITLE_MIN: usize = 8;
     let available = inner.width as usize;
-    let mut used = DONE_MARK_WIDTH as usize + 1 + TITLE_MIN;
-    let due_visible = due_width > 0 && used + 1 + due_width <= available;
-    if due_visible {
-        used += 1 + due_width;
-    }
-    let flags_visible = used + 1 + flags_width <= available;
-    if flags_visible {
-        used += 1 + flags_width;
-    }
-    let extras_visible = extras_width > 0 && used + 1 + extras_width <= available;
-    let columns = Columns {
-        extras: extras_visible,
-        due: due_visible,
-        flags: flags_visible,
-    };
+    let flags_visible = DONE_MARK_WIDTH as usize + 1 + TITLE_MIN + 1 + flags_width <= available;
     let mut widths = vec![
         Constraint::Length(DONE_MARK_WIDTH), // [ ] / [✓]
-        Constraint::Fill(1),                 // title
+        Constraint::Fill(1),                 // title + this task's metadata
     ];
-    if columns.extras {
-        widths.push(Constraint::Length(extras_width as u16));
-    }
-    if columns.due {
-        widths.push(Constraint::Length(due_width as u16));
-    }
-    if columns.flags {
+    if flags_visible {
         widths.push(Constraint::Length(flags_width as u16));
     }
+    let column_gaps = widths.len().saturating_sub(1);
+    let content_width = available
+        .saturating_sub(DONE_MARK_WIDTH as usize)
+        .saturating_sub(column_gaps)
+        .saturating_sub(if flags_visible { flags_width } else { 0 });
     let mut presentations = presentations.into_iter().enumerate();
     let rows: Vec<Row> = app
         .list_rows
@@ -1596,7 +1573,13 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                     .next()
                     .expect("task rows and task presentations must stay aligned");
                 debug_assert_eq!(*view_idx, presentation_index);
-                task_row(presentation, theme, *view_idx == app.task_index, columns)
+                task_row(
+                    presentation,
+                    theme,
+                    *view_idx == app.task_index,
+                    content_width,
+                    flags_visible,
+                )
             }
         })
         .collect();
@@ -1614,9 +1597,7 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     // Remember where the markers ended up, so a click can find them. The
     // flags sit at the right edge, the tick at the left.
     app.areas.done_x = Some(inner.x);
-    app.areas.flag_x = columns
-        .flags
-        .then_some(inner.right().saturating_sub(flags_width as u16));
+    app.areas.flag_x = flags_visible.then_some(inner.right().saturating_sub(flags_width as u16));
 
     let vis = app.selected_visual_row();
     app.task_state.select(vis);
@@ -1697,16 +1678,13 @@ fn extras(task: &crate::model::Task) -> String {
     }
 }
 
-/// Owned display data derived once for one task during a frame. Column sizing
-/// and row construction share it so due labels and body metadata are not
-/// recomputed while laying out the same table.
+/// Owned display data derived once for one task during a frame.
 struct TaskPresentation {
     title: String,
     extras: String,
     due: String,
     flags: String,
     done: bool,
-    has_due: bool,
 }
 
 impl TaskPresentation {
@@ -1714,20 +1692,11 @@ impl TaskPresentation {
         Self {
             title: task.title.clone(),
             extras: extras(task),
-            due: due::display(&task.due, date_format),
+            due: due::display_compact(&task.due, date_format),
             flags: crate::model::importance_marks(task.importance),
             done: task.done,
-            has_due: !task.due.is_empty(),
         }
     }
-}
-
-/// Which of the optional columns the table is laying out this frame.
-#[derive(Clone, Copy)]
-struct Columns {
-    extras: bool,
-    due: bool,
-    flags: bool,
 }
 
 /// Full-width rule with the category name aligned to the title column:
@@ -1756,7 +1725,8 @@ fn task_row(
     presentation: TaskPresentation,
     theme: &Theme,
     selected: bool,
-    columns: Columns,
+    content_width: usize,
+    flags_visible: bool,
 ) -> Row<'static> {
     let TaskPresentation {
         title,
@@ -1764,18 +1734,11 @@ fn task_row(
         due,
         flags,
         done,
-        has_due,
     } = presentation;
     // A finished task is muted — but not on the selected row (even when
     // Categories has focus), where the tick and strikethrough say enough.
-    let title_style = if has_due {
-        let color = if done && !selected {
-            theme.dimmed_accent()
-        } else {
-            theme.accent
-        };
-        Style::new().fg(color)
-    } else if done && !selected {
+    // Due colour belongs to the due label rather than tinting the whole title.
+    let title_style = if done && !selected {
         Style::new().fg(theme.muted_color())
     } else {
         theme.plain()
@@ -1793,25 +1756,97 @@ fn task_row(
         ("[ ]", Style::new().fg(theme.muted_color()))
     };
     cells.push(Cell::new(mark).style(mark_style));
-    cells.push(Cell::new(Span::styled(title, title_style)));
-    // Order: title · ≡ · due · flags
-    if columns.extras {
-        cells.push(Cell::new(Span::styled(
-            extras,
-            Style::new().fg(theme.muted_color()),
-        )));
-    }
-    if columns.due {
+    let metadata_style = if done {
+        Style::new()
+            .fg(theme.muted_color())
+            .add_modifier(Modifier::CROSSED_OUT)
+    } else {
+        Style::new().fg(theme.muted_color())
+    };
+    let due_style = if done {
+        title_style
+    } else {
+        Style::new().fg(theme.accent)
+    };
+    cells.push(Cell::new(task_content_line(
+        title,
+        title_style,
+        extras,
+        metadata_style,
+        due,
+        due_style,
+        content_width,
+    )));
+    if flags_visible {
+        let flag_style = if done {
+            metadata_style
+        } else {
+            Style::new().fg(theme.error_color())
+        };
         cells.push(Cell::new(Text::from(
-            Line::from(Span::styled(due, title_style)).right_aligned(),
-        )));
-    }
-    if columns.flags {
-        cells.push(Cell::new(Text::from(
-            Line::from(Span::styled(flags, Style::new().fg(theme.error_color()))).right_aligned(),
+            Line::from(Span::styled(flags, flag_style)).right_aligned(),
         )));
     }
     Row::new(cells)
+}
+
+/// Build one task's content cell with row-local metadata at its right edge.
+/// Due is the highest-priority suffix; body/progress markers join it only when
+/// both complete values fit while retaining a recognisable title.
+fn task_content_line(
+    title: String,
+    title_style: Style,
+    extras: String,
+    extras_style: Style,
+    due: String,
+    due_style: Style,
+    width: usize,
+) -> Line<'static> {
+    const TITLE_MIN: usize = 8;
+    const META_GAP: usize = 1;
+
+    let title_floor = title.width().min(TITLE_MIN);
+    let mut show_due = false;
+    let mut show_extras = false;
+    let mut metadata_width = 0;
+
+    if !due.is_empty() && title_floor + META_GAP + due.width() <= width {
+        show_due = true;
+        metadata_width = due.width();
+    }
+    if !extras.is_empty() {
+        let joined_width = if metadata_width == 0 {
+            extras.width()
+        } else {
+            extras.width() + META_GAP + metadata_width
+        };
+        if title_floor + META_GAP + joined_width <= width {
+            show_extras = true;
+            metadata_width = joined_width;
+        }
+    }
+
+    if metadata_width == 0 {
+        return Line::from(Span::styled(truncate(&title, width), title_style));
+    }
+
+    let title_width = width.saturating_sub(META_GAP + metadata_width);
+    let title = truncate(&title, title_width);
+    let padding = width.saturating_sub(title.width() + metadata_width);
+    let mut spans = vec![
+        Span::styled(title, title_style),
+        Span::raw(" ".repeat(padding)),
+    ];
+    if show_extras {
+        spans.push(Span::styled(extras, extras_style));
+        if show_due {
+            spans.push(Span::raw(" "));
+        }
+    }
+    if show_due {
+        spans.push(Span::styled(due, due_style));
+    }
+    Line::from(spans)
 }
 
 // ------------------------------------------------------------ status bar
