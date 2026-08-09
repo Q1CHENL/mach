@@ -15,16 +15,16 @@ pub const BANNER_WIDTH: u16 = 35;
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
     (
-        "Updates that keep checking",
-        "Mach checks again while it stays open.",
+        "Portable backups",
+        "Export every task, category, and image in one archive.",
     ),
     (
-        "Smarter retries",
-        "Failed checks retry sooner and honor GitHub's wait time.",
+        "Safe restores",
+        "Import archives without duplicates or partial changes.",
     ),
     (
-        "Consistent update notices",
-        "Every data store sees the same available update.",
+        "Lists that keep going",
+        "Enter continues todos, bullets, and numbered items.",
     ),
 ];
 
