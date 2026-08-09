@@ -15,16 +15,16 @@ pub const BANNER_WIDTH: u16 = 35;
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
     (
-        "Compact due dates",
-        "Due dates no longer shrink unrelated task titles.",
+        "Responsive task preview",
+        "Narrow panes stack fields so editing stays in place.",
     ),
     (
-        "Blank rows preserved",
-        "Editors keep intentional blank rows.",
+        "Clickable command bar",
+        "Click the command bar or clock to focus it.",
     ),
     (
-        "Release notes on demand",
-        "Use /whatsnew again; Help shows the data store.",
+        "Consistent forms",
+        "Category and task editors now share the same spacing.",
     ),
 ];
 
