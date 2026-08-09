@@ -79,6 +79,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             .spacing(1)
             .areas(content);
 
+    let mut modal_task_form = false;
     draw_sidebar(f, app, &theme, sidebar);
     if let Some((list, preview_rect)) =
         split_tasks_and_preview(right, &app.settings.preview_position)
@@ -86,15 +87,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         app.areas.preview = preview_rect;
         draw_tasks(f, app, &theme, list);
         match app.mode {
-            Mode::TaskForm => draw_task_form(f, app, &theme, preview_rect, true),
+            Mode::TaskForm => match docked_task_form_layout(preview_rect) {
+                Some(layout) => draw_task_form(f, app, &theme, preview_rect, layout),
+                None => {
+                    draw_task_preview(f, app, &theme, preview_rect);
+                    modal_task_form = true;
+                }
+            },
             _ => draw_task_preview(f, app, &theme, preview_rect),
         }
     } else {
         app.areas.preview = Rect::ZERO;
         draw_tasks(f, app, &theme, right);
         if app.mode == Mode::TaskForm {
-            // Short window: fall back to the centered modal editor.
-            draw_task_form(f, app, &theme, area, false);
+            modal_task_form = true;
         }
     }
     draw_status(f, app, &theme, status);
@@ -109,9 +115,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Welcome => draw_welcome(f, &theme, area),
         Mode::WhatsNew => draw_whats_new(f, &theme, area),
         Mode::CategoryForm => draw_category_form(f, app, &theme, area),
-        Mode::TaskForm => {
-            // Already drawn in the preview pane (or as a modal above).
+        Mode::TaskForm if modal_task_form => {
+            // Draw the fallback last, over the intact panels and task preview.
+            draw_task_form(f, app, &theme, area, TaskFormLayout::Modal);
         }
+        Mode::TaskForm => {} // Already drawn in the task preview pane.
         _ => {}
     }
 }
@@ -163,12 +171,48 @@ fn split_preview_right(right: Rect) -> Option<(Rect, Rect)> {
 
 // --------------------------------------------------------- task dialog
 
+const TASK_FORM_WIDE_CHROME: u16 = 9;
+const TASK_FORM_COMPACT_CHROME: u16 = 15;
+const TASK_FORM_MIN_BODY_HEIGHT: u16 = 3;
+const TASK_FORM_WIDE_MIN_WIDTH: u16 = 56;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskFormLayout {
+    DockedWide,
+    DockedCompact,
+    Modal,
+}
+
+impl TaskFormLayout {
+    fn is_docked(self) -> bool {
+        !matches!(self, Self::Modal)
+    }
+
+    fn is_compact(self) -> bool {
+        matches!(self, Self::DockedCompact)
+    }
+}
+
+fn docked_task_form_layout(area: Rect) -> Option<TaskFormLayout> {
+    if area.width >= TASK_FORM_WIDE_MIN_WIDTH
+        && area.height >= TASK_FORM_WIDE_CHROME + TASK_FORM_MIN_BODY_HEIGHT
+    {
+        Some(TaskFormLayout::DockedWide)
+    } else if area.width >= PREVIEW_WIDTH_MIN
+        && area.height >= TASK_FORM_COMPACT_CHROME + TASK_FORM_MIN_BODY_HEIGHT
+    {
+        Some(TaskFormLayout::DockedCompact)
+    } else {
+        None
+    }
+}
+
 /// Title, category/due/flags metadata, then the body: a free stack of prose,
 /// to-dos and pictures with a `/` menu for making new ones.
 ///
-/// `docked` fills `area` (the permanent preview pane). Otherwise the
-/// form is a centered modal for short terminals.
-fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docked: bool) {
+/// Docked layouts fill the permanent task preview pane. The modal layout is
+/// centered over `area` when that pane cannot expose every field honestly.
+fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layout: TaskFormLayout) {
     // Disjoint borrows: the form owns the fields, the store owns the
     // decoded images.
     let App {
@@ -178,22 +222,21 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
     } = app;
     let Some(form) = form.as_mut() else { return };
 
-    // Borders (2), title + metadata boxes (6), hint (1).
-    const CHROME: u16 = 9;
-    const MIN_DOCKED_HEIGHT: u16 = CHROME + 3;
-    const MIN_DOCKED_WIDTH: u16 = 56;
-    // A tiny permanent preview cannot expose every editable field honestly.
-    // Keep the list underneath and use the same centered modal as compact mode.
-    let docked = docked && area.height >= MIN_DOCKED_HEIGHT && area.width >= MIN_DOCKED_WIDTH;
-    let rect = if docked {
+    let rect = if layout.is_docked() {
         area
     } else {
-        let full = f.area();
-        let width = 92.min(full.width.saturating_sub(4));
-        let body_height = full.height.saturating_sub(CHROME).clamp(3, 22);
-        centered(full, width, (CHROME + body_height).min(full.height))
+        let width = 92.min(area.width.saturating_sub(4));
+        let body_height = area
+            .height
+            .saturating_sub(TASK_FORM_WIDE_CHROME)
+            .clamp(TASK_FORM_MIN_BODY_HEIGHT, 22);
+        centered(
+            area,
+            width,
+            (TASK_FORM_WIDE_CHROME + body_height).min(area.height),
+        )
     };
-    let h_pad = if docked { 1 } else { 2 };
+    let h_pad = if layout.is_docked() { 1 } else { 2 };
     let block = Block::bordered()
         .border_type(BorderType::Thick)
         .border_style(theme.accent_text())
@@ -206,21 +249,37 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
     f.render_widget(Clear, rect);
     f.render_widget(block, rect);
 
-    let [title_box, metadata_box, body_box, hint] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Min(3),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
-    // Category takes the rest; Due fits a formatted date+time; Flags fits ⚑⚑⚑.
-    let [category_box, due_box, importance_box] = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(20),
-        Constraint::Length(9),
-    ])
-    .spacing(1)
-    .areas(metadata_box);
+    let (title_box, category_box, due_box, importance_box, body_box, hint) = if layout.is_compact()
+    {
+        let [title, category, due, importance, body, hint] = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(TASK_FORM_MIN_BODY_HEIGHT),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+        (title, category, due, importance, body, hint)
+    } else {
+        let [title, metadata, body, hint] = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(TASK_FORM_MIN_BODY_HEIGHT),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+        // Category takes the rest; Due fits a formatted date+time;
+        // Flags fits ⚑⚑⚑.
+        let [category, due, importance] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(20),
+            Constraint::Length(9),
+        ])
+        .spacing(1)
+        .areas(metadata);
+        (title, category, due, importance, body, hint)
+    };
 
     // --- title ----------------------------------------------------------
     let focused = form.field == Field::Title;
@@ -311,10 +370,10 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
                 .add_modifier(Modifier::BOLD),
         ),
         None => Line::styled(
-            if docked {
-                "/ commands · Ctrl+Z undo · Ctrl+S save · Esc list"
-            } else {
-                "/ commands · Ctrl+Z undo · Ctrl+S save · Esc cancel"
+            match layout {
+                TaskFormLayout::DockedWide => "/ commands · Ctrl+Z undo · Ctrl+S save · Esc list",
+                TaskFormLayout::DockedCompact => "/ · Ctrl+S save · Esc list",
+                TaskFormLayout::Modal => "/ commands · Ctrl+Z undo · Ctrl+S save · Esc cancel",
             },
             Style::new().fg(theme.muted_color()),
         ),
@@ -342,7 +401,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, docke
 /// Read-only view of the selected task in the permanent preview pane.
 fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let focused = false;
-    let block = panel("Preview", focused, theme);
+    let block = panel("Task preview", focused, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {

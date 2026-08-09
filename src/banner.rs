@@ -62,7 +62,7 @@ pub const HELP_COLUMNS: [HelpRow; 16] = [
     ),
     row(
         "↑ ↓          within a panel",
-        "Enter        edit in the preview",
+        "Enter        edit in the task preview",
     ),
     row("⌥↑ ⌥↓       reorder in manual view", ""),
     row("PgUp PgDn    top / bottom", "Space        tick a task off"),
@@ -76,7 +76,7 @@ pub const HELP_COLUMNS: [HelpRow; 16] = [
     row("", ""),
     heading(
         "COMMANDS  (press /)",
-        "PREVIEW  (Enter · when space allows)",
+        "TASK PREVIEW  (Enter · when space allows)",
     ),
     row(
         "/search  /settings  /help",

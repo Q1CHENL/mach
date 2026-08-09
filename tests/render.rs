@@ -169,7 +169,7 @@ fn help_marks_both_section_headings() {
         is_bold(&buffer, "COMMANDS  (press /)"),
         "second heading not bold"
     );
-    assert!(is_bold(&buffer, "PREVIEW"), "second heading not bold");
+    assert!(is_bold(&buffer, "TASK PREVIEW"), "second heading not bold");
     // An ordinary row is plain, so the checks above mean something.
     assert!(!is_bold(&buffer, "/quit"), "body row should not be bold");
 }
@@ -192,8 +192,65 @@ fn draws_the_task_dialog_with_a_body() {
     assert!(screen.contains("1. first"), "{screen}");
     assert!(screen.contains("↗ https://example.com"), "{screen}");
     assert!(
-        screen.contains("Preview") || screen.contains("Esc list"),
+        screen.contains("Task preview") || screen.contains("Esc list"),
         "{screen}"
+    );
+}
+
+#[test]
+fn narrow_side_preview_uses_a_stacked_in_place_editor() {
+    let mut app = sample_app();
+    app.settings.preview_position = "right".into();
+    app.open_edit_task();
+
+    let buffer = draw(&mut app, 90, 30);
+    let preview = app.areas.preview;
+    let (edit_x, _) = find_cells(&buffer, " Edit task ");
+    assert!(
+        edit_x >= preview.x && edit_x < preview.right(),
+        "editor should stay inside the task preview: preview={preview:?}\n{}",
+        buffer_text(&buffer)
+    );
+
+    let (_, title_y) = find_cells(&buffer, " Title ");
+    let (_, category_y) = find_cells(&buffer, " Category ");
+    let (_, due_y) = find_cells(&buffer, " Due ");
+    let (_, flags_y) = find_cells(&buffer, " Flags ");
+    assert!(
+        title_y < category_y && category_y < due_y && due_y < flags_y,
+        "compact metadata fields should stack vertically\n{}",
+        buffer_text(&buffer)
+    );
+}
+
+#[test]
+fn modal_task_editor_keeps_the_task_preview_visible_behind_it() {
+    let mut app = sample_app();
+    app.settings.preview_position = "right".into();
+    app.tasks[0].title = format!("{}UNDERLAY", " ".repeat(32));
+    app.invalidate_preview();
+    app.rebuild_view();
+    app.open_edit_task();
+
+    let buffer = draw(&mut app, 120, 16);
+    let preview = app.areas.preview;
+    let (edit_x, _) = find_cells(&buffer, " Edit task ");
+    assert!(edit_x < preview.x, "fixture should use the modal fallback");
+
+    // The modal ends before the right edge. A marker placed at the far end
+    // of the underlying preview title must remain visible beside it.
+    let edge_start = buffer.area.width.saturating_sub(14);
+    let mut right_edge = String::new();
+    for y in 0..buffer.area.height {
+        for x in edge_start..buffer.area.width {
+            right_edge.push_str(buffer[(x, y)].symbol());
+        }
+        right_edge.push('\n');
+    }
+    assert!(
+        right_edge.contains("UNDERLAY"),
+        "modal fallback should preserve the task preview\n{}",
+        buffer_text(&buffer)
     );
 }
 
@@ -476,10 +533,10 @@ fn preview_can_sit_on_the_right() {
     app.settings.preview_position = "right".into();
     // Wide + tall enough for a side preview.
     let screen = render(&mut app, 120, 30);
-    assert!(screen.contains("Preview"), "{screen}");
+    assert!(screen.contains("Task preview"), "{screen}");
     assert!(screen.contains("ship the release"), "{screen}");
-    // Tasks title and Preview title should appear on the same band (top),
-    // not only with Preview under a short task list.
+    // Tasks and Task preview titles should appear on the same band (top),
+    // not only with Task preview under a short task list.
     let lines: Vec<&str> = screen.lines().collect();
     let tasks_y = lines
         .iter()
@@ -487,8 +544,8 @@ fn preview_can_sit_on_the_right() {
         .expect("Tasks");
     let preview_y = lines
         .iter()
-        .position(|l| l.contains("Preview"))
-        .expect("Preview");
+        .position(|l| l.contains("Task preview"))
+        .expect("Task preview");
     assert!(
         preview_y.abs_diff(tasks_y) <= 2,
         "preview should be beside tasks, not far below: tasks={tasks_y} preview={preview_y}\n{screen}"

@@ -151,7 +151,7 @@ pub struct Areas {
     pub slash_menu: Rect,
 }
 
-pub const SETTINGS_ITEMS: [&str; 4] = ["Sort", "Theme", "Date format", "Preview"];
+pub const SETTINGS_ITEMS: [&str; 4] = ["Sort", "Theme", "Date format", "Task preview"];
 
 /// One row of the task table: a real task, or a category section header
 /// (All Tasks / search only). Headers are not selectable.

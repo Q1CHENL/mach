@@ -67,7 +67,7 @@ impl SlashCommand {
     pub fn hint(self) -> &'static str {
         match self {
             Self::Search => "search tasks",
-            Self::Settings => "sort, theme, date, preview",
+            Self::Settings => "sort, theme, date, task preview",
             Self::Help => "key reference",
             Self::WhatsNew => "release highlights",
             Self::CopyTitle => "copy selected task title",
