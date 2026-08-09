@@ -1,6 +1,6 @@
 # Mach
 
-A terminal todo TUI for people who live in the shell and work with agents.
+A terminal-first task manager for people who live in the shell and work with agents.
 
 Categories, due dates, subtasks, inline images, and a CLI that scripts or
 agents can drive.
