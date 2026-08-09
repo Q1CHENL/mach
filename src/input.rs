@@ -1482,7 +1482,9 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             let (x, y) = (m.column, m.row);
             let sidebar = app.areas.sidebar;
             let tasks = app.areas.tasks;
-            if contains(sidebar, x, y) {
+            if contains(app.areas.command_bar, x, y) {
+                focus_command_bar(app, x);
+            } else if contains(sidebar, x, y) {
                 if app.searching {
                     return;
                 }
@@ -1549,7 +1551,9 @@ fn handle_slash_mouse(app: &mut App, mouse: MouseEvent) {
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if contains(rect, mouse.column, mouse.row)
+            if contains(app.areas.command_bar, mouse.column, mouse.row) {
+                set_command_bar_cursor(app, mouse.column);
+            } else if contains(rect, mouse.column, mouse.row)
                 && mouse.row > rect.y
                 && mouse.row + 1 < rect.bottom()
             {
@@ -1567,6 +1571,25 @@ fn handle_slash_mouse(app: &mut App, mouse: MouseEvent) {
         }
         _ => {}
     }
+}
+
+/// Give the bottom command bar the same input mode as its keyboard entry
+/// point. A locked search resumes editing instead of being silently cleared.
+fn focus_command_bar(app: &mut App, x: u16) {
+    match app.mode {
+        Mode::Slash | Mode::Search => {}
+        Mode::Normal if app.searching => app.resume_search(),
+        Mode::Normal => app.open_slash(),
+        _ => return,
+    }
+    set_command_bar_cursor(app, x);
+}
+
+fn set_command_bar_cursor(app: &mut App, x: u16) {
+    // The visible slash occupies the first cell of the command field.
+    let col = x.saturating_sub(app.areas.command_bar.x).saturating_sub(1) as usize;
+    app.input.set_cursor_from_col(col);
+    app.dirty = true;
 }
 
 /// True when a left-click lands on the sidebar or task list (and not on

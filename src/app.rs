@@ -47,6 +47,11 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// The bottom command bar, rather than either list panel, owns input.
+    pub fn command_bar_focused(self) -> bool {
+        matches!(self, Mode::Slash | Mode::Search)
+    }
+
     /// Anything drawn on top of the two panels.
     pub fn is_overlay(self) -> bool {
         matches!(
@@ -132,6 +137,8 @@ pub(crate) enum UpdateActivity {
 pub struct Areas {
     pub sidebar: Rect,
     pub tasks: Rect,
+    /// Inner row of the bottom command bar, including its clock.
+    pub command_bar: Rect,
     /// Bottom-right task preview / docked editor, when the window is tall enough.
     pub preview: Rect,
     /// Screen columns of the flag and done markers, as the table laid
@@ -1446,6 +1453,17 @@ impl App {
         self.searching = true;
         self.task_index = 0;
         self.rebuild_view();
+    }
+
+    /// Return keyboard input to an already locked search without rebuilding
+    /// the view or moving its selected task.
+    pub fn resume_search(&mut self) {
+        if !self.searching {
+            return;
+        }
+        self.mode = Mode::Search;
+        self.input = TextInput::new(&self.search_query, MAX_TITLE_LEN);
+        self.dirty = true;
     }
 
     pub fn end_search(&mut self) {

@@ -333,10 +333,12 @@ fn hidden_geometry_is_cleared_on_an_undersized_frame() {
     let mut app = sample_app();
     let _ = render(&mut app, 100, 30);
     assert!(!app.areas.tasks.is_empty());
+    assert!(!app.areas.command_bar.is_empty());
 
     let _ = render(&mut app, 20, 5);
     assert!(app.areas.tasks.is_empty());
     assert!(app.areas.sidebar.is_empty());
+    assert!(app.areas.command_bar.is_empty());
     assert!(app.areas.slash_menu.is_empty());
 }
 

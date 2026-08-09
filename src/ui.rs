@@ -1433,7 +1433,8 @@ fn paint_scrollbar(
 
 fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let focused = app.focus == Focus::Sidebar;
-    let block = panel("Categories", focused, theme);
+    let chrome_focus = focused && !app.mode.command_bar_focused();
+    let block = panel("Categories", chrome_focus, theme);
     let inner = block.inner(area);
     app.areas.sidebar = inner;
     if inner.height == 0 || inner.width == 0 {
@@ -1484,7 +1485,7 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         rows,
         inner.height as usize,
         app.cat_state.offset(),
-        focused,
+        chrome_focus,
     );
 }
 
@@ -1494,7 +1495,7 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let focused = app.focus == Focus::Tasks;
     // While the task editor is open, dim panel chrome (border / scrollbar)
     // but keep the selected-row wash so the edited task stays visible.
-    let chrome_focus = focused && app.mode != Mode::TaskForm;
+    let chrome_focus = focused && app.mode != Mode::TaskForm && !app.mode.command_bar_focused();
     // The sidebar already says which category is showing; only a search
     // needs spelling out up here.
     let mut block = panel("Tasks", chrome_focus, theme);
@@ -1886,6 +1887,9 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         Constraint::Length(right_width.min(area.width)),
     ])
     .areas(area);
+    // The clock is display-only, but it is still part of the command bar's
+    // mouse target. A click there focuses the input and lands at its end.
+    app.areas.command_bar = area;
     f.render_widget(Paragraph::new(right), right_area);
 
     let field = left_area.width.saturating_sub(2) as usize;

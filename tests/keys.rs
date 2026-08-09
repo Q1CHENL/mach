@@ -1,5 +1,7 @@
 //! Key and mouse handling, driven through the real event entry point.
 
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -11,6 +13,7 @@ use mach::form::TaskForm;
 use mach::input::handle_event;
 use mach::model::{Category, Task};
 use mach::store::Store;
+use mach::ui;
 
 fn app() -> App {
     let mut store = Store::open_in_memory_with_paths(
@@ -59,6 +62,25 @@ fn file_app() -> (App, std::path::PathBuf) {
 
 fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     handle_event(app, Event::Key(KeyEvent::new(code, modifiers)));
+}
+
+fn click(app: &mut App, column: u16, row: u16) {
+    handle_event(
+        app,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+}
+
+fn draw(app: &mut App, width: u16, height: u16) {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, app))
+        .expect("draw must not panic");
 }
 
 fn repeat(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -790,6 +812,80 @@ fn typeahead_query_is_reset_when_focus_changes() {
         app.selected_task().map(|task| task.title.as_str()),
         Some("zebra")
     );
+}
+
+#[test]
+fn command_bar_click_opens_the_palette_and_positions_its_cursor() {
+    let mut app = app();
+    app.focus = Focus::Sidebar;
+    app.areas.command_bar = Rect {
+        x: 2,
+        y: 14,
+        width: 40,
+        height: 1,
+    };
+
+    click(&mut app, 8, 14);
+    assert_eq!(app.mode, Mode::Slash);
+
+    for c in "help".chars() {
+        press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    click(&mut app, 5, 14);
+    assert_eq!(
+        app.mode,
+        Mode::Slash,
+        "clicking the input must not close it"
+    );
+    assert_eq!(app.input.cursor(), 2);
+}
+
+#[test]
+fn command_bar_click_resumes_a_locked_search() {
+    let mut app = app();
+    app.start_search("i");
+    app.select_task(1);
+    let selected = app.selected_task().unwrap().id.clone();
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.searching);
+    app.areas.command_bar = Rect {
+        x: 2,
+        y: 14,
+        width: 40,
+        height: 1,
+    };
+
+    click(&mut app, 8, 14);
+
+    assert_eq!(app.mode, Mode::Search);
+    assert_eq!(app.input.value(), "i");
+    assert_eq!(app.input.cursor(), 1);
+    assert_eq!(app.selected_task().map(|task| &task.id), Some(&selected));
+}
+
+#[test]
+fn command_bar_clock_is_clickable_and_places_the_cursor_at_the_end() {
+    let mut app = app();
+    app.focus = Focus::Sidebar;
+    let (width, height) = (100, 30);
+    draw(&mut app, width, height);
+
+    // The clock is right-aligned inside the bottom status bar.
+    click(&mut app, width - 3, height - 2);
+    assert_eq!(app.mode, Mode::Slash);
+
+    for c in "help".chars() {
+        press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    click(&mut app, width - 3, height - 2);
+
+    assert_eq!(
+        app.mode,
+        Mode::Slash,
+        "the clock belongs to the command bar"
+    );
+    assert_eq!(app.input.cursor(), 4);
 }
 
 #[test]
