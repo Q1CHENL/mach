@@ -1,12 +1,12 @@
 [package]
 name = "mach-tui"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90"
-description = "A powerful yet easy-to-use todo TUI"
+description = "A terminal-first task manager for people who live in the shell and work with agents"
 authors = ["Qichen Liu"]
 license = "MIT"
-keywords = ["tui", "todo", "terminal", "productivity"]
+keywords = ["tui", "todo", "terminal", "productivity", "task-management"]
 categories = ["command-line-utilities"]
 readme = "README.md"
 repository = "https://github.com/Q1CHENL/mach"
