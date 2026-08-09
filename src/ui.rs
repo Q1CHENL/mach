@@ -510,8 +510,8 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let Some(form) = &mut app.category_form else {
         return;
     };
-    // Borders (2), top pad under title (1), name box (3), gap (1), hint (1).
-    const CHROME: u16 = 8;
+    // Borders (2), name box (3), hint (1).
+    const CHROME: u16 = 6;
     let text_height = area.height.saturating_sub(CHROME).clamp(3, 12);
     let width = 72.min(area.width.saturating_sub(4));
     let rect = centered(area, width, (CHROME + text_height).min(area.height));
@@ -523,15 +523,13 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             format!(" {} ", form.title_text()),
             theme.accent_text().bold(),
         ))
-        // One blank row under "Edit category" / "New category".
-        .padding(Padding::new(2, 2, 1, 0));
+        .padding(Padding::horizontal(1));
     let inner = block.inner(rect);
     f.render_widget(Clear, rect);
     f.render_widget(block, rect);
 
-    let [name_box, _gap, text_box, hint] = Layout::vertical([
+    let [name_box, text_box, hint] = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(1),
         Constraint::Length(text_height),
         Constraint::Length(1),
     ])
