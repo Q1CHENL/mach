@@ -1088,23 +1088,38 @@ impl BodyEditor {
         }
     }
 
-    /// Enter always starts a plain line: a to-do is asked for with
-    /// `/todo`, not inherited from the line above.
-    /// Returns false when the line cap is hit.
+    /// Enter continues to-do, bullet and numbered lines. An empty list item
+    /// returns to plain text; prose, links and pictures still start prose.
+    /// Returns false only when adding a line would exceed the line cap.
     pub fn newline(&mut self) -> bool {
         self.close_menu();
+
+        let exits_list = match &self.lines[self.cursor] {
+            Line::Todo { text, .. } | Line::Bullet(text) | Line::Number(text) => {
+                text.value().trim().is_empty()
+            }
+            Line::Text(_) | Line::Link(_) | Line::Image { .. } => false,
+        };
+        if exits_list {
+            self.lines[self.cursor] = self.empty_line();
+            return true;
+        }
+
         if !self.can_add_lines(1) {
             return false;
         }
-        let tail = match self.line() {
-            Line::Text(text)
-            | Line::Todo { text, .. }
-            | Line::Bullet(text)
-            | Line::Number(text)
-            | Line::Link(text) => text.split_off_at_cursor(),
-            Line::Image { .. } => TextInput::new("", self.line_max_len),
+        let line_max_len = self.line_max_len;
+        let next = match self.line() {
+            Line::Text(text) | Line::Link(text) => Line::Text(text.split_off_at_cursor()),
+            Line::Todo { text, .. } => Line::Todo {
+                text: text.split_off_at_cursor(),
+                done: false,
+            },
+            Line::Bullet(text) => Line::Bullet(text.split_off_at_cursor()),
+            Line::Number(text) => Line::Number(text.split_off_at_cursor()),
+            Line::Image { .. } => Line::Text(TextInput::new("", line_max_len)),
         };
-        self.lines.insert(self.cursor + 1, Line::Text(tail));
+        self.lines.insert(self.cursor + 1, next);
         self.cursor += 1;
         // Leaving a line may complete a typed image path.
         self.adopt_pasted_paths();
@@ -2189,9 +2204,6 @@ mod tests {
         e.apply(Command::Number);
         type_in(&mut e, "first");
         e.newline();
-        // Enter starts a plain line; convert the next one too.
-        type_in(&mut e, "/number");
-        e.apply(Command::Number);
         type_in(&mut e, "second");
         assert_eq!(
             e.value(),
@@ -2250,14 +2262,57 @@ mod tests {
     }
 
     #[test]
-    fn enter_in_a_todo_starts_a_plain_line() {
-        let mut e = editor(&[Block::todo("one", false)]);
+    fn enter_in_a_todo_starts_an_unchecked_todo() {
+        let mut e = editor(&[Block::todo("one", true)]);
         e.end();
         e.newline();
         type_in(&mut e, "two");
         assert_eq!(
             e.value(),
-            vec![Block::todo("one", false), Block::text("two")]
+            vec![Block::todo("one", true), Block::todo("two", false)]
+        );
+    }
+
+    #[test]
+    fn enter_in_a_bullet_continues_the_list() {
+        let mut e = editor(&[Block::bullet("first")]);
+        e.end();
+        e.newline();
+        type_in(&mut e, "second");
+
+        assert_eq!(
+            e.value(),
+            vec![Block::bullet("first"), Block::bullet("second")]
+        );
+    }
+
+    #[test]
+    fn enter_splits_a_numbered_item_into_the_continued_list() {
+        let mut e = editor(&[Block::number("firstsecond")]);
+        e.home();
+        for _ in 0..5 {
+            e.right();
+        }
+        e.newline();
+
+        assert_eq!(
+            e.value(),
+            vec![Block::number("first"), Block::number("second")]
+        );
+        assert_eq!(e.text_for_copy(), "1. first\n2. second");
+    }
+
+    #[test]
+    fn enter_on_an_empty_list_item_returns_to_plain_text() {
+        let mut e = editor(&[]);
+        type_in(&mut e, "- first");
+        e.newline();
+        e.newline();
+        type_in(&mut e, "plain");
+
+        assert_eq!(
+            e.value(),
+            vec![Block::bullet("first"), Block::text("plain")]
         );
     }
 
