@@ -717,6 +717,7 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
             app.help_scroll = 0;
             app.mode = Mode::Help;
         }
+        SlashCommand::WhatsNew => app.mode = Mode::WhatsNew,
         SlashCommand::CopyTitle => match app.selected_task() {
             Some(task) => {
                 finish_copy(app, crate::body::CopyPayload::Text(task.title.clone()));

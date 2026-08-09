@@ -1,5 +1,6 @@
 //! Application state and every operation the UI can trigger.
 
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -307,6 +308,10 @@ impl App {
         };
         app.rebuild_view();
         Ok(app)
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        self.store.data_dir()
     }
 
     /// Refresh after another process commits. Dialogs deliberately defer the

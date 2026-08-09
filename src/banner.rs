@@ -82,7 +82,7 @@ pub const HELP_COLUMNS: [HelpRow; 16] = [
         "/search  /settings  /help",
         "Tab ⇧Tab     next / previous field",
     ),
-    row("", "← → Space    choose category / flags"),
+    row("/whatsnew", "← → Space    choose category / flags"),
     row(
         "/copy  /copytitle · /done",
         "Enter        calendar · new line · open",

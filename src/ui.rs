@@ -2115,6 +2115,14 @@ fn draw_help(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             lines.push(Line::raw(""));
         }
     }
+    let store = format!("Data store: {}", app.data_dir().display());
+    lines.push(
+        Line::styled(
+            truncate(&store, width.saturating_sub(4) as usize),
+            Style::new().fg(theme.muted_color()),
+        )
+        .centered(),
+    );
     lines.push(Line::styled(banner::HELP_FOOTER, theme.accent_text()).centered());
 
     let height = u16::try_from(lines.len())

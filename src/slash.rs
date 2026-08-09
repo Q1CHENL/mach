@@ -1,10 +1,11 @@
-//! The `/` command palette: search, settings, help, copy, done, purge, update, quit.
+//! The `/` command palette: navigation, information, task actions, updates and quit.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommand {
     Search,
     Settings,
     Help,
+    WhatsNew,
     /// Copy the selected task's title to the clipboard.
     CopyTitle,
     /// Copy the selected task's title and body to the clipboard.
@@ -20,10 +21,11 @@ pub enum SlashCommand {
 
 impl SlashCommand {
     /// Fixed palette order. Search is first when the menu opens empty.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Search,
         Self::Settings,
         Self::Help,
+        Self::WhatsNew,
         Self::CopyTitle,
         Self::CopyTask,
         Self::Done,
@@ -37,6 +39,7 @@ impl SlashCommand {
             Self::Search => "search",
             Self::Settings => "settings",
             Self::Help => "help",
+            Self::WhatsNew => "whatsnew",
             Self::CopyTitle => "copytitle",
             Self::CopyTask => "copy",
             Self::Done => "done",
@@ -51,6 +54,7 @@ impl SlashCommand {
             Self::Search => "Search",
             Self::Settings => "Settings",
             Self::Help => "Help",
+            Self::WhatsNew => "What's new",
             Self::CopyTitle => "Copy title",
             Self::CopyTask => "Copy task",
             Self::Done => "Done tasks",
@@ -65,6 +69,7 @@ impl SlashCommand {
             Self::Search => "search tasks",
             Self::Settings => "sort, theme, date, preview",
             Self::Help => "key reference",
+            Self::WhatsNew => "release highlights",
             Self::CopyTitle => "copy selected task title",
             Self::CopyTask => "copy selected task title and body",
             Self::Done => "show or hide completed tasks",
@@ -79,6 +84,7 @@ impl SlashCommand {
             Self::Search => &["search"],
             Self::Settings => &["settings"],
             Self::Help => &["help"],
+            Self::WhatsNew => &["whatsnew"],
             Self::CopyTitle => &["copytitle"],
             Self::CopyTask => &["copy", "copytask"],
             Self::Done => &["done", "hide", "show"],
@@ -205,6 +211,12 @@ mod tests {
     fn typing_update_is_update() {
         assert_eq!(matching("update"), vec![SlashCommand::Update]);
         assert_eq!(matching("upgrade"), vec![SlashCommand::Update]);
+    }
+
+    #[test]
+    fn whats_new_is_the_only_reopenable_launch_page() {
+        assert_eq!(matching("whatsnew"), vec![SlashCommand::WhatsNew]);
+        assert!(matching("about").is_empty());
     }
 
     #[test]
