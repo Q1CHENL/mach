@@ -176,6 +176,16 @@ fn cmd_c_never_quits() {
 }
 
 #[test]
+fn cmd_c_without_a_selection_does_not_type_into_a_form() {
+    let mut app = app();
+    app.open_new_task();
+
+    press(&mut app, KeyCode::Char('c'), KeyModifiers::SUPER);
+
+    assert_eq!(app.form.as_ref().unwrap().title.value(), "");
+}
+
+#[test]
 fn ctrl_shift_c_never_quits() {
     // Ctrl+Shift+C is Copy in many terminals. With no selection it must
     // remain a no-op instead of arming mach's Ctrl+C quit chord.
@@ -644,6 +654,51 @@ fn click_on_panels_does_not_discard_a_dirty_task_form() {
 }
 
 #[test]
+fn modal_task_form_chrome_owns_clicks_over_the_task_panel() {
+    let mut app = app();
+    app.select_category(1);
+    app.open_edit_task();
+    draw(&mut app, 120, 16);
+    let point = ratatui::layout::Position { x: 30, y: 1 };
+    assert!(
+        app.areas.tasks.contains(point),
+        "fixture must overlap the task panel"
+    );
+    assert!(
+        app.form
+            .as_ref()
+            .unwrap()
+            .areas
+            .field_at(point.x, point.y)
+            .is_none(),
+        "fixture must hit modal chrome, not a field"
+    );
+
+    click(&mut app, point.x, point.y);
+
+    assert_eq!(app.mode, Mode::TaskForm);
+    assert!(app.form.is_some());
+}
+
+#[test]
+fn clicking_the_visible_panel_outside_a_clean_modal_still_leaves_the_form() {
+    let mut app = app();
+    app.select_category(1);
+    app.open_edit_task();
+    draw(&mut app, 120, 16);
+    let point = ratatui::layout::Position { x: 110, y: 2 };
+    assert!(
+        app.areas.tasks.contains(point),
+        "fixture must hit the task panel"
+    );
+
+    click(&mut app, point.x, point.y);
+
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.form.is_none());
+}
+
+#[test]
 fn click_on_panels_does_not_discard_a_dirty_category_form() {
     let mut app = app();
     lay_out(&mut app);
@@ -664,6 +719,77 @@ fn click_on_panels_does_not_discard_a_dirty_category_form() {
     assert_eq!(app.mode, Mode::CategoryForm);
     assert!(app.category_form.is_some());
     assert!(message(&app).to_lowercase().contains("unsaved"));
+}
+
+#[test]
+fn modal_category_form_chrome_owns_clicks_over_the_task_panel() {
+    let mut app = app();
+    app.select_category(1);
+    app.open_edit_category();
+    draw(&mut app, 120, 16);
+    let point = ratatui::layout::Position { x: 30, y: 1 };
+    assert!(
+        app.areas.tasks.contains(point),
+        "fixture must overlap the task panel"
+    );
+    let form = app.category_form.as_ref().unwrap();
+    assert!(!form.name_area.contains(point));
+    assert!(!form.description_area.contains(point));
+
+    click(&mut app, point.x, point.y);
+
+    assert_eq!(app.mode, Mode::CategoryForm);
+    assert!(app.category_form.is_some());
+}
+
+#[test]
+fn category_description_slash_menu_rows_are_clickable() {
+    let mut app = app();
+    app.select_category(1);
+    app.open_edit_category();
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+    draw(&mut app, 100, 30);
+
+    let menu_area = app
+        .category_form
+        .as_ref()
+        .unwrap()
+        .body_menu_area
+        .expect("menu layout");
+    assert!(
+        app.category_form
+            .as_ref()
+            .unwrap()
+            .description
+            .menu
+            .is_some(),
+        "slash menu must be open"
+    );
+    handle_event(
+        &mut app,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: menu_area.x + 1,
+            row: menu_area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    assert!(
+        app.category_form
+            .as_ref()
+            .unwrap()
+            .description
+            .menu
+            .is_some(),
+        "scrolling over a menu row must not activate it"
+    );
+    click(&mut app, menu_area.x + 1, menu_area.y + 1);
+    press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+
+    let form = app.category_form.as_ref().unwrap();
+    assert_eq!(form.description.plain_value(), "- x");
+    assert!(form.description.menu.is_none());
 }
 
 #[test]

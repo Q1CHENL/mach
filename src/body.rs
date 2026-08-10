@@ -401,7 +401,24 @@ pub struct BodyEditor {
 
 impl BodyEditor {
     pub fn new(blocks: &[Block]) -> Self {
-        Self::from_blocks(blocks, MAX_BODY_LINES, MAX_NOTES_LINE_LEN, false)
+        Self::new_with_images(blocks, crate::image::default_images_root(), &[])
+    }
+
+    pub fn new_with_images(
+        blocks: &[Block],
+        image_root: PathBuf,
+        attachments: &[crate::store::Attachment],
+    ) -> Self {
+        let mut catalog = crate::image::AttachmentCatalog::default();
+        catalog.set(attachments);
+        Self::from_blocks(
+            blocks,
+            MAX_BODY_LINES,
+            MAX_NOTES_LINE_LEN,
+            false,
+            image_root,
+            catalog,
+        )
     }
 
     /// A prose editor with bullets: for category descriptions. No to-dos
@@ -419,10 +436,19 @@ impl BodyEditor {
             MAX_CATEGORY_DESC_LINES,
             MAX_CATEGORY_DESC_LINE_LEN,
             true,
+            crate::image::default_images_root(),
+            crate::image::AttachmentCatalog::default(),
         )
     }
 
-    fn from_blocks(blocks: &[Block], max_lines: usize, line_max_len: usize, plain: bool) -> Self {
+    fn from_blocks(
+        blocks: &[Block],
+        max_lines: usize,
+        line_max_len: usize,
+        plain: bool,
+        image_root: PathBuf,
+        attachments: crate::image::AttachmentCatalog,
+    ) -> Self {
         let mut lines: Vec<Line> = blocks
             .iter()
             .map(|b| line_from_block(b, line_max_len))
@@ -442,8 +468,8 @@ impl BodyEditor {
             content_height: 0,
             prefer_col: u16::MAX,
             sel_anchor: None,
-            image_root: crate::image::default_images_root(),
-            attachments: crate::image::AttachmentCatalog::default(),
+            image_root,
+            attachments,
         };
         // Turn bare image paths in the body into picture blocks.
         if !plain {
@@ -2169,7 +2195,14 @@ mod tests {
 
     #[test]
     fn refuses_more_lines_than_the_cap() {
-        let mut e = BodyEditor::from_blocks(&[], 2, 32, false);
+        let mut e = BodyEditor::from_blocks(
+            &[],
+            2,
+            32,
+            false,
+            crate::image::default_images_root(),
+            crate::image::AttachmentCatalog::default(),
+        );
         type_in(&mut e, "a");
         assert!(e.newline());
         type_in(&mut e, "b");

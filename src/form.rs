@@ -62,8 +62,12 @@ pub struct CategoryForm {
     pub error: Option<String>,
     /// The category being edited; `None` when creating one.
     pub editing: Option<String>,
+    /// Full modal rectangle from the last frame, including its chrome.
+    pub form_area: Rect,
     pub name_area: Rect,
     pub description_area: Rect,
+    /// Screen rect of the open description `/` dropdown.
+    pub body_menu_area: Option<Rect>,
     history: History<CategorySnap>,
     initial_name: String,
     initial_description: String,
@@ -77,8 +81,10 @@ impl CategoryForm {
             on_description: false,
             error: None,
             editing: None,
+            form_area: Rect::ZERO,
             name_area: Rect::ZERO,
             description_area: Rect::ZERO,
+            body_menu_area: None,
             history: History::new(),
             initial_name: String::new(),
             initial_description: String::new(),
@@ -304,6 +310,8 @@ pub struct TaskForm {
     pub editing: Option<String>,
     /// Filled in while drawing; used to hit-test clicks.
     pub areas: FieldAreas,
+    /// Full editor rectangle from the last frame, including its chrome.
+    pub form_area: Rect,
     /// Whether the description's image is shown full size.
     pub preview: bool,
     /// Decoded GIF for preview, keyed by path (kept after close for fast reopen).
@@ -332,17 +340,29 @@ pub struct TaskForm {
 
 impl TaskForm {
     pub fn new() -> Self {
+        Self::new_with_images(crate::image::default_images_root(), &[])
+    }
+
+    pub fn new_with_images(
+        image_root: std::path::PathBuf,
+        attachments: &[crate::store::Attachment],
+    ) -> Self {
+        Self::with_body(BodyEditor::new_with_images(&[], image_root, attachments))
+    }
+
+    fn with_body(body: BodyEditor) -> Self {
         Self {
             title: TextInput::new("", MAX_TITLE_LEN),
             category_id: None,
             category_choices: vec![CategoryChoice::uncategorized()],
             due: TextInput::new("", 32),
             importance: 0,
-            body: BodyEditor::new(&[]),
+            body,
             field: Field::Title,
             error: None,
             editing: None,
             areas: FieldAreas::default(),
+            form_area: Rect::ZERO,
             preview: false,
             gif: None,
             gif_pending: None,
@@ -358,22 +378,30 @@ impl TaskForm {
     }
 
     pub fn edit(task: &Task) -> Self {
-        Self {
-            title: TextInput::new(&task.title, MAX_TITLE_LEN),
+        Self::edit_with_images(task, crate::image::default_images_root(), &[])
+    }
+
+    pub fn edit_with_images(
+        task: &Task,
+        image_root: std::path::PathBuf,
+        attachments: &[crate::store::Attachment],
+    ) -> Self {
+        let body = BodyEditor::new_with_images(&task.body, image_root, attachments);
+        let initial_body = body.value();
+        let mut form = Self::with_body(body);
+        form.title = TextInput::new(&task.title, MAX_TITLE_LEN);
+        form.category_id = task.category_id.clone();
+        form.due = TextInput::new(&task.due, 32);
+        form.importance = task.importance;
+        form.editing = Some(task.id.clone());
+        form.initial = TaskDraft {
+            title: task.title.clone(),
             category_id: task.category_id.clone(),
-            due: TextInput::new(&task.due, 32),
+            due: task.due.clone(),
             importance: task.importance,
-            body: BodyEditor::new(&task.body),
-            editing: Some(task.id.clone()),
-            initial: TaskDraft {
-                title: task.title.clone(),
-                category_id: task.category_id.clone(),
-                due: task.due.clone(),
-                importance: task.importance,
-                body: task.body.clone(),
-            },
-            ..Self::new()
-        }
+            body: initial_body,
+        };
+        form
     }
 
     /// Whether `(x, y)` sits on the drawn picture for body line `line`.

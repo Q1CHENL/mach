@@ -348,17 +348,20 @@ impl App {
 
     pub(crate) fn with_store_and_update_state(
         version: &str,
-        mut store: Store,
+        store: Store,
         update_state: Result<UpdateStateStore, StoreError>,
     ) -> Result<Self, StoreError> {
-        // The transaction reads fresh state, so two concurrently-starting
-        // processes cannot both claim the same first run or upgrade.
         let initial = store.snapshot()?;
-        let (launch, snapshot) = if initial.settings.last_run_version.as_deref() == Some(version) {
-            (LaunchState::Returning, initial)
+        // This is provisional until the terminal session is safely owned.
+        // `record_launch` repeats the classification inside the fresh write
+        // transaction, preserving the cross-process first-run contract.
+        let launch = if initial.settings.last_run_version.as_deref() == Some(version) {
+            LaunchState::Returning
         } else {
-            store.update_with_snapshot(|data| Ok(data.settings.record_launch(version)))?
+            let mut settings = initial.settings.clone();
+            settings.record_launch(version)
         };
+        let snapshot = initial;
         let StoreData {
             revision,
             categories: real_cats,
@@ -437,6 +440,26 @@ impl App {
             app.refresh_update_state(Utc::now().timestamp());
         }
         Ok(app)
+    }
+
+    /// Persist the launch only after terminal initialization succeeds.
+    ///
+    /// Until this runs, Welcome / What's New is merely provisional: a failed
+    /// terminal setup must leave it available for the next successful launch.
+    pub(crate) fn record_launch(&mut self) -> Result<(), StoreError> {
+        let version = self.version.clone();
+        let launch = if self.settings.last_run_version.as_deref() == Some(version.as_str()) {
+            LaunchState::Returning
+        } else {
+            self.update_store(|data| Ok(data.settings.record_launch(&version)))?
+        };
+        self.mode = match launch {
+            LaunchState::FirstRun => Mode::Welcome,
+            LaunchState::Upgraded => Mode::WhatsNew,
+            LaunchState::Returning => Mode::Normal,
+        };
+        self.dirty = true;
+        Ok(())
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -1114,10 +1137,9 @@ impl App {
             self.invalidate_preview();
             return;
         };
-        let mut form = TaskForm::edit(&task);
+        let mut form =
+            TaskForm::edit_with_images(&task, self.images.root().to_path_buf(), &self.attachments);
         form.set_categories(&self.categories, task.category_id.as_deref());
-        form.set_image_root(self.images.root().to_path_buf());
-        form.set_attachments(&self.attachments);
         self.preview_form = Some(form);
         self.preview_task_id = Some(id);
         self.preview_gen = generation;
@@ -1548,11 +1570,10 @@ impl App {
             ));
             return;
         }
-        let mut form = TaskForm::new();
+        let mut form =
+            TaskForm::new_with_images(self.images.root().to_path_buf(), &self.attachments);
         let category = (!self.is_all_view()).then(|| self.current_category_id());
         form.set_categories(&self.categories, category);
-        form.set_image_root(self.images.root().to_path_buf());
-        form.set_attachments(&self.attachments);
         self.task_edit_base = None;
         self.form = Some(form);
         self.mode = Mode::TaskForm;
@@ -1561,10 +1582,12 @@ impl App {
     /// Opens the dialog on the selected task.
     pub fn open_edit_task(&mut self) {
         if let Some(task) = self.selected_task().cloned() {
-            let mut form = TaskForm::edit(&task);
+            let mut form = TaskForm::edit_with_images(
+                &task,
+                self.images.root().to_path_buf(),
+                &self.attachments,
+            );
             form.set_categories(&self.categories, task.category_id.as_deref());
-            form.set_image_root(self.images.root().to_path_buf());
-            form.set_attachments(&self.attachments);
             // Decode body pictures off the UI thread so the dialog opens
             // immediately; they fill in on the next frames.
             self.images.prefetch(form.body.images());
@@ -2643,12 +2666,35 @@ mod tests {
             })
             .unwrap();
 
-        let first = App::with_store("0.2.0", store).unwrap();
+        let mut first = App::with_store("0.2.0", store).unwrap();
         assert_eq!(first.mode, Mode::WhatsNew);
+        first.record_launch().unwrap();
         drop(first);
 
         let second = App::with_store("0.2.0", Store::open(&dir).unwrap()).unwrap();
         assert_eq!(second.mode, Mode::Normal);
+        drop(second);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recording_launch_reclassifies_a_concurrent_provisional_welcome() {
+        let dir = std::env::temp_dir().join(format!(
+            "mach-concurrent-launch-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut first = App::with_store("0.4.0", Store::open(&dir).unwrap()).unwrap();
+        let mut second = App::with_store("0.4.0", Store::open(&dir).unwrap()).unwrap();
+        assert_eq!(first.mode, Mode::Welcome);
+        assert_eq!(second.mode, Mode::Welcome);
+
+        first.record_launch().unwrap();
+        second.record_launch().unwrap();
+
+        assert_eq!(first.mode, Mode::Welcome);
+        assert_eq!(second.mode, Mode::Normal);
+        drop(first);
         drop(second);
         std::fs::remove_dir_all(dir).unwrap();
     }

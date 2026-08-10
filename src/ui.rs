@@ -47,6 +47,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.areas = crate::app::Areas::default();
     if let Some(form) = &mut app.form {
         form.areas = crate::form::FieldAreas::default();
+        form.form_area = Rect::ZERO;
         form.body_menu_area = None;
         form.image_hits.clear();
         if let Some(picker) = &mut form.picker {
@@ -54,8 +55,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
     }
     if let Some(form) = &mut app.category_form {
+        form.form_area = Rect::ZERO;
         form.name_area = Rect::ZERO;
         form.description_area = Rect::ZERO;
+        form.body_menu_area = None;
     }
 
     if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
@@ -112,7 +115,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::Help => draw_help(f, app, &theme, area),
         Mode::Settings => draw_settings(f, app, &theme, area),
-        Mode::Welcome => draw_welcome(f, &theme, area),
+        Mode::Welcome => draw_welcome(f, app, &theme, area),
         Mode::WhatsNew => draw_whats_new(f, &theme, area),
         Mode::CategoryForm => draw_category_form(f, app, &theme, area),
         Mode::TaskForm if modal_task_form => {
@@ -236,6 +239,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
             (TASK_FORM_WIDE_CHROME + body_height).min(area.height),
         )
     };
+    form.form_area = rect;
     let h_pad = if layout.is_docked() { 1 } else { 2 };
     let block = Block::bordered()
         .border_type(BorderType::Thick)
@@ -574,6 +578,7 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let text_height = area.height.saturating_sub(CHROME).clamp(3, 12);
     let width = 72.min(area.width.saturating_sub(4));
     let rect = centered(area, width, (CHROME + text_height).min(area.height));
+    form.form_area = rect;
 
     let block = Block::bordered()
         .border_type(BorderType::Thick)
@@ -640,6 +645,7 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         ));
     }
     if focused {
+        form.body_menu_area = slash_menu_rect(&form.description, box_inner, cursor);
         draw_slash_menu(f, &form.description, theme, box_inner, cursor);
     }
     scrollbar(
@@ -2277,7 +2283,7 @@ fn draw_settings(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
-fn draw_welcome(f: &mut Frame, theme: &Theme, area: Rect) {
+fn draw_welcome(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let mut lines = wordmark_lines(theme, area.width);
     if !lines.is_empty() {
         lines.push(Line::raw(""));
@@ -2291,7 +2297,8 @@ fn draw_welcome(f: &mut Frame, theme: &Theme, area: Rect) {
     );
     lines.push(Line::raw(""));
     lines.push(Line::raw("Written in Rust with ratatui.").centered());
-    lines.push(Line::raw("Your tasks stay local in ~/.mach.").centered());
+    let storage = format!("Your tasks stay local in {}.", app.data_dir().display());
+    lines.push(Line::raw(storage.clone()).centered());
     lines.push(Line::raw(""));
     lines.push(
         Line::styled(
@@ -2301,7 +2308,11 @@ fn draw_welcome(f: &mut Frame, theme: &Theme, area: Rect) {
         .centered(),
     );
 
-    let width = 50.min(area.width);
+    let width = u16::try_from(storage.width())
+        .unwrap_or(u16::MAX)
+        .saturating_add(4)
+        .max(50)
+        .min(area.width);
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2)

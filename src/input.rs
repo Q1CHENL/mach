@@ -141,8 +141,15 @@ fn content_edit_kind(key: KeyEvent) -> Option<EditKind> {
 fn handle_key(app: &mut App, key: KeyEvent) {
     // Cmd/Ctrl+C on a selection copies it. Copying always wins over
     // quitting, so the two can share the chord.
-    if is_copy_chord(key) && copy_selected_body_image(app) {
-        return;
+    if is_copy_chord(key) {
+        if copy_selected_body_image(app) {
+            return;
+        }
+        // Command is Copy on macOS. When there is no selection it remains a
+        // no-op instead of falling through to the editor as a literal `c`.
+        if key.modifiers.contains(KeyModifiers::SUPER) {
+            return;
+        }
     }
     // Auto-repeat comes from one physical hold, not a second affirmative
     // action. Keep navigation/edit repeats responsive, but never let one
@@ -1108,7 +1115,44 @@ fn body_menu_key(body: &mut crate::body::BodyEditor, key: KeyEvent) -> MenuKey {
 
 /// Title, then body as plain text (same export as body `/copy`).
 fn task_clipboard_text(task: &crate::model::Task) -> String {
-    let body = crate::body::BodyEditor::new(&task.body).text_for_copy();
+    use crate::model::Block;
+
+    // Tasks are already persisted as typed blocks. Formatting them must not
+    // send stored text back through the editor's path-adoption logic, where
+    // filesystem contents could silently reinterpret it as a picture.
+    let mut number = 0usize;
+    let body = task
+        .body
+        .iter()
+        .filter_map(|block| match block {
+            Block::Text { text } => {
+                number = 0;
+                (!text.trim().is_empty()).then(|| text.clone())
+            }
+            Block::Todo { text, done } => {
+                number = 0;
+                let mark = if *done { "[✓]" } else { "[ ]" };
+                Some(format!("{mark} {text}"))
+            }
+            Block::Bullet { text } => {
+                number = 0;
+                Some(format!("- {text}"))
+            }
+            Block::Number { text } => {
+                number += 1;
+                Some(format!("{number}. {text}"))
+            }
+            Block::Link { url } => {
+                number = 0;
+                (!url.trim().is_empty()).then(|| url.clone())
+            }
+            Block::Image { .. } => {
+                number = 0;
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     if body.is_empty() {
         task.title.clone()
     } else {
@@ -1458,6 +1502,17 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                 return;
             }
         } else {
+            if m.kind == MouseEventKind::Down(MouseButton::Left)
+                && app
+                    .category_form
+                    .as_ref()
+                    .is_some_and(|form| form.description.menu.is_some())
+            {
+                match click_category_slash_menu(app, m.column, m.row) {
+                    MenuClick::Handled => return,
+                    MenuClick::Miss => {}
+                }
+            }
             if let (MouseEventKind::Down(MouseButton::Left), Some(form)) =
                 (m.kind, &mut app.category_form)
             {
@@ -1624,6 +1679,9 @@ fn click_on_panels(app: &App, m: MouseEvent) -> bool {
     }
     // Prefer form chrome when it overlaps the panels (modal / picker).
     if let Some(form) = &app.form {
+        if contains(form.form_area, x, y) {
+            return false;
+        }
         if form.areas.field_at(x, y).is_some() {
             return false;
         }
@@ -1635,7 +1693,10 @@ fn click_on_panels(app: &App, m: MouseEvent) -> bool {
         }
     }
     if let Some(form) = &app.category_form
-        && (contains(form.name_area, x, y) || contains(form.description_area, x, y))
+        && (contains(form.form_area, x, y)
+            || contains(form.name_area, x, y)
+            || contains(form.description_area, x, y)
+            || form.body_menu_area.is_some_and(|r| contains(r, x, y)))
     {
         return false;
     }
@@ -1715,7 +1776,7 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
     // would otherwise dismiss the menu without selecting anything.
     if app.form.as_ref().is_some_and(|f| f.body.menu.is_some()) {
         match click_body_slash_menu(app, m.column, m.row) {
-            MenuClick::Handled | MenuClick::CopyDone => return,
+            MenuClick::Handled => return,
             MenuClick::Miss => {
                 // Fall through: place the cursor / change field, menu
                 // closes via body.click or set_field.
@@ -1819,53 +1880,91 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
 enum MenuClick {
     /// Click was on the menu (selected a row or the chrome).
     Handled,
-    /// Copy command finished (clipboard side effects applied).
-    CopyDone,
     /// Click missed the menu rect entirely.
     Miss,
 }
 
-/// Hit-test the open body `/` dropdown. Clicking a command row runs it.
-fn click_body_slash_menu(app: &mut App, x: u16, y: u16) -> MenuClick {
-    let Some(form) = app.form.as_ref() else {
-        return MenuClick::Miss;
-    };
-    let Some(rect) = form.body_menu_area else {
-        return MenuClick::Miss;
+enum MenuHit {
+    Handled,
+    Command {
+        index: usize,
+        command: crate::body::Command,
+    },
+    Miss,
+}
+
+fn slash_menu_hit(
+    body: &crate::body::BodyEditor,
+    rect: Option<ratatui::layout::Rect>,
+    x: u16,
+    y: u16,
+) -> MenuHit {
+    let Some(rect) = rect else {
+        return MenuHit::Miss;
     };
     if !contains(rect, x, y) {
-        return MenuClick::Miss;
+        return MenuHit::Miss;
     }
 
     // Rows sit inside the border: top border at rect.y, first command at y+1.
-    let commands = form.body.menu_commands();
-    if commands.is_empty() {
-        return MenuClick::Handled;
+    let commands = body.menu_commands();
+    if commands.is_empty() || y <= rect.y || y >= rect.bottom().saturating_sub(1) {
+        return MenuHit::Handled;
     }
-    if y <= rect.y || y >= rect.bottom().saturating_sub(1) {
-        // Title / bottom border — keep the menu open, select nothing.
-        return MenuClick::Handled;
+    let index = (y - rect.y - 1) as usize;
+    match commands.get(index).copied() {
+        Some(command) => MenuHit::Command { index, command },
+        None => MenuHit::Handled,
     }
-    let idx = (y - rect.y - 1) as usize;
-    if idx >= commands.len() {
-        return MenuClick::Handled;
-    }
+}
 
-    let command = commands[idx];
+/// Hit-test the open body `/` dropdown. Clicking a command row runs it.
+fn click_body_slash_menu(app: &mut App, x: u16, y: u16) -> MenuClick {
+    let hit = match app.form.as_ref() {
+        Some(form) => slash_menu_hit(&form.body, form.body_menu_area, x, y),
+        None => MenuHit::Miss,
+    };
+    let (index, command) = match hit {
+        MenuHit::Miss => return MenuClick::Miss,
+        MenuHit::Handled => return MenuClick::Handled,
+        MenuHit::Command { index, command } => (index, command),
+    };
     let Some(form) = app.form.as_mut() else {
         return MenuClick::Miss;
     };
     if let Some(menu) = &mut form.body.menu {
-        menu.index = idx;
+        menu.index = index;
     }
     form.before_edit(EditKind::Atomic);
-    match form.body.apply(command) {
-        Some(payload) => {
-            finish_copy(app, payload);
-            MenuClick::CopyDone
-        }
-        None => MenuClick::Handled,
+    let payload = form.body.apply(command);
+    if let Some(payload) = payload {
+        finish_copy(app, payload);
     }
+    MenuClick::Handled
+}
+
+fn click_category_slash_menu(app: &mut App, x: u16, y: u16) -> MenuClick {
+    let hit = match app.category_form.as_ref() {
+        Some(form) => slash_menu_hit(&form.description, form.body_menu_area, x, y),
+        None => MenuHit::Miss,
+    };
+    let (index, command) = match hit {
+        MenuHit::Miss => return MenuClick::Miss,
+        MenuHit::Handled => return MenuClick::Handled,
+        MenuHit::Command { index, command } => (index, command),
+    };
+    let Some(form) = app.category_form.as_mut() else {
+        return MenuClick::Miss;
+    };
+    if let Some(menu) = &mut form.description.menu {
+        menu.index = index;
+    }
+    form.before_edit(EditKind::Atomic);
+    let payload = form.description.apply(command);
+    if let Some(payload) = payload {
+        finish_copy(app, payload);
+    }
+    MenuClick::Handled
 }
 
 /// Whether this click lands on the row the last one did, soon enough to
@@ -1891,7 +1990,20 @@ mod tests {
 
     use super::{
         MAX_OSC52_ENCODED_BYTES, MAX_OSC52_RAW_BYTES, build_clipboard_payload_with, osc52_sequence,
+        task_clipboard_text,
     };
+
+    #[test]
+    fn task_copy_preserves_stored_text_that_names_an_existing_image() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/screenshot.png");
+        let mut task = crate::model::Task::new("Keep the path", 0, None, "");
+        task.body = vec![crate::model::Block::text(path)];
+
+        assert_eq!(
+            task_clipboard_text(&task),
+            format!("Keep the path\n\n{path}")
+        );
+    }
 
     #[test]
     fn terminal_clipboard_fallback_preserves_utf8_text() {

@@ -70,6 +70,25 @@ fn replace_form_title(app: &mut App, title: &str) {
 }
 
 #[test]
+fn constructing_tui_state_does_not_consume_the_launch_screen() {
+    let dir = std::env::temp_dir().join(format!(
+        "mach-launch-pending-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let app = App::with_store("0.4.0", Store::open(&dir).unwrap()).unwrap();
+    assert_eq!(app.mode, Mode::Welcome);
+    drop(app);
+
+    let snapshot = Store::open(&dir).unwrap().snapshot().unwrap();
+    assert_eq!(
+        snapshot.settings.last_run_version, None,
+        "building App before terminal setup must not consume Welcome"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn loads_and_mutates_a_store_snapshot() {
     let mut app = setup();
 
@@ -556,6 +575,39 @@ fn form_save_accepts_a_convergent_external_edit() {
         "shared title"
     );
     cleanup_on_disk(app, external, dir);
+}
+
+#[test]
+fn task_form_adopts_paths_against_its_store_before_taking_the_dirty_baseline() {
+    let dir = std::env::temp_dir().join(format!(
+        "mach-form-image-root-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut store = Store::open(&dir).unwrap();
+    std::fs::create_dir_all(store.images_dir()).unwrap();
+    std::fs::write(store.images_dir().join("active-root.png"), b"fixture").unwrap();
+    let mut task = Task::new("picture path", 0, None, "");
+    task.body = vec![Block::text("active-root.png")];
+    store
+        .update(|data| {
+            data.tasks.push(task);
+            Ok(())
+        })
+        .unwrap();
+
+    let mut app = App::with_store("test", store).unwrap();
+    app.mode = Mode::Normal;
+    app.open_edit_task();
+    let form = app.form.as_ref().expect("task form open");
+    assert_eq!(form.body.value(), vec![Block::image("active-root.png")]);
+    assert!(
+        !form.is_dirty(),
+        "path adoption during construction belongs in the initial baseline"
+    );
+
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
