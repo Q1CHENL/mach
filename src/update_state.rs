@@ -137,7 +137,8 @@ impl UpdateStateStore {
 
     /// Manual checks ignore the normal deadline and supersede any older
     /// in-flight lease. A late result from that older worker can no longer
-    /// overwrite the manual result.
+    /// overwrite the manual scheduler state; executable replacement is
+    /// serialized separately by the destination install lock.
     pub(crate) fn claim_manual(&mut self, now: i64) -> Result<UpdateLease, StoreError> {
         validate_now(now)?;
         let tx = self
@@ -520,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_claim_prevents_an_older_worker_from_overwriting_it() {
+    fn manual_claim_prevents_an_older_worker_from_overwriting_scheduler_state() {
         let mut store = UpdateStateStore::open_in_memory().unwrap();
         let now = 1_800_000_000;
         let AutomaticClaim::Claimed(old) = store.try_claim_automatic(now).unwrap() else {

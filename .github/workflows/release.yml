@@ -191,7 +191,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: publish verified release
+    name: publish checksum-verified release
     needs: [verify, build-linux, build-macos]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -237,25 +237,26 @@ jobs:
         with:
           subject-checksums: dist/SHA256SUMS
 
-      - name: Stage and verify the GitHub draft
+      - name: Stage or resume the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
+          published_release=false
           if release_json="$(gh release view "$TAG_NAME" \
             --json databaseId,isDraft,isPrerelease 2>/dev/null)"; then
-            if [ "$(jq -r '.isDraft' <<< "$release_json")" != true ]; then
-              printf 'release %s is already published\n' "$TAG_NAME" >&2
-              exit 1
-            fi
             if [ "$(jq -r '.isPrerelease' <<< "$release_json")" != false ]; then
-              printf 'draft %s is unexpectedly marked as a prerelease\n' \
+              printf 'release %s is unexpectedly marked as a prerelease\n' \
                 "$TAG_NAME" >&2
               exit 1
             fi
-            gh release edit "$TAG_NAME" \
-              --draft \
-              --title "mach $TAG_NAME"
+            if [ "$(jq -r '.isDraft' <<< "$release_json")" = true ]; then
+              gh release edit "$TAG_NAME" \
+                --draft \
+                --title "mach $TAG_NAME"
+            else
+              published_release=true
+            fi
           else
             gh release create "$TAG_NAME" \
               --verify-tag \
@@ -264,14 +265,6 @@ jobs:
               --generate-notes \
               --title "mach $TAG_NAME"
           fi
-
-          gh release upload "$TAG_NAME" \
-            --clobber \
-            dist/mach-x86_64-unknown-linux-gnu \
-            dist/mach-aarch64-unknown-linux-gnu \
-            dist/mach-x86_64-apple-darwin \
-            dist/mach-aarch64-apple-darwin \
-            dist/SHA256SUMS
 
           release_id="$(gh release view "$TAG_NAME" \
             --json databaseId \
@@ -283,9 +276,25 @@ jobs:
               exit 1
               ;;
           esac
+
+          if [ "$published_release" = false ]; then
+            gh release upload "$TAG_NAME" \
+              --clobber \
+              dist/mach-x86_64-unknown-linux-gnu \
+              dist/mach-aarch64-unknown-linux-gnu \
+              dist/mach-x86_64-apple-darwin \
+              dist/mach-aarch64-apple-darwin \
+              dist/SHA256SUMS
+          fi
+
           gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             > "$RUNNER_TEMP/release.json"
-          scripts/verify-release.sh github dist "$RUNNER_TEMP/release.json"
+          if [ "$published_release" = true ]; then
+            scripts/verify-release.sh github-published \
+              dist "$RUNNER_TEMP/release.json"
+          else
+            scripts/verify-release.sh github dist "$RUNNER_TEMP/release.json"
+          fi
           printf 'RELEASE_ID=%s\n' "$release_id" >> "$GITHUB_ENV"
 
       - name: Prepare the crate release
@@ -397,26 +406,34 @@ jobs:
             "$CRATE_VERSION" >&2
           exit 1
 
-      - name: Publish the verified GitHub Release
+      - name: Publish the checksum-verified GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             > "$RUNNER_TEMP/release-before-publish.json"
-          scripts/verify-release.sh github \
-            dist "$RUNNER_TEMP/release-before-publish.json"
+          if jq -e '.draft == true' \
+            "$RUNNER_TEMP/release-before-publish.json" >/dev/null; then
+            scripts/verify-release.sh github \
+              dist "$RUNNER_TEMP/release-before-publish.json"
+          else
+            scripts/verify-release.sh github-published \
+              dist "$RUNNER_TEMP/release-before-publish.json"
+          fi
 
           gh release edit "$TAG_NAME" --draft=false --latest
-          release_json="$(gh api \
-            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            > "$RUNNER_TEMP/release-after-publish.json"
+          scripts/verify-release.sh github-published \
+            dist "$RUNNER_TEMP/release-after-publish.json"
           latest_tag="$(gh api \
             "repos/$GITHUB_REPOSITORY/releases/latest" \
             --jq '.tag_name')"
           if ! jq -e \
             --arg tag "$TAG_NAME" \
             '.draft == false and .prerelease == false and .tag_name == $tag' \
-            <<< "$release_json" >/dev/null \
+            "$RUNNER_TEMP/release-after-publish.json" >/dev/null \
             || [ "$latest_tag" != "$TAG_NAME" ]; then
             printf 'release %s was not published as latest\n' "$TAG_NAME" >&2
             exit 1

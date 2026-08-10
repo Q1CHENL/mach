@@ -86,6 +86,7 @@ jq -s '{draft: true, prerelease: false, assets: .}' "$assets" \
 "$verify_release" github "$dist" "${tmpdir}/release.json"
 
 jq '.draft = false' "${tmpdir}/release.json" > "${tmpdir}/published.json"
+"$verify_release" github-published "$dist" "${tmpdir}/published.json"
 expect_failure 'an already-published GitHub release' \
   "$verify_release" github "$dist" "${tmpdir}/published.json"
 
@@ -93,6 +94,11 @@ jq '.assets[0].digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffff
   "${tmpdir}/release.json" > "${tmpdir}/wrong-asset.json"
 expect_failure 'a GitHub asset with the wrong digest' \
   "$verify_release" github "$dist" "${tmpdir}/wrong-asset.json"
+jq '.draft = false' "${tmpdir}/wrong-asset.json" \
+  > "${tmpdir}/wrong-published-asset.json"
+expect_failure 'a published GitHub asset with the wrong digest' \
+  "$verify_release" github-published "$dist" \
+  "${tmpdir}/wrong-published-asset.json"
 
 jq '.assets += [{name: "unexpected", size: 1, digest: "sha256:00", state: "uploaded"}]' \
   "${tmpdir}/release.json" > "${tmpdir}/unexpected-asset.json"

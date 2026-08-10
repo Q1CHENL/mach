@@ -105,11 +105,13 @@ verify_local() {
 verify_github() {
   dist=$1
   release_json=$2
+  expected_draft=$3
+  release_label=$4
   verify_local "$dist"
   [ -f "$release_json" ] || fail "release JSON does not exist: $release_json"
 
-  jq -e '
-    .draft == true
+  jq -e --argjson expected_draft "$expected_draft" '
+    .draft == $expected_draft
     and .prerelease == false
     and ([.assets[].name] | sort == [
       "SHA256SUMS",
@@ -119,7 +121,7 @@ verify_github() {
       "mach-x86_64-unknown-linux-gnu"
     ])
   ' "$release_json" >/dev/null \
-    || fail 'GitHub draft does not contain exactly the expected release assets'
+    || fail "GitHub $release_label does not contain exactly the expected release assets"
 
   for asset in \
     mach-x86_64-unknown-linux-gnu \
@@ -194,15 +196,16 @@ verify_newer() {
 }
 
 if [ "$#" -lt 2 ]; then
-  fail "usage: $0 local DIST | github DIST RELEASE_JSON | crate ARCHIVE VERSION VERSION_JSON | newer VERSION PREVIOUS"
+  fail "usage: $0 local DIST | github DIST RELEASE_JSON | github-published DIST RELEASE_JSON | crate ARCHIVE VERSION VERSION_JSON | newer VERSION PREVIOUS"
 fi
 
 mode=$1
 shift
 case "$mode:$#" in
   local:1) verify_local "$1" ;;
-  github:2) verify_github "$1" "$2" ;;
+  github:2) verify_github "$1" "$2" true draft ;;
+  github-published:2) verify_github "$1" "$2" false release ;;
   crate:3) verify_crate "$1" "$2" "$3" ;;
   newer:2) verify_newer "$1" "$2" ;;
-  *) fail "usage: $0 local DIST | github DIST RELEASE_JSON | crate ARCHIVE VERSION VERSION_JSON | newer VERSION PREVIOUS" ;;
+  *) fail "usage: $0 local DIST | github DIST RELEASE_JSON | github-published DIST RELEASE_JSON | crate ARCHIVE VERSION VERSION_JSON | newer VERSION PREVIOUS" ;;
 esac

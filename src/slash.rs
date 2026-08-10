@@ -18,7 +18,7 @@ pub enum SlashCommand {
     Done,
     /// Permanently remove done tasks (current category, or all in All Tasks).
     Purge,
-    /// Install the latest verified GitHub release.
+    /// Install the latest checksum-verified GitHub release.
     Update,
     Quit,
 }
@@ -93,7 +93,7 @@ impl SlashCommand {
             Self::Import => "merge the specified archive",
             Self::Done => "show or hide completed tasks",
             Self::Purge => "delete completed tasks in this view",
-            Self::Update => "install the latest verified build",
+            Self::Update => "install the latest checksum-verified build",
             Self::Quit => "leave mach",
         }
     }

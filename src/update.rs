@@ -7,9 +7,10 @@
 //! remains an explicit action through `/update` or `mach update --install`.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use semver::Version;
@@ -30,6 +31,11 @@ const TIMEOUT: Duration = Duration::from_secs(8);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_TEXT_BYTES: u64 = 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
+const RELEASE_RECEIPT_DIR: &str = ".mach-release-install";
+const INSTALL_LOCK_DIR: &str = ".mach-install.lock";
+const INSTALL_LOCK_OWNER: &str = "owner";
+const INSTALL_LOCK_WAIT: Duration = Duration::from_secs(30);
+const INSTALL_LOCK_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct CheckResult {
@@ -74,6 +80,13 @@ impl CheckFailure {
 pub struct InstallResult {
     pub destination: PathBuf,
     pub tag: String,
+    pub disposition: InstallDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallDisposition {
+    Installed,
+    AlreadyCurrent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,9 +217,10 @@ fn current_asset_name() -> Result<String, String> {
 
 /// Install the exact release and platform asset returned by [`check`].
 ///
-/// The binary is downloaded and verified in-process. No downloaded script is
-/// executed. The replacement is written, synced, chmodded, and atomically
-/// renamed within the destination directory before that directory is synced.
+/// The binary is downloaded and checksum-verified in-process. No downloaded
+/// script is executed. The replacement is written, synced, chmodded, and
+/// atomically renamed within the destination directory before that directory
+/// is synced.
 pub fn install(info: &CheckResult) -> Result<InstallResult, String> {
     install_with_progress(info, |_| {})
 }
@@ -215,7 +229,7 @@ pub(crate) fn install_with_progress(
     info: &CheckResult,
     progress: impl FnMut(DownloadProgress),
 ) -> Result<InstallResult, String> {
-    validate_install_info(info)?;
+    let target_version = validate_install_info(info)?;
     let destination = install_destination()?;
     let manifest = http_get_text(
         &info.checksums_url,
@@ -225,14 +239,21 @@ pub(crate) fn install_with_progress(
     )
     .map_err(|e| format!("could not download checksums for {}: {e}", info.tag))?;
     let expected_sha = checksum_for_asset(&manifest, &info.asset_name)?;
-    download_verified_binary(&info.asset_url, &expected_sha, &destination, progress)?;
+    let (installed_version, disposition) = download_verified_binary(
+        &info.asset_url,
+        &expected_sha,
+        &destination,
+        &target_version,
+        progress,
+    )?;
     Ok(InstallResult {
         destination,
-        tag: info.tag.clone(),
+        tag: format!("v{installed_version}"),
+        disposition,
     })
 }
 
-fn validate_install_info(info: &CheckResult) -> Result<(), String> {
+fn validate_install_info(info: &CheckResult) -> Result<Version, String> {
     if info.current != current_version() {
         return Err(format!(
             "release check was produced for v{}, but this binary is v{}",
@@ -278,7 +299,7 @@ fn validate_install_info(info: &CheckResult) -> Result<(), String> {
             info.tag
         ));
     }
-    Ok(())
+    Ok(latest)
 }
 
 fn release_asset_url(tag: &str, asset: &str) -> String {
@@ -313,17 +334,67 @@ fn resolve_install_destination(
     }
 
     let home = home.ok_or_else(|| "could not determine the install directory".to_string())?;
+    let current_exe =
+        current_exe.ok_or_else(|| "could not determine the current mach executable".to_string())?;
+    let default_destination = home.join(".local/bin/mach");
+    if receipted_release_version(current_exe)?.is_some() {
+        return Ok(current_exe.to_path_buf());
+    }
+
     let cargo_bin = cargo_home
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.join(".cargo"))
         .join("bin");
-    if current_exe.and_then(Path::parent) == Some(cargo_bin.as_path()) {
+    if is_cargo_managed(current_exe, &cargo_bin) {
         return Err("this mach executable is managed by Cargo; update it with \
              'cargo install --locked mach-tui', or set MACH_INSTALL_DIR to install a release \
              binary elsewhere"
             .into());
     }
-    Ok(home.join(".local/bin/mach"))
+    if install_paths_match(current_exe, &default_destination) {
+        return Ok(default_destination);
+    }
+
+    let current_parent = current_exe
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/path/to/mach"));
+    Err(format!(
+        "this mach executable at {} is managed by a package manager or another installer; update \
+         it there, or set MACH_INSTALL_DIR={} to replace it with a checksum-verified release binary",
+        current_exe.display(),
+        current_parent.display()
+    ))
+}
+
+fn install_paths_match(left: &Path, right: &Path) -> bool {
+    fn normalize_parent(path: &Path) -> PathBuf {
+        let Some(parent) = path.parent() else {
+            return path.to_path_buf();
+        };
+        let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+        path.file_name()
+            .map_or(parent.clone(), |name| parent.join(name))
+    }
+
+    normalize_parent(left) == normalize_parent(right)
+}
+
+fn is_cargo_managed(current_exe: &Path, cargo_bin: &Path) -> bool {
+    let Some(parent) = current_exe.parent() else {
+        return false;
+    };
+    if install_paths_match(parent, cargo_bin) {
+        return true;
+    }
+    if parent.file_name().and_then(|name| name.to_str()) != Some("bin") {
+        return false;
+    }
+    let Some(root) = parent.parent() else {
+        return false;
+    };
+    root.join(".crates2.json").is_file() || root.join(".crates.toml").is_file()
 }
 
 fn checksum_for_asset(manifest: &str, asset_name: &str) -> Result<String, String> {
@@ -363,8 +434,9 @@ fn download_verified_binary(
     url: &str,
     expected_sha: &str,
     destination: &Path,
+    target_version: &Version,
     progress: impl FnMut(DownloadProgress),
-) -> Result<(), String> {
+) -> Result<(Version, InstallDisposition), String> {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(DOWNLOAD_TIMEOUT))
         .build();
@@ -386,6 +458,7 @@ fn download_verified_binary(
         response.body_mut().as_reader(),
         expected_sha,
         destination,
+        target_version,
         total,
         progress,
     )
@@ -395,14 +468,19 @@ fn write_verified_binary<R: Read>(
     mut source: R,
     expected_sha: &str,
     destination: &Path,
+    target_version: &Version,
     expected_total: Option<u64>,
     mut progress: impl FnMut(DownloadProgress),
-) -> Result<(), String> {
+) -> Result<(Version, InstallDisposition), String> {
     #[cfg(not(unix))]
     return Err("self-update is supported only on Unix platforms".into());
 
     #[cfg(unix)]
     {
+        if expected_sha.len() != 64 || !expected_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("expected release digest is not a SHA-256 digest".into());
+        }
+        let expected_sha = expected_sha.to_ascii_lowercase();
         let parent = destination
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -427,7 +505,7 @@ fn write_verified_binary<R: Read>(
             total: expected_total,
         });
 
-        let write_result = (|| -> Result<(), String> {
+        let write_result = (|| -> Result<String, String> {
             let mut hasher = Sha256::new();
             let mut downloaded = 0_u64;
             let mut buffer = [0_u8; 64 * 1024];
@@ -469,25 +547,301 @@ fn write_verified_binary<R: Read>(
             temp_file
                 .sync_all()
                 .map_err(|e| format!("could not sync temporary binary: {e}"))?;
-            Ok(())
+            Ok(actual_sha)
         })();
         drop(temp_file);
 
-        if let Err(error) = write_result {
+        let actual_sha = match write_result {
+            Ok(actual_sha) => actual_sha,
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error);
+            }
+        };
+
+        let install_result = (|| -> Result<(Version, InstallDisposition), String> {
+            let _lock = InstallLock::acquire(parent)?;
+            if let Some(installed_version) =
+                receipted_release_version(destination)?.filter(|version| version >= target_version)
+            {
+                return Ok((installed_version, InstallDisposition::AlreadyCurrent));
+            }
+
+            let (installed_version, receipt_update) =
+                record_release_version(parent, &actual_sha, target_version)?;
+            if let Err(error) = fs::rename(&temp_path, destination) {
+                let rollback_error = receipt_update.rollback().err();
+                let mut message = format!(
+                    "could not replace {} atomically: {error}",
+                    destination.display()
+                );
+                if let Some(rollback_error) = rollback_error {
+                    message.push_str(&format!(
+                        "; could not roll back release receipt: {rollback_error}"
+                    ));
+                }
+                return Err(message);
+            }
+            parent_dir.sync_all().map_err(|e| {
+                format!("could not sync install directory {}: {e}", parent.display())
+            })?;
+            Ok((installed_version, InstallDisposition::Installed))
+        })();
+
+        if temp_path.exists() {
             let _ = fs::remove_file(&temp_path);
-            return Err(error);
         }
-        if let Err(error) = fs::rename(&temp_path, destination) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(format!(
-                "could not replace {} atomically: {error}",
-                destination.display()
+        install_result
+    }
+}
+
+#[cfg(unix)]
+fn receipted_release_version(destination: &Path) -> Result<Option<Version>, String> {
+    let Some(parent) = destination.parent() else {
+        return Ok(None);
+    };
+    let receipt_dir = parent.join(RELEASE_RECEIPT_DIR);
+    if !receipt_dir.is_dir() || !destination.is_file() {
+        return Ok(None);
+    }
+    let digest = sha256_file(destination)?;
+    let receipt = receipt_dir.join(digest);
+    if !receipt.is_file() {
+        return Ok(None);
+    }
+    read_receipt_version(&receipt).map(Some)
+}
+
+#[cfg(not(unix))]
+fn receipted_release_version(_destination: &Path) -> Result<Option<Version>, String> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|e| format!("could not inspect installed binary {}: {e}", path.display()))?;
+    if metadata.len() > MAX_BINARY_BYTES {
+        return Err(format!(
+            "installed binary {} exceeds the {} MiB safety limit",
+            path.display(),
+            MAX_BINARY_BYTES / 1024 / 1024
+        ));
+    }
+    let mut file = File::open(path)
+        .map_err(|e| format!("could not open installed binary {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| format!("could not read installed binary {}: {e}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(unix)]
+fn read_receipt_version(path: &Path) -> Result<Version, String> {
+    let file = File::open(path)
+        .map_err(|e| format!("could not open release receipt {}: {e}", path.display()))?;
+    let text = read_bounded_text(file, 128)
+        .map_err(|e| format!("invalid release receipt {}: {e}", path.display()))?;
+    let value = text
+        .strip_suffix('\n')
+        .filter(|value| !value.is_empty() && !value.contains(['\r', '\n']))
+        .ok_or_else(|| format!("invalid release receipt {}", path.display()))?;
+    let version = Version::parse(value)
+        .map_err(|e| format!("invalid release receipt {}: {e}", path.display()))?;
+    if !version.pre.is_empty() || !version.build.is_empty() || value != version.to_string() {
+        return Err(format!("invalid release receipt {}", path.display()));
+    }
+    Ok(version)
+}
+
+#[cfg(unix)]
+fn record_release_version(
+    parent: &Path,
+    digest: &str,
+    target_version: &Version,
+) -> Result<(Version, ReceiptUpdate), String> {
+    let receipt_dir = parent.join(RELEASE_RECEIPT_DIR);
+    fs::create_dir_all(&receipt_dir).map_err(|e| {
+        format!(
+            "could not create release receipt directory {}: {e}",
+            receipt_dir.display()
+        )
+    })?;
+    let receipt = receipt_dir.join(digest);
+    let previous_version = if receipt.is_file() {
+        let recorded = read_receipt_version(&receipt)?;
+        if recorded >= *target_version {
+            return Ok((
+                recorded,
+                ReceiptUpdate {
+                    receipt,
+                    previous_version: None,
+                    changed: false,
+                },
             ));
         }
-        parent_dir
-            .sync_all()
+        Some(recorded)
+    } else {
+        None
+    };
+
+    write_release_receipt(parent, &receipt, target_version)?;
+    Ok((
+        target_version.clone(),
+        ReceiptUpdate {
+            receipt,
+            previous_version,
+            changed: true,
+        },
+    ))
+}
+
+#[cfg(unix)]
+fn write_release_receipt(parent: &Path, receipt: &Path, version: &Version) -> Result<(), String> {
+    let receipt_dir = receipt
+        .parent()
+        .ok_or_else(|| "release receipt has no parent directory".to_string())?;
+    let temp_path = receipt_dir.join(format!(".receipt.{}.tmp", uuid::Uuid::new_v4()));
+    let write_result = (|| -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|e| format!("could not create release receipt: {e}"))?;
+        writeln!(file, "{version}").map_err(|e| format!("could not write release receipt: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("could not sync release receipt: {e}"))?;
+        fs::rename(&temp_path, receipt)
+            .map_err(|e| format!("could not publish release receipt: {e}"))?;
+        File::open(receipt_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("could not sync release receipt directory: {e}"))?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
             .map_err(|e| format!("could not sync install directory {}: {e}", parent.display()))?;
         Ok(())
+    })();
+    if write_result.is_err() && temp_path.exists() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+#[cfg(unix)]
+struct ReceiptUpdate {
+    receipt: PathBuf,
+    previous_version: Option<Version>,
+    changed: bool,
+}
+
+#[cfg(unix)]
+impl ReceiptUpdate {
+    fn rollback(self) -> Result<(), String> {
+        if !self.changed {
+            return Ok(());
+        }
+        let receipt_dir = self
+            .receipt
+            .parent()
+            .ok_or_else(|| "release receipt has no parent directory".to_string())?;
+        let parent = receipt_dir
+            .parent()
+            .ok_or_else(|| "release receipt directory has no parent".to_string())?;
+        if let Some(previous_version) = self.previous_version {
+            write_release_receipt(parent, &self.receipt, &previous_version)
+        } else {
+            fs::remove_file(&self.receipt)
+                .map_err(|e| format!("could not remove {}: {e}", self.receipt.display()))?;
+            File::open(receipt_dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|e| format!("could not sync release receipt directory: {e}"))?;
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|e| format!("could not sync install directory {}: {e}", parent.display()))
+        }
+    }
+}
+
+#[cfg(unix)]
+struct InstallLock {
+    path: PathBuf,
+    owner_record: String,
+}
+
+#[cfg(unix)]
+impl InstallLock {
+    fn acquire(parent: &Path) -> Result<Self, String> {
+        let path = parent.join(INSTALL_LOCK_DIR);
+        let started = Instant::now();
+        loop {
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let owner_record = format!("{timestamp} {}\n", uuid::Uuid::new_v4());
+                    let owner_path = path.join(INSTALL_LOCK_OWNER);
+                    let initialize = (|| -> Result<(), String> {
+                        let mut owner = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&owner_path)
+                            .map_err(|e| format!("could not create install lock owner: {e}"))?;
+                        owner
+                            .write_all(owner_record.as_bytes())
+                            .map_err(|e| format!("could not write install lock owner: {e}"))?;
+                        owner
+                            .sync_all()
+                            .map_err(|e| format!("could not sync install lock owner: {e}"))?;
+                        File::open(&path)
+                            .and_then(|directory| directory.sync_all())
+                            .map_err(|e| format!("could not sync install lock: {e}"))?;
+                        Ok(())
+                    })();
+                    if let Err(error) = initialize {
+                        let _ = fs::remove_file(owner_path);
+                        let _ = fs::remove_dir(&path);
+                        return Err(error);
+                    }
+                    return Ok(Self { path, owner_record });
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(format!(
+                        "could not acquire install lock {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+            if started.elapsed() >= INSTALL_LOCK_WAIT {
+                return Err(format!(
+                    "timed out waiting for another installer holding {}; if no installer is \
+                     running, remove this stale lock directory",
+                    path.display()
+                ));
+            }
+            thread::sleep(INSTALL_LOCK_POLL);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        let owner = self.path.join(INSTALL_LOCK_OWNER);
+        if fs::read_to_string(&owner).ok().as_deref() == Some(self.owner_record.as_str()) {
+            let _ = fs::remove_file(owner);
+            let _ = fs::remove_dir(&self.path);
+        }
     }
 }
 
@@ -917,6 +1271,85 @@ mod tests {
     }
 
     #[test]
+    fn externally_managed_binary_does_not_create_a_shadow_release_install() {
+        let home = Path::new("/home/alice");
+        let current_exe = Path::new("/opt/homebrew/bin/mach");
+
+        let error = resolve_install_destination(None, Some(home), Some(current_exe), None)
+            .expect_err("an externally managed executable must not update a shadow destination");
+
+        assert!(error.contains("package manager"));
+        assert!(error.contains("MACH_INSTALL_DIR"));
+    }
+
+    #[test]
+    fn cargo_install_root_is_detected_from_its_ownership_metadata() {
+        let dir = std::env::temp_dir().join(format!("mach-cargo-root-{}", uuid::Uuid::new_v4()));
+        let cargo_root = dir.join("custom-cargo-root");
+        let bin = cargo_root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(cargo_root.join(".crates2.json"), b"{}").unwrap();
+        let current_exe = bin.join("mach");
+
+        let error =
+            resolve_install_destination(None, Some(dir.as_path()), Some(&current_exe), None)
+                .expect_err(
+                    "cargo install --root ownership must not create a shadow release install",
+                );
+
+        assert!(error.contains("Cargo"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn release_receipt_disambiguates_a_cargo_root_at_the_default_destination() {
+        let dir = std::env::temp_dir().join(format!("mach-cargo-default-{}", uuid::Uuid::new_v4()));
+        let home = dir.join("home");
+        let cargo_root = home.join(".local");
+        let bin = cargo_root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(cargo_root.join(".crates2.json"), b"{}").unwrap();
+        let current_exe = bin.join("mach");
+        let binary = b"ambiguous default-path binary";
+        fs::write(&current_exe, binary).unwrap();
+
+        let error = resolve_install_destination(None, Some(&home), Some(&current_exe), None)
+            .expect_err("Cargo ownership must beat an unreceipted default path");
+        assert!(error.contains("Cargo"));
+
+        let receipt_dir = bin.join(RELEASE_RECEIPT_DIR);
+        fs::create_dir(&receipt_dir).unwrap();
+        fs::write(receipt_dir.join(sha256_hex(binary)), b"1.2.3\n").unwrap();
+        assert_eq!(
+            resolve_install_destination(None, Some(&home), Some(&current_exe), None).unwrap(),
+            current_exe,
+            "a content-bound release receipt is stronger ownership evidence"
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn custom_release_destination_is_reused_only_with_a_matching_receipt() {
+        let dir = std::env::temp_dir().join(format!("mach-release-root-{}", uuid::Uuid::new_v4()));
+        let home = dir.join("home");
+        let bin = dir.join("custom/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let current_exe = bin.join("mach");
+        let binary = b"checksum-verified release binary";
+        fs::write(&current_exe, binary).unwrap();
+        let receipt_dir = bin.join(RELEASE_RECEIPT_DIR);
+        fs::create_dir(&receipt_dir).unwrap();
+        fs::write(receipt_dir.join(sha256_hex(binary)), b"1.2.3\n").unwrap();
+
+        assert_eq!(
+            resolve_install_destination(None, Some(&home), Some(&current_exe), None).unwrap(),
+            current_exe
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn selector_ignores_legacy_prereleases_and_binds_required_assets() {
         let releases = vec![
             release("v1.21.9", false, &[]),
@@ -1105,6 +1538,7 @@ mod tests {
             std::io::Cursor::new(b"corrupt download"),
             &"0".repeat(64),
             &destination,
+            &Version::parse("1.0.0").unwrap(),
             None,
             |_| {},
         )
@@ -1122,17 +1556,25 @@ mod tests {
         let destination = dir.join("mach");
         let binary = b"verified binary";
         let digest = sha256_hex(binary);
+        let version = Version::parse("1.2.3").unwrap();
 
-        write_verified_binary(
+        let (installed_version, disposition) = write_verified_binary(
             std::io::Cursor::new(binary),
             &digest,
             &destination,
+            &version,
             None,
             |_| {},
         )
         .unwrap();
 
+        assert_eq!(installed_version, version);
+        assert_eq!(disposition, InstallDisposition::Installed);
         assert_eq!(fs::read(&destination).unwrap(), binary);
+        assert_eq!(
+            fs::read_to_string(dir.join(RELEASE_RECEIPT_DIR).join(&digest)).unwrap(),
+            "1.2.3\n"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1142,6 +1584,105 @@ mod tests {
             );
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn verified_replace_does_not_downgrade_a_newer_receipted_binary() {
+        let dir = std::env::temp_dir().join(format!("mach-update-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let destination = dir.join("mach");
+        let newer_binary = b"newer verified binary";
+        fs::write(&destination, newer_binary).unwrap();
+        let receipt_dir = dir.join(".mach-release-install");
+        fs::create_dir(&receipt_dir).unwrap();
+        fs::write(receipt_dir.join(sha256_hex(newer_binary)), b"9.9.9\n").unwrap();
+
+        let older_binary = b"older verified binary";
+        let (installed_version, disposition) = write_verified_binary(
+            std::io::Cursor::new(older_binary),
+            &sha256_hex(older_binary),
+            &destination,
+            &Version::parse("9.8.7").unwrap(),
+            None,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(installed_version, Version::parse("9.9.9").unwrap());
+        assert_eq!(disposition, InstallDisposition::AlreadyCurrent);
+        assert_eq!(fs::read(&destination).unwrap(), newer_binary);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_binary_rename_rolls_back_the_candidate_receipt() {
+        let dir = std::env::temp_dir().join(format!("mach-update-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let destination = dir.join("mach");
+        fs::create_dir(&destination).unwrap();
+        let binary = b"checksum-verified binary";
+        let digest = sha256_hex(binary);
+
+        let error = write_verified_binary(
+            std::io::Cursor::new(binary),
+            &digest,
+            &destination,
+            &Version::parse("1.2.3").unwrap(),
+            None,
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(error.contains("could not replace"));
+        assert!(!dir.join(RELEASE_RECEIPT_DIR).join(digest).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_install_lock_owner_cannot_remove_a_new_lock() {
+        let dir = std::env::temp_dir().join(format!("mach-update-lock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let lock = InstallLock::acquire(&dir).unwrap();
+        let lock_path = dir.join(INSTALL_LOCK_DIR);
+        let replacement_record = "0 replacement-owner\n";
+        fs::write(lock_path.join(INSTALL_LOCK_OWNER), replacement_record).unwrap();
+
+        drop(lock);
+        assert_eq!(
+            fs::read_to_string(lock_path.join(INSTALL_LOCK_OWNER)).unwrap(),
+            replacement_record
+        );
+
+        fs::remove_file(lock_path.join(INSTALL_LOCK_OWNER)).unwrap();
+        fs::remove_dir(lock_path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn install_lock_serializes_destination_writers() {
+        let dir = std::env::temp_dir().join(format!("mach-update-lock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let first = InstallLock::acquire(&dir).unwrap();
+        let second_dir = dir.clone();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let second = InstallLock::acquire(&second_dir).unwrap();
+            acquired_tx.send(()).unwrap();
+            drop(second);
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(250))
+                .is_err(),
+            "a second installer must wait while the destination lock is held"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the next installer should acquire the released lock");
+        waiter.join().unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 
     #[test]
@@ -1157,6 +1698,7 @@ mod tests {
             std::io::Cursor::new(&binary),
             &digest,
             &destination,
+            &Version::parse("1.2.3").unwrap(),
             Some(binary.len() as u64),
             |event| progress.push(event),
         )

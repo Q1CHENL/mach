@@ -12,7 +12,7 @@ agents can drive.
 ## Install
 
 ```sh
-# 1. verified release binary → ~/.local/bin
+# 1. checksum-verified release binary → ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/Q1CHENL/mach/main/install.sh | sh
 
 # 2. crates.io → ~/.cargo/bin  (Rust 1.90+)
@@ -56,8 +56,12 @@ records change.
 The TUI checks in the background, including while it stays open. A successful
 check schedules the next one 24 hours later. Failed checks retry after an hour
 by default and honor server-provided backoff. Run `/update` to download,
-verify, and install the latest release, or use `mach update --install` from the
-shell.
+verify its SHA-256 checksum, and install the latest release, or use
+`mach update --install` from the shell. Self-update follows release-installer
+ownership: it updates `~/.local/bin/mach` or a custom destination previously
+recorded by the release installer. Cargo and other package-manager installs
+must be updated through their manager; set `MACH_INSTALL_DIR` only when you
+intentionally want to replace one with a release binary.
 
 ## Data
 

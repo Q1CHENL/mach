@@ -840,7 +840,7 @@ impl App {
         self.next_update_state_poll_at = deadline.min(now.saturating_add(STATE_REFRESH_SECONDS));
     }
 
-    /// Explicitly check for and install the latest verified release (`/update`).
+    /// Explicitly check for and install the latest checksum-verified release (`/update`).
     pub(crate) fn start_update_install(&mut self) {
         self.update_notice = None;
         if self
@@ -997,8 +997,12 @@ impl App {
             }
             Ok(UpdateOutcome::Installed { result, info, etag }) => {
                 self.finish_update_state_modified(lease, now, etag.as_deref(), &info.latest);
+                let action = match result.disposition {
+                    crate::update::InstallDisposition::Installed => "Installed",
+                    crate::update::InstallDisposition::AlreadyCurrent => "Already installed",
+                };
                 self.set_update_notice(UpdateNotice {
-                    text: format!("Installed {} · restart mach", result.tag),
+                    text: format!("{action} {} · restart mach", result.tag),
                     available_version: None,
                 })
             }
@@ -2714,6 +2718,7 @@ mod tests {
             result: crate::update::InstallResult {
                 destination: "/tmp/mach-bin/mach".into(),
                 tag: "v0.3.0".into(),
+                disposition: crate::update::InstallDisposition::Installed,
             },
             info: update_result(true),
             etag: None,
@@ -2735,6 +2740,35 @@ mod tests {
 
         app.open_slash();
         assert!(app.status_message().is_none());
+    }
+
+    #[test]
+    fn tui_update_reports_a_concurrently_installed_release_truthfully() {
+        let store = Store::open_in_memory_with_paths("/tmp/mach-install-race-test").unwrap();
+        let mut app = App::with_store("test", store).unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.update_job = Some(UpdateJob {
+            rx,
+            kind: UpdateJobKind::Install,
+            lease: None,
+        });
+        app.update_activity = Some(UpdateActivity::Checking);
+        tx.send(finished(Ok(UpdateOutcome::Installed {
+            result: crate::update::InstallResult {
+                destination: "/tmp/mach-bin/mach".into(),
+                tag: "v0.3.1".into(),
+                disposition: crate::update::InstallDisposition::AlreadyCurrent,
+            },
+            info: update_result(true),
+            etag: None,
+        })))
+        .unwrap();
+
+        assert!(app.poll_update());
+        assert_eq!(
+            app.status_message().map(|(text, _)| text),
+            Some("Already installed v0.3.1 · restart mach")
+        );
     }
 
     #[test]

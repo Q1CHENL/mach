@@ -92,7 +92,7 @@ const HELP: &str = "\
                          identical records are skipped; conflicts abort
 
   update                 check GitHub for a newer release
-    --install            verify and install release binary to ~/.local/bin
+    --install            verify SHA-256 and install release binary to ~/.local/bin
 
   (no command)           open TUI
   --json                 exactly one JSON document on stdout
@@ -220,7 +220,7 @@ enum Command {
     },
     /// Check GitHub for a newer release (optional install)
     Update {
-        /// Verify and install the release binary to ~/.local/bin
+        /// Verify SHA-256 and install the release binary to ~/.local/bin
         #[arg(long)]
         install: bool,
     },
@@ -779,6 +779,10 @@ fn cmd_update(do_install: bool, json_mode: bool) -> Result<Rendered, CliError> {
         let _ = store.finish_modified(lease, Utc::now().timestamp(), etag.as_deref(), &info.latest);
     }
     let install = install.map_err(CliError::update)?;
+    let install_disposition = install.as_ref().map(|result| match result.disposition {
+        crate::update::InstallDisposition::Installed => "installed",
+        crate::update::InstallDisposition::AlreadyCurrent => "already_current",
+    });
 
     let value = json!({
         "ok": true,
@@ -787,7 +791,8 @@ fn cmd_update(do_install: bool, json_mode: bool) -> Result<Rendered, CliError> {
         "newer": info.newer,
         "prerelease": info.prerelease,
         "url": info.release_url,
-        "installed": install.is_some(),
+        "installed": install_disposition == Some("installed"),
+        "install_disposition": install_disposition,
         "destination": install
             .as_ref()
             .map(|result| result.destination.display().to_string()),
@@ -804,11 +809,19 @@ fn cmd_update(do_install: bool, json_mode: bool) -> Result<Rendered, CliError> {
     if do_install && install.is_none() {
         plain.push_str("Already up to date.\n");
     } else if let Some(result) = install {
-        plain.push_str(&format!(
-            "Installed {} to {}. Restart mach to use the new build.\n",
-            terminal_text(&result.tag),
-            terminal_text(&result.destination.display().to_string())
-        ));
+        let message = match result.disposition {
+            crate::update::InstallDisposition::Installed => format!(
+                "Installed {} to {}. Restart mach to use the new build.\n",
+                terminal_text(&result.tag),
+                terminal_text(&result.destination.display().to_string())
+            ),
+            crate::update::InstallDisposition::AlreadyCurrent => format!(
+                "Already installed {} at {}. Restart mach to use the new build.\n",
+                terminal_text(&result.tag),
+                terminal_text(&result.destination.display().to_string())
+            ),
+        };
+        plain.push_str(&message);
     }
     Ok(rendered(json_mode, value, plain))
 }

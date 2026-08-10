@@ -49,6 +49,72 @@ MACH_INSTALL_DIR="$install_dir" \
 
 cmp "${release_dir}/${asset}" "${install_dir}/mach"
 [ "$("${install_dir}/mach")" = 'fixture 9.8.7' ]
+installed_sha=$(sha256_file "${install_dir}/mach")
+receipt=${install_dir}/.mach-release-install/${installed_sha}
+[ -f "$receipt" ] || {
+  printf 'installer did not bind release ownership to the installed digest\n' >&2
+  exit 1
+}
+if [ "$(wc -l < "$receipt" | tr -d '[:space:]')" != 1 ] \
+  || [ "$(sed -n '1p' "$receipt")" != '9.8.7' ]; then
+  printf 'installer receipt did not record the installed release version\n' >&2
+  exit 1
+fi
+
+older_tag=v9.8.6
+older_release_dir=${tmpdir}/releases/${older_tag}
+mkdir -p "$older_release_dir"
+printf '#!/bin/sh\nprintf "fixture 9.8.6\\n"\n' > "${older_release_dir}/${asset}"
+chmod 755 "${older_release_dir}/${asset}"
+printf '%s  %s\n' "$(sha256_file "${older_release_dir}/${asset}")" "$asset" \
+  > "${older_release_dir}/SHA256SUMS"
+
+MACH_RELEASE_BASE_URL="file://${tmpdir}/releases" \
+MACH_VERSION="$older_tag" \
+MACH_INSTALL_DIR="$install_dir" \
+  "$test_shell" "$installer" >/dev/null
+[ "$("${install_dir}/mach")" = 'fixture 9.8.7' ] || {
+  printf 'installer downgraded a newer destination\n' >&2
+  exit 1
+}
+
+concurrent_install_dir=${tmpdir}/concurrent-bin
+mkdir -p "$concurrent_install_dir"
+(
+  MACH_RELEASE_BASE_URL="file://${tmpdir}/releases" \
+  MACH_VERSION="$older_tag" \
+  MACH_INSTALL_DIR="$concurrent_install_dir" \
+    "$test_shell" "$installer" >/dev/null
+) &
+older_pid=$!
+(
+  MACH_RELEASE_BASE_URL="file://${tmpdir}/releases" \
+  MACH_VERSION="$tag" \
+  MACH_INSTALL_DIR="$concurrent_install_dir" \
+    "$test_shell" "$installer" >/dev/null
+) &
+newer_pid=$!
+wait "$older_pid"
+wait "$newer_pid"
+[ "$("${concurrent_install_dir}/mach")" = 'fixture 9.8.7' ] || {
+  printf 'concurrent installers left the older release installed\n' >&2
+  exit 1
+}
+
+directory_install_dir=${tmpdir}/directory-destination
+mkdir -p "${directory_install_dir}/mach"
+if MACH_RELEASE_BASE_URL="file://${tmpdir}/releases" \
+  MACH_VERSION="$tag" \
+  MACH_INSTALL_DIR="$directory_install_dir" \
+  "$test_shell" "$installer" >/dev/null 2>&1; then
+  printf 'installer accepted a directory as the executable destination\n' >&2
+  exit 1
+fi
+[ ! -e "${directory_install_dir}/.mach-release-install/$(sha256_file "${release_dir}/${asset}")" ] \
+  || {
+    printf 'failed install left a release receipt for an uninstalled binary\n' >&2
+    exit 1
+  }
 
 printf '{"node_id":"fixture","tag_name":"%s","name":"release"}' "$tag" \
   > "${tmpdir}/latest.json"
