@@ -15,16 +15,16 @@ pub const BANNER_WIDTH: u16 = 35;
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
     (
-        "Portable backups",
-        "Export every task, category, and image in one archive.",
+        "Responsive backups",
+        "Export and import run in the background and can be cancelled.",
     ),
     (
-        "Safe restores",
-        "Import archives without duplicates or partial changes.",
+        "Steadier forms",
+        "Editors keep drafts across clicks, menus, and launch screens.",
     ),
     (
-        "Lists that keep going",
-        "Enter continues todos, bullets, and numbered items.",
+        "Safer self-updates",
+        "Only release installs update, and only to a newer version.",
     ),
 ];
 
