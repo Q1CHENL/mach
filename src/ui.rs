@@ -1914,6 +1914,9 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     // command or a search is being typed it is what has focus.
     let typing = matches!(app.mode, Mode::Slash | Mode::Search);
     let update_activity = (!typing).then(|| app.update_activity()).flatten();
+    let archive_activity = (!typing && app.message.is_none())
+        .then(|| app.archive_activity_text())
+        .flatten();
     let downloading = matches!(update_activity, Some(UpdateActivity::Downloading(_)));
     let block = Block::bordered()
         .border_type(BorderType::Thick)
@@ -1970,6 +1973,12 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             ));
             let body = line_with_selection(&view.text, view.sel_cols, Style::new(), theme);
             Line::from([vec![Span::styled("/", theme.accent_text())], body.spans].concat())
+        }
+        _ if archive_activity.is_some() => {
+            let text = archive_activity
+                .as_deref()
+                .expect("archive status was checked");
+            Line::from(Span::styled(truncate(text, field), theme.accent_text()))
         }
         _ if update_activity == Some(UpdateActivity::Checking) => {
             Line::from(Span::styled("Checking for updates…", theme.accent_text()))

@@ -41,7 +41,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(500);
 const GIF_WAIT: Duration = Duration::from_millis(30);
 const IMAGE_WAIT: Duration = Duration::from_millis(16);
-const UPDATE_WAIT: Duration = Duration::from_millis(100);
+const BACKGROUND_WAIT: Duration = Duration::from_millis(100);
 
 /// Entry point for the `mach` binary.
 pub fn run() {
@@ -79,7 +79,9 @@ pub fn run_tui(store: Store) -> io::Result<()> {
 
     let (mut terminal, _session) = TerminalSession::enter()?;
     app.poll_automatic_update_schedule();
-    event_loop(&mut terminal, &mut app)
+    let result = event_loop(&mut terminal, &mut app);
+    app.shutdown_archive();
+    result
 }
 
 /// Owns every terminal mode enabled by mach. Keeping cleanup in `Drop` makes
@@ -151,6 +153,12 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         if app.poll_update() {
             app.mark_dirty();
         }
+        if app.poll_archive() {
+            app.mark_dirty();
+        }
+        if app.should_quit {
+            return Ok(());
+        }
         let now = Instant::now();
         if housekeeping_due(&mut next_housekeeping, now) {
             if app.poll_automatic_update_schedule() {
@@ -188,7 +196,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         let wait = loop_wait(
             need_fast,
             app.images.has_pending(),
-            app.update_work_active(),
+            app.background_work_active(),
             until_housekeeping,
         );
         let _ = event::poll(wait)?;
@@ -206,15 +214,15 @@ fn housekeeping_due(next: &mut Instant, now: Instant) -> bool {
 fn loop_wait(
     need_fast: bool,
     images_pending: bool,
-    update_active: bool,
+    background_active: bool,
     until_housekeeping: Duration,
 ) -> Duration {
     let activity_wait = if need_fast {
         GIF_WAIT
     } else if images_pending {
         IMAGE_WAIT
-    } else if update_active {
-        UPDATE_WAIT
+    } else if background_active {
+        BACKGROUND_WAIT
     } else {
         HOUSEKEEPING_INTERVAL
     };
@@ -225,7 +233,7 @@ fn loop_wait(
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{HOUSEKEEPING_INTERVAL, UPDATE_WAIT, housekeeping_due, loop_wait};
+    use super::{BACKGROUND_WAIT, HOUSEKEEPING_INTERVAL, housekeeping_due, loop_wait};
 
     #[test]
     fn housekeeping_runs_immediately_then_on_its_interval() {
@@ -257,7 +265,7 @@ mod tests {
         );
         assert_eq!(
             loop_wait(false, false, true, Duration::from_millis(500)),
-            UPDATE_WAIT,
+            BACKGROUND_WAIT,
         );
     }
 }

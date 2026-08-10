@@ -25,8 +25,9 @@ pub const MAX_CATEGORY_COUNT: usize = 128;
 /// Byte budget paired with a user-visible grapheme limit. This keeps a single
 /// grapheme with pathological combining sequences from bypassing every text
 /// length boundary while leaving generous room for emoji ZWJ sequences.
-pub fn text_byte_limit(max_graphemes: usize) -> usize {
-    max_graphemes.saturating_mul(16).max(256)
+pub const fn text_byte_limit(max_graphemes: usize) -> usize {
+    let scaled = max_graphemes.saturating_mul(16);
+    if scaled < 256 { 256 } else { scaled }
 }
 
 /// Stable Unicode compatibility-normalized, default-case-folded text used by

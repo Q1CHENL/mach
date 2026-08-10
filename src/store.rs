@@ -35,14 +35,14 @@ const DATABASE_FILE: &str = "mach.db";
 const DATABASE_SCHEMA_VERSION: i64 = 1;
 const LEGACY_MIGRATION_KEY: &str = "legacy_json_migrated";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
-const ID_MAX_BYTES: usize = 128;
-const DUE_MAX_BYTES: usize = 128;
-const CREATED_MAX_BYTES: usize = 64;
+pub(crate) const ID_MAX_BYTES: usize = 128;
+pub(crate) const DUE_MAX_BYTES: usize = 128;
+pub(crate) const CREATED_MAX_BYTES: usize = 64;
 const SETTINGS_VALUE_MAX_BYTES: usize = 128;
 const MAX_LEGACY_JSON_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SQLITE_VALUE_BYTES: i32 = 8 * 1024 * 1024;
-const MAX_ATTACHMENT_BYTES: u64 = 128 * 1024 * 1024;
-const ATTACHMENT_ID_LEN: usize = 64;
+pub(crate) const MAX_ATTACHMENT_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const ATTACHMENT_ID_LEN: usize = 64;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -190,6 +190,14 @@ pub struct Attachment {
     pub media_type: String,
     pub byte_len: u64,
     pub storage_name: String,
+}
+
+/// Verified attachment bytes staged by a caller for installation inside the
+/// same write transaction as their task references.
+#[derive(Debug, Clone)]
+pub(crate) struct StagedAttachment {
+    pub metadata: Attachment,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -845,6 +853,7 @@ impl Store {
             persistent_attachments: true,
         };
         store.migrate_legacy_json()?;
+        store.reconcile_attachment_storage()?;
         Ok(store)
     }
 
@@ -891,18 +900,6 @@ impl Store {
         &self.paths.database
     }
 
-    pub(crate) fn import_attachment_from(
-        &self,
-        source_path: &Path,
-    ) -> Result<Attachment, StoreError> {
-        if !self.persistent_attachments {
-            return Err(StoreError::Validation(
-                "image attachments require a persistent store".into(),
-            ));
-        }
-        import_attachment_from_path(source_path, &self.paths.images)
-    }
-
     /// Cheap external-change probe for a long-running TUI.
     pub fn revision(&self) -> Result<u64, StoreError> {
         read_revision(&self.connection)
@@ -942,7 +939,7 @@ impl Store {
         &mut self,
         operation: impl FnOnce(&mut StoreData) -> Result<R, StoreError>,
     ) -> Result<(R, StoreData), StoreError> {
-        self.update_inner(None, operation)
+        self.update_inner(None, &[], operation)
     }
 
     /// Apply a mutation only if the caller's snapshot is still current.
@@ -960,12 +957,22 @@ impl Store {
         expected_revision: u64,
         operation: impl FnOnce(&mut StoreData) -> Result<R, StoreError>,
     ) -> Result<(R, StoreData), StoreError> {
-        self.update_inner(Some(expected_revision), operation)
+        self.update_inner(Some(expected_revision), &[], operation)
+    }
+
+    pub(crate) fn update_if_revision_with_staged_attachments<R>(
+        &mut self,
+        expected_revision: u64,
+        staged_attachments: &[StagedAttachment],
+        operation: impl FnOnce(&mut StoreData) -> Result<R, StoreError>,
+    ) -> Result<(R, StoreData), StoreError> {
+        self.update_inner(Some(expected_revision), staged_attachments, operation)
     }
 
     fn update_inner<R>(
         &mut self,
         expected_revision: Option<u64>,
+        staged_attachments: &[StagedAttachment],
         operation: impl FnOnce(&mut StoreData) -> Result<R, StoreError>,
     ) -> Result<(R, StoreData), StoreError> {
         let images_root = self
@@ -974,32 +981,64 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let before = load_snapshot(&tx)?;
-        let base_revision = before.revision;
-        if let Some(expected) = expected_revision
-            && expected != base_revision
-        {
-            return Err(StoreError::Conflict {
-                expected,
-                actual: base_revision,
-            });
+        let mut installed_attachments = Vec::new();
+        let prepared = (|| {
+            let before = load_snapshot(&tx)?;
+            let base_revision = before.revision;
+            if let Some(expected) = expected_revision
+                && expected != base_revision
+            {
+                return Err(StoreError::Conflict {
+                    expected,
+                    actual: base_revision,
+                });
+            }
+            let mut data = before.clone();
+            let result = operation(&mut data)?;
+            import_task_attachments(
+                &mut data,
+                images_root.as_deref(),
+                staged_attachments,
+                &mut installed_attachments,
+            )?;
+            prune_unreferenced_attachments(&mut data);
+            normalize_and_validate(
+                &mut data,
+                Local::now().naive_local(),
+                DueMode::NewWrite,
+                AttachmentMode::Persisted,
+            )?;
+            let next_revision = base_revision
+                .checked_add(1)
+                .ok_or_else(|| StoreError::Corrupt("revision overflow".into()))?;
+            data.revision = next_revision;
+            persist_diff(&tx, &before, &data)?;
+            Ok((result, data))
+        })();
+
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let cleanup = remove_installed_attachment_files(&installed_attachments);
+                let rollback = tx.rollback();
+                cleanup?;
+                rollback?;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = tx.commit() {
+            if let Some(images_root) = images_root.as_deref() {
+                cleanup_attachments_after_failed_commit(
+                    &mut self.connection,
+                    images_root,
+                    &installed_attachments,
+                )?;
+            }
+            return Err(error.into());
         }
-        let mut data = before.clone();
-        let result = operation(&mut data)?;
-        import_task_attachments(&mut data, images_root.as_deref())?;
-        normalize_and_validate(
-            &mut data,
-            Local::now().naive_local(),
-            DueMode::NewWrite,
-            AttachmentMode::Persisted,
-        )?;
-        let next_revision = base_revision
-            .checked_add(1)
-            .ok_or_else(|| StoreError::Corrupt("revision overflow".into()))?;
-        data.revision = next_revision;
-        persist_diff(&tx, &before, &data)?;
-        tx.commit()?;
-        Ok((result, data))
+        let _ = self.cleanup_pending_attachments();
+        Ok(prepared)
     }
 
     fn migrate_legacy_json(&mut self) -> Result<(), StoreError> {
@@ -1011,59 +1050,101 @@ impl Store {
             tx.commit()?;
             return Ok(());
         }
+        let mut installed_attachments = Vec::new();
+        let prepared = (|| {
+            let existing = load_snapshot(&tx)?;
+            if !existing.categories.is_empty()
+                || !existing.tasks.is_empty()
+                || !existing.attachments.is_empty()
+                || existing.revision != 0
+            {
+                return Err(StoreError::Corrupt(
+                    "database contains data but has no completed legacy migration marker".into(),
+                ));
+            }
 
-        let existing = load_snapshot(&tx)?;
-        if !existing.categories.is_empty()
-            || !existing.tasks.is_empty()
-            || !existing.attachments.is_empty()
-            || existing.revision != 0
-        {
-            return Err(StoreError::Corrupt(
-                "database contains data but has no completed legacy migration marker".into(),
-            ));
-        }
-
-        let categories_file = read_optional_json::<CategoriesFile>(&self.paths.categories)?;
-        let tasks_file = read_optional_json::<TasksFile>(&self.paths.tasks)?;
-        let settings = read_optional_json::<Settings>(&self.paths.settings)?;
-        validate_legacy_schema(
-            &self.paths.categories,
-            categories_file.as_ref().map(|f| f.schema),
-        )?;
-        validate_legacy_schema(&self.paths.tasks, tasks_file.as_ref().map(|f| f.schema))?;
-
-        let has_legacy = categories_file.is_some() || tasks_file.is_some() || settings.is_some();
-        if has_legacy {
-            let mut data = StoreData {
-                revision: 1,
-                categories: categories_file
-                    .map(|file| {
-                        file.categories
-                            .into_iter()
-                            .filter(|category| !category.is_all())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                tasks: tasks_file.map(|file| file.tasks).unwrap_or_default(),
-                settings: settings.unwrap_or_default().normalized(),
-                attachments: Vec::new(),
-            };
-            import_task_attachments(&mut data, Some(&images_root))?;
-            // Legacy relative values used the reader's current date/year. Freeze
-            // that interpretation now so it cannot drift after migration.
-            normalize_and_validate(
-                &mut data,
-                Local::now().naive_local(),
-                DueMode::LegacyMigration,
-                AttachmentMode::Persisted,
+            let categories_file = read_optional_json::<CategoriesFile>(&self.paths.categories)?;
+            let tasks_file = read_optional_json::<TasksFile>(&self.paths.tasks)?;
+            let settings = read_optional_json::<Settings>(&self.paths.settings)?;
+            validate_legacy_schema(
+                &self.paths.categories,
+                categories_file.as_ref().map(|file| file.schema),
             )?;
-            persist_diff(&tx, &existing, &data)?;
+            validate_legacy_schema(
+                &self.paths.tasks,
+                tasks_file.as_ref().map(|file| file.schema),
+            )?;
+
+            let has_legacy =
+                categories_file.is_some() || tasks_file.is_some() || settings.is_some();
+            if has_legacy {
+                let mut data = StoreData {
+                    revision: 1,
+                    categories: categories_file
+                        .map(|file| {
+                            file.categories
+                                .into_iter()
+                                .filter(|category| !category.is_all())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    tasks: tasks_file.map(|file| file.tasks).unwrap_or_default(),
+                    settings: settings.unwrap_or_default().normalized(),
+                    attachments: Vec::new(),
+                };
+                import_task_attachments(
+                    &mut data,
+                    Some(&images_root),
+                    &[],
+                    &mut installed_attachments,
+                )?;
+                prune_unreferenced_attachments(&mut data);
+                // Legacy relative values used the reader's current date/year. Freeze
+                // that interpretation now so it cannot drift after migration.
+                normalize_and_validate(
+                    &mut data,
+                    Local::now().naive_local(),
+                    DueMode::LegacyMigration,
+                    AttachmentMode::Persisted,
+                )?;
+                persist_diff(&tx, &existing, &data)?;
+            }
+            tx.execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, '1')",
+                [LEGACY_MIGRATION_KEY],
+            )?;
+            Ok(())
+        })();
+
+        if let Err(error) = prepared {
+            let cleanup = remove_installed_attachment_files(&installed_attachments);
+            let rollback = tx.rollback();
+            cleanup?;
+            rollback?;
+            return Err(error);
         }
-        tx.execute(
-            "INSERT INTO metadata(key, value) VALUES (?1, '1')",
-            [LEGACY_MIGRATION_KEY],
-        )?;
-        tx.commit()?;
+        if let Err(error) = tx.commit() {
+            cleanup_attachments_after_failed_commit(
+                &mut self.connection,
+                &images_root,
+                &installed_attachments,
+            )?;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn cleanup_pending_attachments(&mut self) -> Result<(), StoreError> {
+        if self.persistent_attachments {
+            cleanup_pending_attachment_files(&mut self.connection, &self.paths.images)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_attachment_storage(&mut self) -> Result<(), StoreError> {
+        if self.persistent_attachments {
+            reconcile_attachment_files(&mut self.connection, &self.paths.images)?;
+        }
         Ok(())
     }
 }
@@ -1190,6 +1271,9 @@ fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), Sto
             block_index INTEGER NOT NULL CHECK (block_index >= 0),
             attachment_id TEXT NOT NULL REFERENCES attachments(id) ON DELETE RESTRICT,
             PRIMARY KEY (task_id, block_index)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS attachment_gc (
+            storage_name TEXT PRIMARY KEY
         ) STRICT;
         CREATE INDEX IF NOT EXISTS task_attachments_by_attachment
             ON task_attachments(attachment_id);
@@ -1472,7 +1556,10 @@ fn persist_diff(
         .collect();
 
     for attachment in &before.attachments {
-        if after_attachments.get(attachment.id.as_str()).copied() != Some(attachment) {
+        if after_attachments
+            .get(attachment.id.as_str())
+            .is_some_and(|current| *current != attachment)
+        {
             return Err(StoreError::Validation(format!(
                 "attachment {:?} metadata is immutable",
                 attachment.id
@@ -1491,6 +1578,10 @@ fn persist_diff(
                     sqlite_attachment_size(attachment.byte_len)?,
                     attachment.storage_name,
                 ],
+            )?;
+            tx.execute(
+                "DELETE FROM attachment_gc WHERE storage_name = ?1",
+                [&attachment.storage_name],
             )?;
         }
     }
@@ -1656,6 +1747,22 @@ fn persist_diff(
         }
     }
 
+    for attachment in &before.attachments {
+        if !after_attachments.contains_key(attachment.id.as_str()) {
+            tx.execute(
+                "INSERT OR IGNORE INTO attachment_gc(storage_name) VALUES (?1)",
+                [&attachment.storage_name],
+            )?;
+            execute_one(
+                tx,
+                "DELETE FROM attachments WHERE id = ?1",
+                [attachment.id.as_str()],
+                "attachment",
+                &attachment.id,
+            )?;
+        }
+    }
+
     for category in &before.categories {
         if !after_categories.contains_key(category.id.as_str()) {
             execute_one(
@@ -1815,6 +1922,8 @@ fn persist_app_state(
 fn import_task_attachments(
     data: &mut StoreData,
     images_root: Option<&Path>,
+    staged_attachments: &[StagedAttachment],
+    installed_attachments: &mut Vec<InstalledAttachmentFile>,
 ) -> Result<(), StoreError> {
     let mut known: HashMap<String, Attachment> = data
         .attachments
@@ -1822,6 +1931,18 @@ fn import_task_attachments(
         .cloned()
         .map(|attachment| (attachment.id.clone(), attachment))
         .collect();
+    let mut staged_by_id = HashMap::with_capacity(staged_attachments.len());
+    for staged in staged_attachments {
+        if staged_by_id
+            .insert(staged.metadata.id.as_str(), staged)
+            .is_some()
+        {
+            return Err(StoreError::Validation(format!(
+                "staged attachment {:?} is duplicated",
+                staged.metadata.id
+            )));
+        }
+    }
 
     for task in &mut data.tasks {
         for block in &mut task.body {
@@ -1831,30 +1952,44 @@ fn import_task_attachments(
             if known.contains_key(attachment_id) {
                 continue;
             }
-            if is_attachment_id(attachment_id) {
-                return Err(StoreError::Validation(format!(
-                    "task {:?} refers to unknown attachment {attachment_id:?}",
-                    task.id
-                )));
-            }
             let Some(images_root) = images_root else {
                 return Err(StoreError::Validation(
                     "image attachments require a persistent store".into(),
                 ));
             };
-            let imported = import_attachment(attachment_id, images_root)?;
-            if let Some(existing) = known.get(&imported.id) {
-                if existing != &imported {
+            let reference = attachment_id.clone();
+            let (source_path, expected) = if is_attachment_id(&reference) {
+                let staged = staged_by_id.get(reference.as_str()).ok_or_else(|| {
+                    StoreError::Validation(format!(
+                        "task {:?} refers to unknown attachment {reference:?}",
+                        task.id
+                    ))
+                })?;
+                (staged.path.clone(), Some(&staged.metadata))
+            } else {
+                (crate::image::expand_in(&reference, images_root), None)
+            };
+            let imported = import_attachment_from_path(&source_path, images_root)?;
+            if let Some(installed) = imported.installed.clone() {
+                installed_attachments.push(installed);
+            }
+            if expected.is_some_and(|expected| expected != &imported.metadata) {
+                return Err(StoreError::Validation(format!(
+                    "staged attachment {reference:?} does not match its verified metadata"
+                )));
+            }
+            if let Some(existing) = known.get(&imported.metadata.id) {
+                if existing != &imported.metadata {
                     return Err(StoreError::Corrupt(format!(
                         "attachment {:?} metadata does not match imported content",
-                        imported.id
+                        imported.metadata.id
                     )));
                 }
             } else {
-                known.insert(imported.id.clone(), imported.clone());
-                data.attachments.push(imported.clone());
+                known.insert(imported.metadata.id.clone(), imported.metadata.clone());
+                data.attachments.push(imported.metadata.clone());
             }
-            *attachment_id = imported.id;
+            *attachment_id = imported.metadata.id;
         }
     }
     data.attachments
@@ -1862,15 +1997,21 @@ fn import_task_attachments(
     Ok(())
 }
 
-fn import_attachment(reference: &str, images_root: &Path) -> Result<Attachment, StoreError> {
-    let source_path = crate::image::expand_in(reference, images_root);
-    import_attachment_from_path(&source_path, images_root)
+#[derive(Debug, Clone)]
+struct InstalledAttachmentFile {
+    id: String,
+    path: PathBuf,
+}
+
+struct ImportedAttachmentFile {
+    metadata: Attachment,
+    installed: Option<InstalledAttachmentFile>,
 }
 
 fn import_attachment_from_path(
     source_path: &Path,
     images_root: &Path,
-) -> Result<Attachment, StoreError> {
+) -> Result<ImportedAttachmentFile, StoreError> {
     let mut source = fs::File::open(source_path)
         .map_err(|error| StoreError::io("open image attachment", source_path, error))?;
     let metadata = source
@@ -1886,6 +2027,7 @@ fn import_attachment_from_path(
     ensure_private_directory(images_root)?;
     let temp_path = images_root.join(format!(".mach-attachment-{}.tmp", uuid::Uuid::new_v4()));
     let mut temp = open_private_attachment_temp(&temp_path)?;
+    let mut installed_path = None;
     let result = (|| {
         let mut hasher = Sha256::new();
         let mut byte_len = 0_u64;
@@ -1960,6 +2102,7 @@ fn import_attachment_from_path(
             fs::rename(&temp_path, &destination).map_err(|error| {
                 StoreError::io("install managed image attachment", &destination, error)
             })?;
+            installed_path = Some(destination.clone());
             set_private_file(&destination)?;
             fs::File::open(images_root)
                 .and_then(|directory| directory.sync_all())
@@ -1975,8 +2118,19 @@ fn import_attachment_from_path(
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
+        if let Some(path) = installed_path.as_deref() {
+            let _ = fs::remove_file(path);
+        }
     }
-    result
+    let metadata = result?;
+    let installed = installed_path.map(|path| InstalledAttachmentFile {
+        id: metadata.id.clone(),
+        path,
+    });
+    Ok(ImportedAttachmentFile {
+        metadata,
+        installed,
+    })
 }
 
 fn open_private_attachment_temp(path: &Path) -> Result<fs::File, StoreError> {
@@ -2034,6 +2188,228 @@ fn is_attachment_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_managed_attachment_name(value: &str) -> bool {
+    let Some((id, extension)) = value.rsplit_once('.') else {
+        return false;
+    };
+    is_attachment_id(id) && matches!(extension, "png" | "jpg" | "gif" | "webp")
+}
+
+fn is_managed_attachment_temp_name(value: &str) -> bool {
+    value
+        .strip_prefix(".mach-attachment-")
+        .and_then(|value| value.strip_suffix(".tmp"))
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+fn prune_unreferenced_attachments(data: &mut StoreData) {
+    let referenced: HashSet<_> = data
+        .tasks
+        .iter()
+        .flat_map(|task| task.body.iter())
+        .filter_map(|block| match block {
+            Block::Image { attachment_id } => Some(attachment_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    data.attachments
+        .retain(|attachment| referenced.contains(attachment.id.as_str()));
+}
+
+fn remove_managed_attachment_file(path: &Path) -> Result<bool, StoreError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StoreError::io(
+            "remove managed image attachment",
+            path,
+            error,
+        )),
+    }
+}
+
+fn sync_images_directory(images_root: &Path) -> Result<(), StoreError> {
+    if !images_root.exists() {
+        return Ok(());
+    }
+    fs::File::open(images_root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| StoreError::io("sync image directory", images_root, error))
+}
+
+fn remove_installed_attachment_files(
+    installed_attachments: &[InstalledAttachmentFile],
+) -> Result<(), StoreError> {
+    let mut directory = None;
+    let mut removed = false;
+    for attachment in installed_attachments {
+        removed |= remove_managed_attachment_file(&attachment.path)?;
+        directory = attachment.path.parent();
+    }
+    if removed && let Some(directory) = directory {
+        sync_images_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn cleanup_attachments_after_failed_commit(
+    connection: &mut Connection,
+    images_root: &Path,
+    installed_attachments: &[InstalledAttachmentFile],
+) -> Result<(), StoreError> {
+    if installed_attachments.is_empty() {
+        return Ok(());
+    }
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut unowned = Vec::new();
+    for attachment in installed_attachments {
+        let owned: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attachments WHERE id = ?1)",
+            [&attachment.id],
+            |row| row.get(0),
+        )?;
+        if !owned {
+            unowned.push(attachment.clone());
+        }
+    }
+    remove_installed_attachment_files(&unowned)?;
+    tx.commit()?;
+    sync_images_directory(images_root)?;
+    Ok(())
+}
+
+fn cleanup_pending_attachment_files(
+    connection: &mut Connection,
+    images_root: &Path,
+) -> Result<(), StoreError> {
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let pending = {
+        let mut statement =
+            tx.prepare("SELECT storage_name FROM attachment_gc ORDER BY storage_name")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut removed = false;
+    for storage_name in pending {
+        if !is_managed_attachment_name(&storage_name) {
+            return Err(StoreError::Corrupt(format!(
+                "attachment cleanup entry has invalid storage name {storage_name:?}"
+            )));
+        }
+        let owned: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attachments WHERE storage_name = ?1)",
+            [&storage_name],
+            |row| row.get(0),
+        )?;
+        if !owned {
+            removed |= remove_managed_attachment_file(&images_root.join(&storage_name))?;
+        }
+        tx.execute(
+            "DELETE FROM attachment_gc WHERE storage_name = ?1",
+            [&storage_name],
+        )?;
+    }
+    if removed {
+        sync_images_directory(images_root)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn reconcile_attachment_files(
+    connection: &mut Connection,
+    images_root: &Path,
+) -> Result<(), StoreError> {
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let unreferenced = {
+        let mut statement = tx.prepare(
+            "SELECT attachments.id, attachments.storage_name
+             FROM attachments
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM task_attachments
+                 WHERE task_attachments.attachment_id = attachments.id
+             )
+             ORDER BY attachments.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, storage_name) in unreferenced {
+        if !is_managed_attachment_name(&storage_name)
+            || !storage_name.starts_with(&format!("{id}."))
+        {
+            return Err(StoreError::Corrupt(format!(
+                "attachment {id:?} has invalid storage name {storage_name:?}"
+            )));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO attachment_gc(storage_name) VALUES (?1)",
+            [&storage_name],
+        )?;
+        tx.execute("DELETE FROM attachments WHERE id = ?1", [&id])?;
+    }
+
+    let owned = {
+        let mut statement = tx.prepare("SELECT storage_name FROM attachments")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<HashSet<_>, _>>()?
+    };
+    if let Some(invalid) = owned
+        .iter()
+        .find(|storage_name| !is_managed_attachment_name(storage_name))
+    {
+        return Err(StoreError::Corrupt(format!(
+            "attachment has invalid storage name {invalid:?}"
+        )));
+    }
+    let pending = {
+        let mut statement = tx.prepare("SELECT storage_name FROM attachment_gc")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if let Some(invalid) = pending
+        .iter()
+        .find(|storage_name| !is_managed_attachment_name(storage_name))
+    {
+        return Err(StoreError::Corrupt(format!(
+            "attachment cleanup entry has invalid storage name {invalid:?}"
+        )));
+    }
+
+    let mut removed = false;
+    if images_root.exists() {
+        let entries = fs::read_dir(images_root)
+            .map_err(|error| StoreError::io("read image directory", images_root, error))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| StoreError::io("read image directory", images_root, error))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let stale_temp = is_managed_attachment_temp_name(name);
+            let orphaned_managed = is_managed_attachment_name(name) && !owned.contains(name);
+            if !stale_temp && !orphaned_managed {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(|error| {
+                StoreError::io("inspect image directory entry", &entry.path(), error)
+            })?;
+            if file_type.is_file() || file_type.is_symlink() {
+                removed |= remove_managed_attachment_file(&entry.path())?;
+            }
+        }
+    }
+    if removed {
+        sync_images_directory(images_root)?;
+    }
+    tx.execute("DELETE FROM attachment_gc", [])?;
+    tx.commit()?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

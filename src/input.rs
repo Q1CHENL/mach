@@ -159,7 +159,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // easy to throw away what was typed, and Esc already backs out there.
     if is_ctrl_c(key) && app.mode == Mode::Normal {
         if app.awaiting(Confirm::Quit) {
-            app.should_quit = true;
+            app.request_quit();
         } else {
             app.ask_confirm(Confirm::Quit, "Press Ctrl+C again to quit");
         }
@@ -305,6 +305,9 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) {
         }
         // Esc backs out one step and never quits; use `/quit`.
         KeyCode::Esc => {
+            if app.cancel_archive() {
+                return;
+            }
             if app.searching {
                 app.end_search();
             }
@@ -737,51 +740,14 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
                 app.error("Usage: /export");
                 return;
             }
-            match app.export_archive() {
-                Ok(summary) => {
-                    let contents = crate::archive::content_count_text(
-                        summary.tasks,
-                        summary.categories,
-                        summary.images,
-                    );
-                    app.archive_result(format!(
-                        "Exported to {} · {contents}",
-                        summary.short_path()
-                    ));
-                }
-                Err(error) => app.error(format!("Could not export: {error}")),
-            }
+            app.start_export_archive();
         }
         SlashCommand::Import => {
             let argument = args_for(cmd, query);
             if argument.is_empty() {
                 app.error("Usage: /import <FILE>");
             } else {
-                match app.import_archive(std::path::Path::new(&argument)) {
-                    Ok(summary) => {
-                        let added = crate::archive::content_count_text(
-                            summary.tasks_added,
-                            summary.categories_added,
-                            summary.images_added,
-                        );
-                        let unchanged = crate::archive::content_count_text(
-                            summary.tasks_unchanged,
-                            summary.categories_unchanged,
-                            summary.images_unchanged,
-                        );
-                        let message = if summary.tasks_added
-                            + summary.categories_added
-                            + summary.images_added
-                            == 0
-                        {
-                            format!("Nothing imported; {unchanged} already present")
-                        } else {
-                            format!("Imported {added}; {unchanged} already present")
-                        };
-                        app.archive_result(message);
-                    }
-                    Err(error) => app.error(format!("Could not import: {error}")),
-                }
+                app.start_import_archive(std::path::PathBuf::from(argument));
             }
         }
         SlashCommand::Done => {
@@ -806,7 +772,7 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
             }
         }
         SlashCommand::Update => app.start_update_install(),
-        SlashCommand::Quit => app.should_quit = true,
+        SlashCommand::Quit => app.request_quit(),
     }
 }
 

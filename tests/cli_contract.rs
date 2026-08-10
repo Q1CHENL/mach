@@ -749,3 +749,62 @@ fn archive_import_is_idempotent_and_rejects_conflicting_ids_atomically() {
     assert_eq!(after.tasks, before.tasks);
     assert_eq!(after.attachments(), before.attachments());
 }
+
+#[test]
+fn failed_archive_database_merge_does_not_install_image_files() {
+    let source = TempDir::new("archive-rollback-source");
+    let destination = TempDir::new("archive-rollback-destination");
+    let output = TempDir::new("archive-rollback-output");
+    let archive = output.path().join("tasks.mach");
+    let screenshot = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/screenshot.png");
+    let body = format!("[image:{}]", screenshot.display());
+
+    let added = mach(source.path(), &["--json", "add", "image", "--body", &body]);
+    assert!(added.status.success());
+    assert!(
+        mach(
+            source.path(),
+            &["export", archive.to_str().expect("UTF-8 archive path")],
+        )
+        .status
+        .success()
+    );
+    assert!(
+        mach(destination.path(), &["--json", "list"])
+            .status
+            .success()
+    );
+    let store = Store::open(destination.path()).unwrap();
+    let connection = rusqlite::Connection::open(store.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_imported_task
+             BEFORE INSERT ON tasks
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced archive merge failure');
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+    drop(store);
+
+    let imported = mach(
+        destination.path(),
+        &["--json", "import", archive.to_str().unwrap()],
+    );
+    assert!(!imported.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&imported.stdout).unwrap();
+    assert_eq!(error["kind"], "database");
+
+    let store = Store::open(destination.path()).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert!(snapshot.tasks.is_empty());
+    assert!(snapshot.attachments().is_empty());
+    if store.images_dir().exists() {
+        assert_eq!(
+            std::fs::read_dir(store.images_dir()).unwrap().count(),
+            0,
+            "failed archive merge must not leave managed image bytes"
+        );
+    }
+}

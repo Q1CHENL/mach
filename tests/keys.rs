@@ -580,6 +580,10 @@ fn slash_import_uses_the_specified_archive_path() {
     );
 
     let (mut destination, destination_dir) = file_app();
+    let lock = rusqlite::Connection::open(destination_dir.join("mach.db"))
+        .expect("open destination database lock");
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("hold destination write lock");
     press(&mut destination, KeyCode::Char('/'), KeyModifiers::NONE);
     for character in format!("import {}", archive.display()).chars() {
         press(
@@ -588,18 +592,27 @@ fn slash_import_uses_the_specified_archive_path() {
             KeyModifiers::NONE,
         );
     }
+    let started = std::time::Instant::now();
     press(&mut destination, KeyCode::Enter, KeyModifiers::NONE);
+    let elapsed = started.elapsed();
 
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "slash import blocked the input path for {elapsed:?}"
+    );
+    press(&mut destination, KeyCode::Char('/'), KeyModifiers::NONE);
+    assert_eq!(destination.mode, Mode::Slash);
+    press(&mut destination, KeyCode::Esc, KeyModifiers::NONE);
+    lock.execute_batch("ROLLBACK")
+        .expect("release destination write lock");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while destination.tasks.is_empty() && std::time::Instant::now() < deadline {
+        destination.poll_external_changes();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert_eq!(destination.tasks.len(), 1, "{}", message(&destination));
     assert_eq!(destination.tasks[0].title, "portable from TUI");
-    assert!(message(&destination).contains("Imported 1 task"));
-    let remaining = destination
-        .message
-        .as_ref()
-        .unwrap()
-        .until
-        .saturating_duration_since(std::time::Instant::now());
-    assert!(remaining >= std::time::Duration::from_secs(7));
 
     drop(source);
     drop(destination);

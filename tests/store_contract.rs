@@ -414,6 +414,230 @@ fn identical_image_sources_share_one_managed_attachment() {
 }
 
 #[test]
+fn deleting_one_shared_reference_keeps_the_managed_attachment() {
+    let dir = TempDir::new("attachment-shared-delete");
+    let sources = TempDir::new("attachment-shared-delete-sources");
+    let source = sources.path().join("shared.png");
+    write_test_png(&source, [70, 80, 90, 255]);
+    let mut store = Store::open(dir.path()).unwrap();
+    let (first, second) = store
+        .update(|data| {
+            let first = data.create_task(
+                "first shared reference",
+                vec![mach::model::Block::image(&source.to_string_lossy())],
+                "",
+                0,
+                None,
+            )?;
+            let second = data.create_task(
+                "second shared reference",
+                vec![mach::model::Block::image(&source.to_string_lossy())],
+                "",
+                0,
+                None,
+            )?;
+            Ok((first, second))
+        })
+        .unwrap();
+    let attachment = store.snapshot().unwrap().attachments()[0].clone();
+    let managed = store.images_dir().join(&attachment.storage_name);
+
+    store.update(|data| data.delete_task(&first.id)).unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.tasks.len(), 1);
+    assert_eq!(snapshot.tasks[0].id, second.id);
+    assert_eq!(snapshot.attachments(), &[attachment]);
+    assert!(managed.is_file());
+}
+
+#[test]
+fn deleting_the_last_reference_reclaims_its_managed_attachment() {
+    let dir = TempDir::new("attachment-reclaim");
+    let source_dir = TempDir::new("attachment-reclaim-source");
+    let source = source_dir.path().join("temporary.png");
+    write_test_png(&source, [22, 44, 66, 255]);
+    let mut store = Store::open(dir.path()).unwrap();
+    let task = store
+        .update(|data| {
+            data.create_task(
+                "temporary image",
+                vec![mach::model::Block::image(&source.to_string_lossy())],
+                "",
+                0,
+                None,
+            )
+        })
+        .unwrap();
+    let attachment = store.snapshot().unwrap().attachments()[0].clone();
+    let managed = store.images_dir().join(&attachment.storage_name);
+    assert!(managed.is_file());
+
+    store
+        .update(|data| data.delete_task(&task.id))
+        .expect("delete the attachment's last task reference");
+
+    let snapshot = store.snapshot().unwrap();
+    assert!(snapshot.tasks.is_empty());
+    assert!(snapshot.attachments().is_empty());
+    assert!(
+        !managed.exists(),
+        "unreferenced managed image must not remain on disk"
+    );
+}
+
+#[test]
+fn failed_database_write_reclaims_new_managed_attachment_file() {
+    let dir = TempDir::new("attachment-database-failure");
+    let source_dir = TempDir::new("attachment-database-failure-source");
+    let source = source_dir.path().join("rollback.png");
+    write_test_png(&source, [11, 33, 55, 255]);
+    let mut store = Store::open(dir.path()).unwrap();
+    let observer = rusqlite::Connection::open(store.database_path()).unwrap();
+    observer
+        .execute_batch(
+            "CREATE TRIGGER reject_task_insert
+             BEFORE INSERT ON tasks
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced task insert failure');
+             END;",
+        )
+        .unwrap();
+    drop(observer);
+
+    let error = store
+        .update(|data| {
+            data.create_task(
+                "must roll back",
+                vec![mach::model::Block::image(&source.to_string_lossy())],
+                "",
+                0,
+                None,
+            )
+        })
+        .expect_err("database failure must abort the attachment import");
+    assert!(matches!(error, StoreError::Database(_)));
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.revision, 0);
+    assert!(snapshot.tasks.is_empty());
+    assert!(snapshot.attachments().is_empty());
+    if store.images_dir().exists() {
+        assert_eq!(
+            std::fs::read_dir(store.images_dir()).unwrap().count(),
+            0,
+            "a failed database mutation must not leave managed image bytes"
+        );
+    }
+}
+
+#[test]
+fn failed_deduplicated_write_keeps_the_preexisting_managed_attachment() {
+    let dir = TempDir::new("attachment-dedup-database-failure");
+    let source_dir = TempDir::new("attachment-dedup-database-failure-source");
+    let source = source_dir.path().join("shared.png");
+    write_test_png(&source, [12, 34, 56, 255]);
+    let mut store = Store::open(dir.path()).unwrap();
+    let original = store
+        .update(|data| {
+            data.create_task(
+                "original",
+                vec![mach::model::Block::image(&source.to_string_lossy())],
+                "",
+                0,
+                None,
+            )
+        })
+        .unwrap();
+    let attachment = store.snapshot().unwrap().attachments()[0].clone();
+    let managed = store.images_dir().join(&attachment.storage_name);
+    let original_bytes = std::fs::read(&managed).unwrap();
+    let observer = rusqlite::Connection::open(store.database_path()).unwrap();
+    observer
+        .execute_batch(
+            "CREATE TRIGGER reject_deduplicated_task_insert
+             BEFORE INSERT ON tasks
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced deduplicated task failure');
+             END;",
+        )
+        .unwrap();
+    drop(observer);
+
+    let error = store
+        .update(|data| {
+            data.create_task(
+                "must roll back",
+                vec![mach::model::Block::image(&source.to_string_lossy())],
+                "",
+                0,
+                None,
+            )
+        })
+        .expect_err("the second task insert must fail");
+    assert!(matches!(error, StoreError::Database(_)));
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.tasks.len(), 1);
+    assert_eq!(snapshot.tasks[0].id, original.id);
+    assert_eq!(snapshot.attachments(), &[attachment]);
+    assert_eq!(std::fs::read(managed).unwrap(), original_bytes);
+}
+
+#[test]
+fn reopening_reconciles_only_managed_or_temporary_orphan_files() {
+    let dir = TempDir::new("attachment-reopen-reconciliation");
+    let source_dir = TempDir::new("attachment-reopen-reconciliation-source");
+    let source = source_dir.path().join("legacy.png");
+    write_test_png(&source, [21, 43, 65, 255]);
+    let mut store = Store::open(dir.path()).unwrap();
+    let task = store
+        .update(|data| {
+            data.create_task(
+                "legacy orphan",
+                vec![mach::model::Block::image(&source.to_string_lossy())],
+                "",
+                0,
+                None,
+            )
+        })
+        .unwrap();
+    let attachment = store.snapshot().unwrap().attachments()[0].clone();
+    let legacy_managed = store.images_dir().join(&attachment.storage_name);
+    let orphaned_managed = store.images_dir().join(format!("{}.png", "a".repeat(64)));
+    let stale_temp = store
+        .images_dir()
+        .join(format!(".mach-attachment-{}.tmp", uuid::Uuid::new_v4()));
+    let arbitrary = store.images_dir().join("keep-user-source.png");
+    let lookalike_temp = store.images_dir().join(".mach-attachment-not-a-uuid.tmp");
+    std::fs::write(&orphaned_managed, b"orphaned managed bytes").unwrap();
+    std::fs::write(&stale_temp, b"stale temporary bytes").unwrap();
+    std::fs::write(&arbitrary, b"user source bytes").unwrap();
+    std::fs::write(&lookalike_temp, b"not a managed temp name").unwrap();
+    let database = store.database_path().to_path_buf();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    connection
+        .execute("DELETE FROM tasks WHERE id = ?1", [&task.id])
+        .unwrap();
+    drop(connection);
+
+    let reopened = Store::open(dir.path()).expect("reconcile attachment storage on reopen");
+    let snapshot = reopened.snapshot().unwrap();
+    assert!(snapshot.tasks.is_empty());
+    assert!(snapshot.attachments().is_empty());
+    assert!(!legacy_managed.exists());
+    assert!(!orphaned_managed.exists());
+    assert!(!stale_temp.exists());
+    assert!(arbitrary.is_file());
+    assert!(lookalike_temp.is_file());
+}
+
+#[test]
 fn failed_attachment_import_does_not_commit_the_task() {
     let dir = TempDir::new("attachment-import-failure");
     let mut store = Store::open(dir.path()).unwrap();

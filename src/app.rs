@@ -1,6 +1,7 @@
 //! Application state and every operation the UI can trigger.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -158,6 +159,47 @@ struct UpdateJob {
     lease: Option<UpdateLease>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveJobKind {
+    Export,
+    Import,
+}
+
+impl ArchiveJobKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Export => "export",
+            Self::Import => "import",
+        }
+    }
+
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Export => "Export",
+            Self::Import => "Import",
+        }
+    }
+}
+
+enum ArchiveOutcome {
+    Export(crate::archive::ExportSummary),
+    Import(crate::archive::ImportSummary),
+}
+
+enum ArchiveEvent {
+    Progress(crate::archive::ArchiveProgress),
+    Finished(Result<ArchiveOutcome, crate::archive::ArchiveError>),
+}
+
+struct ArchiveJob {
+    rx: Receiver<ArchiveEvent>,
+    handle: std::thread::JoinHandle<()>,
+    kind: ArchiveJobKind,
+    control: Arc<crate::archive::ArchiveControl>,
+    progress: crate::archive::ArchiveProgress,
+    cancel_requested: bool,
+}
+
 struct UpdateNotice {
     text: String,
     available_version: Option<String>,
@@ -267,6 +309,12 @@ pub struct App {
     category_edit_base: Option<Category>,
     /// One in-flight automatic check or explicit install.
     update_job: Option<UpdateJob>,
+    /// One in-flight archive import or export. All archive I/O runs off the
+    /// event-loop thread so large backups cannot freeze input or drawing.
+    archive_job: Option<ArchiveJob>,
+    /// A quit requested while archive work is active waits for safe
+    /// cancellation or finalization instead of abandoning temporary files.
+    quit_after_archive: bool,
     /// Application-level update scheduling state, independent of task data.
     update_state: Option<UpdateStateStore>,
     /// Wall-clock deadline for the next cheap state refresh.
@@ -373,6 +421,8 @@ impl App {
             task_edit_base: None,
             category_edit_base: None,
             update_job: None,
+            archive_job: None,
+            quit_after_archive: false,
             update_state,
             next_update_state_poll_at: 0,
             update_notice: None,
@@ -472,25 +522,208 @@ impl App {
         self.dirty = true;
     }
 
-    pub(crate) fn export_archive(
-        &self,
-    ) -> Result<crate::archive::ExportSummary, crate::archive::ArchiveError> {
-        crate::archive::export(&self.store, None)
+    pub(crate) fn start_export_archive(&mut self) {
+        self.start_archive_worker(ArchiveJobKind::Export, None);
     }
 
-    pub(crate) fn import_archive(
+    pub(crate) fn start_import_archive(&mut self, path: PathBuf) {
+        self.start_archive_worker(ArchiveJobKind::Import, Some(path));
+    }
+
+    fn start_archive_worker(&mut self, kind: ArchiveJobKind, import_path: Option<PathBuf>) {
+        if let Some(active) = self.archive_job.as_ref() {
+            self.info(format!("An {} is already running", active.kind.name()));
+            return;
+        }
+
+        let data_dir = self.store.data_dir().to_path_buf();
+        let control = Arc::new(crate::archive::ArchiveControl::new());
+        let worker_control = Arc::clone(&control);
+        let (tx, rx) = mpsc::channel();
+        let thread_name = match kind {
+            ArchiveJobKind::Export => "mach-archive-export",
+            ArchiveJobKind::Import => "mach-archive-import",
+        };
+        let spawn = std::thread::Builder::new()
+            .name(thread_name.into())
+            .spawn(move || {
+                let result = (|| -> Result<ArchiveOutcome, crate::archive::ArchiveError> {
+                    let mut store = Store::open(data_dir)?;
+                    match kind {
+                        ArchiveJobKind::Export => crate::archive::export_with_progress(
+                            &store,
+                            None,
+                            &worker_control,
+                            |progress| {
+                                let _ = tx.send(ArchiveEvent::Progress(progress));
+                            },
+                        )
+                        .map(ArchiveOutcome::Export),
+                        ArchiveJobKind::Import => {
+                            let path = import_path.expect("import worker requires a path");
+                            crate::archive::import_with_progress(
+                                &mut store,
+                                &path,
+                                &worker_control,
+                                |progress| {
+                                    let _ = tx.send(ArchiveEvent::Progress(progress));
+                                },
+                            )
+                            .map(|outcome| ArchiveOutcome::Import(outcome.summary))
+                        }
+                    }
+                })();
+                let _ = tx.send(ArchiveEvent::Finished(result));
+            });
+
+        match spawn {
+            Ok(handle) => {
+                self.archive_job = Some(ArchiveJob {
+                    rx,
+                    handle,
+                    kind,
+                    control,
+                    progress: crate::archive::ArchiveProgress::Preparing,
+                    cancel_requested: false,
+                });
+                self.dirty = true;
+            }
+            Err(error) => self.error(format!("Could not start archive {}: {error}", kind.name())),
+        }
+    }
+
+    /// Apply archive progress or completion without blocking the event loop.
+    pub(crate) fn poll_archive(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let event = self.archive_job.as_ref().map(|job| job.rx.try_recv());
+            match event {
+                None => return changed,
+                Some(Ok(ArchiveEvent::Progress(progress))) => {
+                    if let Some(job) = self.archive_job.as_mut()
+                        && job.progress != progress
+                    {
+                        job.progress = progress;
+                        changed = true;
+                    }
+                }
+                Some(Ok(ArchiveEvent::Finished(result))) => {
+                    let job = self
+                        .archive_job
+                        .take()
+                        .expect("archive event requires an active job");
+                    let kind = job.kind;
+                    let _ = job.handle.join();
+                    changed |= self.finish_archive(kind, result);
+                    if self.quit_after_archive {
+                        self.should_quit = true;
+                    }
+                    return changed;
+                }
+                Some(Err(TryRecvError::Empty)) => return changed,
+                Some(Err(TryRecvError::Disconnected)) => {
+                    let job = self
+                        .archive_job
+                        .take()
+                        .expect("archive channel requires an active job");
+                    let kind = job.kind;
+                    let _ = job.handle.join();
+                    self.error(format!("{} stopped unexpectedly", kind.title()));
+                    if self.quit_after_archive {
+                        self.should_quit = true;
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
+    fn finish_archive(
         &mut self,
-        path: &Path,
-    ) -> Result<crate::archive::ImportSummary, crate::archive::ArchiveError> {
-        let selected_category = self.current_category_id().to_string();
-        let selected_task = self.selected_task().map(|task| task.id.clone());
-        let outcome = crate::archive::import(&mut self.store, path)?;
-        self.apply_snapshot(
-            outcome.snapshot,
-            &selected_category,
-            selected_task.as_deref(),
-        );
-        Ok(outcome.summary)
+        kind: ArchiveJobKind,
+        result: Result<ArchiveOutcome, crate::archive::ArchiveError>,
+    ) -> bool {
+        match result {
+            Ok(ArchiveOutcome::Export(summary)) => {
+                let contents = crate::archive::content_count_text(
+                    summary.tasks,
+                    summary.categories,
+                    summary.images,
+                );
+                self.archive_result(format!("Exported to {} · {contents}", summary.short_path()));
+            }
+            Ok(ArchiveOutcome::Import(summary)) => {
+                if let Err(error) = self.reload_store() {
+                    self.error(format!(
+                        "Archive imported, but mach could not refresh: {error}"
+                    ));
+                    return true;
+                }
+                let added = crate::archive::content_count_text(
+                    summary.tasks_added,
+                    summary.categories_added,
+                    summary.images_added,
+                );
+                let unchanged = crate::archive::content_count_text(
+                    summary.tasks_unchanged,
+                    summary.categories_unchanged,
+                    summary.images_unchanged,
+                );
+                let message =
+                    if summary.tasks_added + summary.categories_added + summary.images_added == 0 {
+                        format!("Nothing imported; {unchanged} already present")
+                    } else {
+                        format!("Imported {added}; {unchanged} already present")
+                    };
+                self.archive_result(message);
+            }
+            Err(crate::archive::ArchiveError::Cancelled) => {
+                self.info(format!("{} cancelled", kind.title()));
+            }
+            Err(error) => self.error(format!("Could not {}: {error}", kind.name())),
+        }
+        true
+    }
+
+    /// Request cancellation at the next safe I/O boundary. Once finalization
+    /// begins, import may be inside its atomic database commit and must finish.
+    pub(crate) fn cancel_archive(&mut self) -> bool {
+        let Some(job) = self.archive_job.as_mut() else {
+            return false;
+        };
+        if !job.control.request_cancel() {
+            let title = job.kind.title();
+            self.info(format!("{title} is finishing and cannot be cancelled"));
+            return true;
+        }
+        if !job.cancel_requested {
+            job.cancel_requested = true;
+            self.dirty = true;
+        }
+        true
+    }
+
+    pub fn request_quit(&mut self) {
+        let Some(job) = self.archive_job.as_mut() else {
+            self.should_quit = true;
+            return;
+        };
+        self.quit_after_archive = true;
+        if job.control.request_cancel() {
+            job.cancel_requested = true;
+        }
+        self.pending = None;
+        self.message = None;
+        self.dirty = true;
+    }
+
+    /// Join archive work before an event-loop error releases the process.
+    /// Normal quits already defer until `poll_archive` observes completion.
+    pub(crate) fn shutdown_archive(&mut self) {
+        if let Some(job) = self.archive_job.take() {
+            let _ = job.control.request_cancel();
+            let _ = job.handle.join();
+        }
     }
 
     /// Commit against the transaction's fresh snapshot and apply the exact
@@ -1808,10 +2041,50 @@ impl App {
         self.update_activity
     }
 
-    pub(crate) fn update_work_active(&self) -> bool {
-        self.update_job
-            .as_ref()
-            .is_some_and(|job| job.kind == UpdateJobKind::Install)
+    pub(crate) fn archive_activity_text(&self) -> Option<String> {
+        let job = self.archive_job.as_ref()?;
+        if self.quit_after_archive {
+            let action = if job.cancel_requested {
+                "Cancelling"
+            } else {
+                "Finishing"
+            };
+            return Some(format!("{action} {} before quit…", job.kind.name()));
+        }
+        if job.cancel_requested {
+            return Some(format!("Cancelling {}…", job.kind.name()));
+        }
+        let text = match job.progress {
+            crate::archive::ArchiveProgress::Preparing => {
+                format!("Preparing {}… · Esc cancels", job.kind.name())
+            }
+            crate::archive::ArchiveProgress::Attachments { completed, total } if total > 0 => {
+                let action = match job.kind {
+                    ArchiveJobKind::Export => "Exporting",
+                    ArchiveJobKind::Import => "Importing",
+                };
+                format!("{action} images {completed}/{total}… · Esc cancels")
+            }
+            crate::archive::ArchiveProgress::Attachments { .. } => {
+                let action = match job.kind {
+                    ArchiveJobKind::Export => "Writing export",
+                    ArchiveJobKind::Import => "Reading import",
+                };
+                format!("{action}… · Esc cancels")
+            }
+            crate::archive::ArchiveProgress::Finalizing => {
+                format!("Finishing {}…", job.kind.name())
+            }
+        };
+        Some(text)
+    }
+
+    pub(crate) fn background_work_active(&self) -> bool {
+        self.archive_job.is_some()
+            || self
+                .update_job
+                .as_ref()
+                .is_some_and(|job| job.kind == UpdateJobKind::Install)
     }
 
     fn set_message(&mut self, text: String, kind: MessageKind, lifetime: MessageLifetime) {
@@ -1940,6 +2213,28 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn exported_task_archive(root: &Path, title: &str) -> PathBuf {
+        let mut source = Store::open(root.join("source")).expect("open archive source");
+        source
+            .update(|data| {
+                data.tasks.push(Task::new(title, 0, None, ""));
+                Ok(())
+            })
+            .expect("create archived task");
+        let path = root.join("tasks.mach");
+        crate::archive::export(&source, Some(&path)).expect("export task archive");
+        path
+    }
+
+    fn wait_for_archive(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.archive_job.is_some() && Instant::now() < deadline {
+            app.poll_archive();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.archive_job.is_none(), "archive worker did not finish");
+    }
+
     fn assert_message_lifetime(app: &App, expected: Duration) {
         let remaining = app
             .message
@@ -2036,6 +2331,97 @@ mod tests {
 
         app.show_update_message("long update result".into(), MessageKind::Info);
         assert_message_lifetime(&app, Duration::from_secs(8));
+    }
+
+    #[test]
+    fn background_import_reloads_the_completed_store() {
+        let root = std::env::temp_dir().join(format!(
+            "mach-background-import-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let archive = exported_task_archive(&root, "imported in the background");
+        let store = Store::open(root.join("destination")).expect("open archive destination");
+        let mut app = App::with_store("test", store).expect("build destination app");
+
+        app.start_import_archive(archive);
+        assert!(app.background_work_active());
+        wait_for_archive(&mut app);
+
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].title, "imported in the background");
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("Imported 1 task"))
+        );
+
+        drop(app);
+        std::fs::remove_dir_all(&root).expect("remove archive test directory");
+    }
+
+    #[test]
+    fn cancelling_a_background_import_prevents_its_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "mach-cancel-import-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let archive = exported_task_archive(&root, "must not be imported");
+        let destination = root.join("destination");
+        let store = Store::open(&destination).expect("open archive destination");
+        let lock = rusqlite::Connection::open(destination.join("mach.db"))
+            .expect("open destination database lock");
+        lock.execute_batch("BEGIN IMMEDIATE")
+            .expect("hold destination write lock");
+        let mut app = App::with_store("test", store).expect("build destination app");
+
+        app.start_import_archive(archive);
+        assert!(app.cancel_archive());
+        lock.execute_batch("ROLLBACK")
+            .expect("release destination write lock");
+        wait_for_archive(&mut app);
+
+        assert!(app.tasks.is_empty());
+        assert_eq!(
+            app.message.as_ref().map(|message| message.text.as_str()),
+            Some("Import cancelled")
+        );
+
+        drop(lock);
+        drop(app);
+        std::fs::remove_dir_all(&root).expect("remove archive test directory");
+    }
+
+    #[test]
+    fn quit_waits_for_background_archive_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "mach-quit-during-import-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let archive = exported_task_archive(&root, "must not outlive mach");
+        let destination = root.join("destination");
+        let store = Store::open(&destination).expect("open archive destination");
+        let lock = rusqlite::Connection::open(destination.join("mach.db"))
+            .expect("open destination database lock");
+        lock.execute_batch("BEGIN IMMEDIATE")
+            .expect("hold destination write lock");
+        let mut app = App::with_store("test", store).expect("build destination app");
+
+        app.start_import_archive(archive);
+        app.request_quit();
+        assert!(!app.should_quit, "quit must wait for archive cleanup");
+        lock.execute_batch("ROLLBACK")
+            .expect("release destination write lock");
+        wait_for_archive(&mut app);
+
+        assert!(app.should_quit);
+        assert!(app.tasks.is_empty());
+
+        drop(lock);
+        drop(app);
+        std::fs::remove_dir_all(&root).expect("remove archive test directory");
     }
 
     #[test]
