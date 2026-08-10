@@ -254,6 +254,73 @@ fn empty_repeatable_subtasks_are_rejected_instead_of_succeeding_silently() {
 }
 
 #[test]
+fn documented_hyphen_leading_body_value_is_accepted_normally() {
+    let dir = TempDir::new("hyphen-leading-body");
+    let output = mach(
+        dir.path(),
+        &["--json", "add", "bullet body", "--body", "- first"],
+    );
+
+    assert!(
+        output.status.success(),
+        "documented bullet markup was rejected: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let task: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(task["body"], "- first");
+}
+
+#[test]
+fn missing_body_value_does_not_consume_the_next_flag_or_mutate() {
+    let dir = TempDir::new("missing-body-before-flag");
+    let added = mach(
+        dir.path(),
+        &[
+            "--json",
+            "add",
+            "keep me",
+            "--body",
+            "original body",
+            "--due",
+            "2026-08-20",
+        ],
+    );
+    assert!(added.status.success());
+    let task: serde_json::Value = serde_json::from_slice(&added.stdout).unwrap();
+    let id = task["id"].as_str().unwrap();
+
+    let edited = mach(dir.path(), &["--json", "edit", id, "--body", "--clear-due"]);
+
+    assert!(!edited.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&edited.stdout).unwrap();
+    assert_eq!(error["kind"], "usage");
+    let shown = mach(dir.path(), &["--json", "show", id]);
+    assert!(shown.status.success());
+    let unchanged: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(unchanged["body"], "original body");
+    assert_eq!(unchanged["due"], "2026-08-20");
+}
+
+#[test]
+fn explicit_equals_preserves_option_shaped_body_text() {
+    let dir = TempDir::new("option-shaped-body");
+    let output = mach(
+        dir.path(),
+        &["--json", "add", "literal option", "--body=--clear-due"],
+    );
+
+    assert!(
+        output.status.success(),
+        "explicit body value was rejected: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let task: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(task["body"], "--clear-due");
+}
+
+#[test]
 fn concurrent_cli_adds_do_not_lose_updates() {
     let dir = TempDir::new("cli-concurrency");
     assert!(mach(dir.path(), &["--json", "list"]).status.success());

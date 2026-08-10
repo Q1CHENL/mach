@@ -457,7 +457,7 @@ fn rendered(json_mode: bool, value: Value, plain: String) -> Rendered {
 }
 
 pub fn run() {
-    let arguments: Vec<OsString> = std::env::args_os().collect();
+    let arguments = normalize_documented_body_values(std::env::args_os().collect());
     let json_requested = requested_json(&arguments);
     let cli = match Cli::try_parse_from(&arguments) {
         Ok(cli) => cli,
@@ -501,6 +501,37 @@ pub fn run() {
         Ok(output) => emit_success(output),
         Err(error) => emit_runtime_error(error, json),
     }
+}
+
+/// Clap normally treats a separate leading-hyphen value as another option.
+/// Preserve that unambiguous behavior except for the documented `- ` body
+/// bullet; explicit `--body=...` remains the escape hatch for all other text.
+fn normalize_documented_body_values(arguments: Vec<OsString>) -> Vec<OsString> {
+    let mut normalized = Vec::with_capacity(arguments.len());
+    let mut arguments = arguments.into_iter().peekable();
+    let mut options = true;
+    while let Some(argument) = arguments.next() {
+        if options && argument == "--" {
+            options = false;
+            normalized.push(argument);
+            continue;
+        }
+        let body_option = options && (argument == "--body" || argument == "-b");
+        let documented_bullet = body_option
+            && arguments
+                .peek()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.starts_with("- "));
+        if documented_bullet {
+            let value = arguments.next().expect("peeked body value must exist");
+            let mut combined = OsString::from("--body=");
+            combined.push(value);
+            normalized.push(combined);
+        } else {
+            normalized.push(argument);
+        }
+    }
+    normalized
 }
 
 fn terminal_error(error: io::Error) -> CliError {
