@@ -186,6 +186,39 @@ impl Theme {
         Style::new().fg(self.accent)
     }
 
+    /// Keeps label identity visually stable across task-row focus and
+    /// completion states.
+    pub fn label_badge(&self, done: bool) -> Style {
+        if self.colors_disabled {
+            return Style::new().add_modifier(Modifier::REVERSED);
+        }
+        let background = if done {
+            self.dimmed_accent()
+        } else {
+            self.accent
+        };
+        let (r, g, b) = rgb_of(background);
+        let luminance = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1_000;
+        let foreground = if luminance >= 128 {
+            Color::Indexed(16)
+        } else {
+            Color::Indexed(231)
+        };
+        Style::new().fg(foreground).bg(background)
+    }
+
+    /// Separates label-manager navigation from accent-backed label identity.
+    pub fn label_focus(&self) -> Style {
+        if self.colors_disabled {
+            Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::new()
+                .fg(Color::Indexed(231))
+                .bg(Color::Indexed(240))
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
     pub fn plain(&self) -> Style {
         Style::new()
     }
@@ -230,9 +263,22 @@ mod tests {
         assert_eq!(no_color.success_color(), Color::Reset);
         assert_eq!(no_color.selection_wash(), Color::Reset);
         assert_eq!(no_color.dimmed_accent(), Color::Reset);
+        assert!(
+            no_color
+                .label_badge(false)
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
 
         let light = Theme::with_environment("white", false, true);
         assert_eq!(light.accent, Color::Indexed(238));
         assert!(light.selection().add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(light.label_badge(false).bg, Some(Color::Indexed(238)));
+        assert_eq!(light.label_badge(false).fg, Some(Color::Indexed(231)));
+
+        let dark_yellow = Theme::with_environment("yellow", false, false);
+        assert_eq!(dark_yellow.label_badge(false).bg, Some(Color::Indexed(226)));
+        assert_eq!(dark_yellow.label_badge(false).fg, Some(Color::Indexed(16)));
+        assert_eq!(dark_yellow.label_focus().bg, Some(Color::Indexed(240)));
     }
 }

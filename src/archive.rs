@@ -16,9 +16,10 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::model::{
-    Block, Category, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN, MAX_CATEGORY_DESC_LINES,
-    MAX_CATEGORY_NAME_LEN, MAX_DESCRIPTION_LINES, MAX_NOTES_LINE_LEN, MAX_TASK_COUNT,
-    MAX_TITLE_LEN, Task, caseless_key, text_byte_limit,
+    Block, Category, Label, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN,
+    MAX_CATEGORY_DESC_LINES, MAX_CATEGORY_NAME_LEN, MAX_DESCRIPTION_LINES, MAX_LABEL_COUNT,
+    MAX_LABEL_NAME_LEN, MAX_LABELS_PER_TASK, MAX_NOTES_LINE_LEN, MAX_TASK_COUNT, MAX_TITLE_LEN,
+    Task, caseless_key, text_byte_limit,
 };
 use crate::settings::Settings;
 use crate::store::{
@@ -27,7 +28,7 @@ use crate::store::{
 };
 
 const ARCHIVE_FORMAT: &str = "mach-archive";
-const ARCHIVE_SCHEMA: u32 = 2;
+const ARCHIVE_SCHEMA: u32 = 3;
 const MIN_ARCHIVE_SCHEMA: u32 = 1;
 const MANIFEST_PATH: &str = "manifest.json";
 const JSON_ESCAPE_EXPANSION: u64 = 6;
@@ -44,12 +45,14 @@ const MAX_MANIFEST_STRING_BYTES: u64 = ARCHIVE_FORMAT.len() as u64
         * (ID_MAX_BYTES as u64
             + text_byte_limit(MAX_CATEGORY_NAME_LEN) as u64
             + MAX_CATEGORY_DESCRIPTION_BYTES)
+    + MAX_LABEL_COUNT as u64 * (ID_MAX_BYTES as u64 + text_byte_limit(MAX_LABEL_NAME_LEN) as u64)
     + MAX_TASK_COUNT as u64
         * (ID_MAX_BYTES as u64
             + text_byte_limit(MAX_TITLE_LEN) as u64
             + DUE_MAX_BYTES as u64
             + CREATED_MAX_BYTES as u64
-            + ID_MAX_BYTES as u64)
+            + ID_MAX_BYTES as u64
+            + MAX_LABELS_PER_TASK as u64 * ID_MAX_BYTES as u64)
     + MAX_ARCHIVE_BLOCK_COUNT as u64 * text_byte_limit(MAX_NOTES_LINE_LEN) as u64
     + MAX_ARCHIVE_ATTACHMENT_COUNT as u64
         * ((ATTACHMENT_ID_LEN * 3 + "images/".len() + ".webp".len()) as u64
@@ -59,6 +62,7 @@ const MAX_MANIFEST_STRING_BYTES: u64 = ARCHIVE_FORMAT.len() as u64
 // separate makes the text escaping bound auditable against Store limits.
 const MAX_MANIFEST_STRUCTURE_BYTES: u64 = (1
     + MAX_CATEGORY_COUNT
+    + MAX_LABEL_COUNT
     + MAX_TASK_COUNT
     + MAX_ARCHIVE_BLOCK_COUNT
     + MAX_ARCHIVE_ATTACHMENT_COUNT) as u64
@@ -162,6 +166,7 @@ pub(crate) struct ExportSummary {
     pub path: PathBuf,
     pub tasks: usize,
     pub categories: usize,
+    pub labels: usize,
     pub images: usize,
 }
 
@@ -253,13 +258,18 @@ pub(crate) struct ImportSummary {
     pub tasks_unchanged: usize,
     pub categories_added: usize,
     pub categories_unchanged: usize,
+    pub labels_added: usize,
+    pub labels_unchanged: usize,
     pub images_added: usize,
     pub images_unchanged: usize,
 }
 
 impl ImportSummary {
     pub(crate) fn changed(&self) -> bool {
-        self.tasks_added > 0 || self.categories_added > 0 || self.images_added > 0
+        self.tasks_added > 0
+            || self.categories_added > 0
+            || self.labels_added > 0
+            || self.images_added > 0
     }
 }
 
@@ -441,13 +451,20 @@ fn cancelled_io_error() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "archive operation cancelled")
 }
 
-pub(crate) fn content_count_text(tasks: usize, categories: usize, images: usize) -> String {
+pub(crate) fn content_count_text(
+    tasks: usize,
+    categories: usize,
+    labels: usize,
+    images: usize,
+) -> String {
     format!(
-        "{} {}, {} {}, and {} {}",
+        "{} {}, {} {}, {} {}, and {} {}",
         tasks,
         plural(tasks, "task", "tasks"),
         categories,
         plural(categories, "category", "categories"),
+        labels,
+        plural(labels, "label", "labels"),
         images,
         plural(images, "image", "images")
     )
@@ -465,6 +482,8 @@ struct Manifest {
     schema: u32,
     #[serde(deserialize_with = "deserialize_categories")]
     categories: Vec<ArchiveCategory>,
+    #[serde(default, deserialize_with = "deserialize_labels")]
+    labels: Vec<ArchiveLabel>,
     #[serde(deserialize_with = "deserialize_tasks")]
     tasks: Vec<ArchiveTask>,
     #[serde(deserialize_with = "deserialize_attachments")]
@@ -476,8 +495,24 @@ struct ExportManifest<'a> {
     format: &'static str,
     schema: u32,
     categories: Vec<ExportCategory<'a>>,
+    labels: Vec<ExportLabel<'a>>,
     tasks: Vec<ExportTask<'a>>,
     attachments: Vec<ExportAttachment<'a>>,
+}
+
+#[derive(Serialize)]
+struct ExportLabel<'a> {
+    id: &'a str,
+    name: &'a str,
+}
+
+impl<'a> From<&'a Label> for ExportLabel<'a> {
+    fn from(label: &'a Label) -> Self {
+        Self {
+            id: &label.id,
+            name: &label.name,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -507,6 +542,7 @@ struct ExportTask<'a> {
     done: bool,
     importance: u8,
     category_id: Option<&'a str>,
+    label_ids: &'a [String],
 }
 
 impl<'a> From<&'a Task> for ExportTask<'a> {
@@ -520,6 +556,25 @@ impl<'a> From<&'a Task> for ExportTask<'a> {
             done: task.done,
             importance: task.importance,
             category_id: task.category_id.as_deref(),
+            label_ids: &task.label_ids,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveLabel {
+    #[serde(deserialize_with = "deserialize_id")]
+    id: String,
+    #[serde(deserialize_with = "deserialize_label_name")]
+    name: String,
+}
+
+impl From<ArchiveLabel> for Label {
+    fn from(label: ArchiveLabel) -> Self {
+        Self {
+            id: label.id,
+            name: label.name,
         }
     }
 }
@@ -587,6 +642,8 @@ struct ArchiveTask {
     importance: u8,
     #[serde(deserialize_with = "deserialize_optional_id")]
     category_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_label_ids")]
+    label_ids: Vec<String>,
 }
 
 impl From<ArchiveTask> for Task {
@@ -600,6 +657,7 @@ impl From<ArchiveTask> for Task {
             done: task.done,
             importance: task.importance,
             category_id: task.category_id,
+            label_ids: task.label_ids,
         }
     }
 }
@@ -725,6 +783,17 @@ where
         deserializer,
         text_byte_limit(MAX_CATEGORY_NAME_LEN),
         "category name",
+    )
+}
+
+fn deserialize_label_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string(
+        deserializer,
+        text_byte_limit(MAX_LABEL_NAME_LEN),
+        "label name",
     )
 }
 
@@ -872,6 +941,25 @@ where
     deserialize_bounded_vec(deserializer, MAX_TASK_COUNT, "archive task")
 }
 
+fn deserialize_labels<'de, D>(deserializer: D) -> Result<Vec<ArchiveLabel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_LABEL_COUNT, "archive label")
+}
+
+fn deserialize_label_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct ArchiveLabelId(#[serde(deserialize_with = "deserialize_id")] String);
+
+    let values: Vec<ArchiveLabelId> =
+        deserialize_bounded_vec(deserializer, MAX_LABELS_PER_TASK, "task label")?;
+    Ok(values.into_iter().map(|value| value.0).collect())
+}
+
 fn deserialize_blocks<'de, D>(deserializer: D) -> Result<Vec<ArchiveBlock>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -953,12 +1041,14 @@ struct ImportedAttachment {
 
 struct ImportedArchive {
     categories: Vec<Category>,
+    labels: Vec<Label>,
     tasks: Vec<Task>,
     attachments: Vec<ImportedAttachment>,
 }
 
 struct MergePlan {
     categories: Vec<Category>,
+    labels: Vec<Label>,
     tasks: Vec<Task>,
     summary: ImportSummary,
 }
@@ -1065,6 +1155,7 @@ pub(crate) fn export_with_progress(
         path,
         tasks: snapshot.tasks.len(),
         categories: snapshot.categories.len(),
+        labels: snapshot.labels.len(),
         images: manifest.attachments.len(),
     })
 }
@@ -1125,6 +1216,7 @@ pub(crate) fn import_with_progress(
     let (summary, _) =
         store.update_if_revision_with_staged_attachments(expected_revision, &staged, |data| {
             data.categories.append(&mut plan.categories);
+            data.labels.append(&mut plan.labels);
             data.tasks.append(&mut plan.tasks);
             Ok(summary)
         })?;
@@ -1155,6 +1247,7 @@ fn manifest_from_snapshot(snapshot: &StoreData) -> Result<ExportManifest<'_>, Ar
             .iter()
             .map(ExportCategory::from)
             .collect(),
+        labels: snapshot.labels.iter().map(ExportLabel::from).collect(),
         tasks: snapshot.tasks.iter().map(ExportTask::from).collect(),
         attachments,
     })
@@ -1274,12 +1367,14 @@ fn read_manifest(
         .into_iter()
         .map(Category::from)
         .collect();
+    let labels: Vec<Label> = manifest.labels.into_iter().map(Label::from).collect();
     let tasks: Vec<Task> = manifest.tasks.into_iter().map(Task::from).collect();
-    validate_imported_data(categories, tasks, attachments)
+    validate_imported_data(categories, labels, tasks, attachments)
 }
 
 fn validate_imported_data(
     categories: Vec<Category>,
+    labels: Vec<Label>,
     tasks: Vec<Task>,
     attachments: Vec<ImportedAttachment>,
 ) -> Result<ImportedArchive, ArchiveError> {
@@ -1296,6 +1391,7 @@ fn validate_imported_data(
     let mut data = StoreData {
         revision: 0,
         categories,
+        labels,
         tasks,
         settings: Settings::default(),
         attachments: attachments
@@ -1307,6 +1403,7 @@ fn validate_imported_data(
         .map_err(|error| ArchiveError::Invalid(format!("invalid archive data: {error}")))?;
     Ok(ImportedArchive {
         categories: data.categories,
+        labels: data.labels,
         tasks: data.tasks,
         attachments,
     })
@@ -1331,6 +1428,16 @@ fn plan_merge(
         .tasks
         .iter()
         .map(|task| (task.id.as_str(), task))
+        .collect();
+    let current_labels: HashMap<_, _> = current
+        .labels
+        .iter()
+        .map(|label| (label.id.as_str(), label))
+        .collect();
+    let current_label_names: HashMap<_, _> = current
+        .labels
+        .iter()
+        .map(|label| (caseless_key(&label.name), label))
         .collect();
     let current_attachments: HashMap<_, _> = current
         .attachments()
@@ -1362,11 +1469,46 @@ fn plan_merge(
         }
         categories.push(category.clone());
     }
+    let mut labels = Vec::new();
+    let mut labels_unchanged = 0usize;
+    for label in &imported.labels {
+        if let Some(existing) = current_labels.get(label.id.as_str()).copied() {
+            if existing == label {
+                labels_unchanged += 1;
+                continue;
+            }
+            return Err(ArchiveError::Conflict(format!(
+                "label id {} conflicts with existing label {:?}",
+                label.id, existing.name
+            )));
+        }
+        if let Some(existing) = current_label_names.get(&caseless_key(&label.name)).copied() {
+            return Err(ArchiveError::Conflict(format!(
+                "label {:?} conflicts with existing label id {}",
+                label.name, existing.id
+            )));
+        }
+        labels.push(label.clone());
+    }
+    let final_label_positions: HashMap<_, _> = current
+        .labels
+        .iter()
+        .chain(labels.iter())
+        .enumerate()
+        .map(|(position, label)| (label.id.as_str(), position))
+        .collect();
     let mut tasks = Vec::new();
     let mut tasks_unchanged = 0usize;
-    for task in &imported.tasks {
+    for imported_task in &imported.tasks {
+        let mut task = imported_task.clone();
+        task.label_ids.sort_by_key(|label_id| {
+            final_label_positions
+                .get(label_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
         if let Some(existing) = current_tasks.get(task.id.as_str()).copied() {
-            if existing == task {
+            if existing == &task {
                 tasks_unchanged += 1;
                 continue;
             }
@@ -1375,8 +1517,9 @@ fn plan_merge(
                 task.id, existing.title
             )));
         }
-        tasks.push(task.clone());
+        tasks.push(task);
     }
+    drop(final_label_positions);
     let mut attachments = Vec::new();
     let mut images_unchanged = 0usize;
     for imported_attachment in &imported.attachments {
@@ -1396,8 +1539,10 @@ fn plan_merge(
     let images_added = attachments.len();
     let mut merged = current.clone();
     let category_start = merged.categories.len();
+    let label_start = merged.labels.len();
     let task_start = merged.tasks.len();
     merged.categories.append(&mut categories);
+    merged.labels.append(&mut labels);
     merged.tasks.append(&mut tasks);
     merged.attachments.append(&mut attachments);
     merged
@@ -1407,6 +1552,7 @@ fn plan_merge(
         ArchiveError::Conflict(format!("archive cannot be merged into this store: {error}"))
     })?;
     let categories = merged.categories.split_off(category_start);
+    let labels = merged.labels.split_off(label_start);
     let tasks = merged.tasks.split_off(task_start);
 
     Ok(MergePlan {
@@ -1416,10 +1562,13 @@ fn plan_merge(
             tasks_unchanged,
             categories_added: categories.len(),
             categories_unchanged,
+            labels_added: labels.len(),
+            labels_unchanged,
             images_added,
             images_unchanged,
         },
         categories,
+        labels,
         tasks,
     })
 }
@@ -1752,7 +1901,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_v2_exports_description_and_imports_v1_body() {
+    fn archive_v3_exports_description_and_imports_v1_body() {
         let source_directory = TestDirectory::new("description-schema-source");
         let output_directory = TestDirectory::new("description-schema-output");
         let destination_directory = TestDirectory::new("description-schema-destination");
@@ -1776,7 +1925,7 @@ mod tests {
                 .unwrap();
             serde_json::from_str(&manifest).unwrap()
         };
-        assert_eq!(current_manifest["schema"], 2);
+        assert_eq!(current_manifest["schema"], 3);
         assert!(current_manifest["tasks"][0].get("description").is_some());
         assert!(current_manifest["tasks"][0].get("body").is_none());
 
@@ -1806,6 +1955,153 @@ mod tests {
             destination.snapshot().unwrap().tasks[0].description,
             vec![Block::text("old description")]
         );
+    }
+
+    #[test]
+    fn archive_v3_round_trip_preserves_labels_and_v2_defaults_to_empty() {
+        let source_directory = TestDirectory::new("label-schema-source");
+        let output_directory = TestDirectory::new("label-schema-output");
+        let destination_directory = TestDirectory::new("label-schema-destination");
+        let legacy_directory = TestDirectory::new("label-schema-legacy-destination");
+        let mut source = Store::open(&source_directory.0).unwrap();
+        let (task_id, first_id, second_id) = source
+            .update(|data| {
+                let first = data.create_label("bug")?;
+                let second = data.create_label("backend")?;
+                let task = data.create_task("labeled", Vec::new(), "", 0, None)?;
+                data.set_task_labels(&task.id, vec![second.id.clone(), first.id.clone()])?;
+                Ok((task.id, first.id, second.id))
+            })
+            .unwrap();
+        let archive_path = output_directory.0.join("labels.mach");
+        let exported = export(&source, Some(&archive_path)).unwrap();
+        assert_eq!(exported.labels, 2);
+
+        let manifest: serde_json::Value = {
+            let file = File::open(&archive_path).unwrap();
+            let mut archive = ZipArchive::new(file).unwrap();
+            let mut manifest = String::new();
+            archive
+                .by_name(MANIFEST_PATH)
+                .unwrap()
+                .read_to_string(&mut manifest)
+                .unwrap();
+            serde_json::from_str(&manifest).unwrap()
+        };
+        assert_eq!(manifest["schema"], 3);
+        assert_eq!(manifest["labels"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            manifest["tasks"][0]["label_ids"],
+            serde_json::json!([first_id, second_id])
+        );
+
+        let mut destination = Store::open(&destination_directory.0).unwrap();
+        let imported = import(&mut destination, &archive_path).unwrap();
+        assert_eq!(imported.labels_added, 2);
+        assert_eq!(imported.labels_unchanged, 0);
+        let snapshot = destination.snapshot().unwrap();
+        assert_eq!(snapshot.labels, source.snapshot().unwrap().labels);
+        assert_eq!(
+            snapshot.task(&task_id).unwrap().label_ids,
+            vec![first_id, second_id]
+        );
+        let unchanged = import(&mut destination, &archive_path).unwrap();
+        assert_eq!(unchanged.labels_added, 0);
+        assert_eq!(unchanged.labels_unchanged, 2);
+        assert_eq!(unchanged.tasks_unchanged, 1);
+
+        let legacy_path = output_directory.0.join("schema-v2.mach");
+        write_manifest_archive(
+            &legacy_path,
+            &serde_json::json!({
+                "format": ARCHIVE_FORMAT,
+                "schema": 2,
+                "categories": [],
+                "tasks": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "title": "schema v2",
+                    "description": [],
+                    "due": "",
+                    "created": "2026-08-12 12:00:00",
+                    "done": false,
+                    "importance": 0,
+                    "category_id": null
+                }],
+                "attachments": []
+            }),
+        );
+        let mut legacy_destination = Store::open(&legacy_directory.0).unwrap();
+        let imported = import(&mut legacy_destination, &legacy_path).unwrap();
+        assert_eq!(imported.labels_added, 0);
+        let snapshot = legacy_destination.snapshot().unwrap();
+        assert!(snapshot.labels.is_empty());
+        assert!(snapshot.tasks[0].label_ids.is_empty());
+    }
+
+    #[test]
+    fn caseless_label_name_conflict_aborts_the_merge() {
+        let source_directory = TestDirectory::new("label-conflict-source");
+        let output_directory = TestDirectory::new("label-conflict-output");
+        let destination_directory = TestDirectory::new("label-conflict-destination");
+        let mut source = Store::open(&source_directory.0).unwrap();
+        source
+            .update(|data| {
+                data.create_label("Maße")?;
+                data.create_task("from archive", Vec::new(), "", 0, None)?;
+                Ok(())
+            })
+            .unwrap();
+        let archive_path = output_directory.0.join("labels.mach");
+        export(&source, Some(&archive_path)).unwrap();
+
+        let mut destination = Store::open(&destination_directory.0).unwrap();
+        destination
+            .update(|data| {
+                data.create_label("MASSE")?;
+                data.create_task("keep", Vec::new(), "", 0, None)?;
+                Ok(())
+            })
+            .unwrap();
+        let before = destination.snapshot().unwrap();
+        let error = import(&mut destination, &archive_path).unwrap_err();
+        assert_eq!(error.kind(), "conflict");
+        let after = destination.snapshot().unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.labels, before.labels);
+        assert_eq!(after.tasks, before.tasks);
+    }
+
+    #[test]
+    fn label_id_conflict_aborts_the_merge() {
+        let source_directory = TestDirectory::new("label-id-conflict-source");
+        let output_directory = TestDirectory::new("label-id-conflict-output");
+        let destination_directory = TestDirectory::new("label-id-conflict-destination");
+        let mut source = Store::open(&source_directory.0).unwrap();
+        let label = source
+            .update(|data| data.create_label("from archive"))
+            .unwrap();
+        let archive_path = output_directory.0.join("labels.mach");
+        export(&source, Some(&archive_path)).unwrap();
+
+        let mut destination = Store::open(&destination_directory.0).unwrap();
+        destination
+            .update(|data| {
+                data.insert_label(Label {
+                    id: label.id.clone(),
+                    name: "local name".into(),
+                })?;
+                data.create_task("keep", Vec::new(), "", 0, None)?;
+                Ok(())
+            })
+            .unwrap();
+        let before = destination.snapshot().unwrap();
+        let error = import(&mut destination, &archive_path).unwrap_err();
+        assert_eq!(error.kind(), "conflict");
+        assert!(error.to_string().contains(&label.id));
+        let after = destination.snapshot().unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.labels, before.labels);
+        assert_eq!(after.tasks, before.tasks);
     }
 
     #[test]

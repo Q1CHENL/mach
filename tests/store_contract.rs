@@ -178,6 +178,89 @@ fn editing_one_task_does_not_rewrite_unchanged_rows() {
 }
 
 #[test]
+fn editing_task_labels_only_writes_that_tasks_assignment_rows() {
+    let dir = TempDir::new("incremental-task-label-write");
+    let mut store = Store::open(dir.path()).unwrap();
+    let (changed_id, untouched_id, first_id, second_id) = store
+        .update(|data| {
+            let first = data.create_label("first")?;
+            let second = data.create_label("second")?;
+            let changed = data.create_task("changed", Vec::new(), "", 0, None)?;
+            let untouched = data.create_task("untouched", Vec::new(), "", 0, None)?;
+            data.set_task_labels(&changed.id, vec![first.id.clone()])?;
+            data.set_task_labels(&untouched.id, vec![first.id.clone()])?;
+            Ok((changed.id, untouched.id, first.id, second.id))
+        })
+        .unwrap();
+    let observer = rusqlite::Connection::open(store.database_path()).unwrap();
+    observer
+        .execute_batch(
+            "
+            CREATE TABLE label_write_audit (
+                entity TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                id TEXT NOT NULL
+            ) STRICT;
+            CREATE TRIGGER audit_task_label_only_update AFTER UPDATE ON tasks BEGIN
+                INSERT INTO label_write_audit VALUES ('task', 'update', NEW.id);
+            END;
+            CREATE TRIGGER audit_label_insert AFTER INSERT ON labels BEGIN
+                INSERT INTO label_write_audit VALUES ('label', 'insert', NEW.id);
+            END;
+            CREATE TRIGGER audit_label_update AFTER UPDATE ON labels BEGIN
+                INSERT INTO label_write_audit VALUES ('label', 'update', NEW.id);
+            END;
+            CREATE TRIGGER audit_label_delete AFTER DELETE ON labels BEGIN
+                INSERT INTO label_write_audit VALUES ('label', 'delete', OLD.id);
+            END;
+            CREATE TRIGGER audit_task_label_insert AFTER INSERT ON task_labels BEGIN
+                INSERT INTO label_write_audit
+                VALUES ('task_label', 'insert', NEW.task_id || ':' || NEW.label_id);
+            END;
+            CREATE TRIGGER audit_task_label_delete AFTER DELETE ON task_labels BEGIN
+                INSERT INTO label_write_audit
+                VALUES ('task_label', 'delete', OLD.task_id || ':' || OLD.label_id);
+            END;
+            ",
+        )
+        .unwrap();
+    drop(observer);
+
+    store
+        .update(|data| data.set_task_labels(&changed_id, vec![second_id.clone()]))
+        .unwrap();
+
+    let observer = rusqlite::Connection::open(store.database_path()).unwrap();
+    let writes: Vec<(String, String, String)> = observer
+        .prepare("SELECT entity, operation, id FROM label_write_audit ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        writes,
+        vec![
+            (
+                "task_label".into(),
+                "delete".into(),
+                format!("{changed_id}:{first_id}"),
+            ),
+            (
+                "task_label".into(),
+                "insert".into(),
+                format!("{changed_id}:{second_id}"),
+            ),
+        ]
+    );
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(
+        snapshot.task(&untouched_id).unwrap().label_ids,
+        vec![first_id]
+    );
+}
+
+#[test]
 fn settings_only_updates_do_not_touch_task_rows() {
     let dir = TempDir::new("incremental-settings-write");
     let mut store = Store::open(dir.path()).unwrap();
@@ -246,6 +329,227 @@ fn compare_and_swap_rejects_a_stale_snapshot() {
     let data = stale.snapshot().unwrap();
     assert_eq!(data.tasks.len(), 1);
     assert_eq!(data.tasks[0].title, "external");
+}
+
+#[test]
+fn labels_use_stable_unicode_caseless_identities() {
+    let dir = TempDir::new("label-identities");
+    let mut store = Store::open(dir.path()).expect("open store");
+    let (cafe, street) = store
+        .update(|data| {
+            let cafe = data.create_label("  Café  ")?;
+            let street = data.create_label("Maße")?;
+            Ok((cafe, street))
+        })
+        .expect("create labels");
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.label(&cafe.id).unwrap().name, "Café");
+    assert_eq!(snapshot.resolve_label_id("Cafe\u{301}").unwrap(), cafe.id);
+    assert_eq!(snapshot.resolve_label_id("MASSE").unwrap(), street.id);
+    assert_eq!(snapshot.resolve_label_id("mass").unwrap(), street.id);
+
+    let duplicate = store
+        .update(|data| data.create_label("Cafe\u{301}"))
+        .expect_err("canonically equivalent label names must conflict");
+    assert!(matches!(duplicate, StoreError::Validation(_)));
+    let presentation_syntax = store
+        .update(|data| data.create_label("#bug"))
+        .expect_err("the display prefix is not part of a stored label name");
+    assert!(
+        presentation_syntax
+            .to_string()
+            .contains("must not start with '#'")
+    );
+}
+
+#[test]
+fn label_identity_key_is_persisted_enforced_and_verified() {
+    let dir = TempDir::new("label-identity-key");
+    let mut store = Store::open(dir.path()).expect("open store");
+    let label = store
+        .update(|data| data.create_label("Maße"))
+        .expect("create label");
+    let connection = rusqlite::Connection::open(store.database_path()).unwrap();
+    let stored_key: String = connection
+        .query_row(
+            "SELECT name_key FROM labels WHERE id = ?1",
+            [&label.id],
+            |row| row.get(0),
+        )
+        .expect("read the persisted Unicode identity key");
+    assert_eq!(stored_key, mach::model::label_name_key("Maße"));
+
+    let duplicate = connection.execute(
+        "INSERT INTO labels(id, position, name, name_key)
+         VALUES ('duplicate', 1, 'MASSE', ?1)",
+        [&stored_key],
+    );
+    assert!(
+        duplicate.is_err(),
+        "SQLite must enforce the same Unicode identity as the application"
+    );
+
+    connection
+        .execute(
+            "UPDATE labels SET name_key = 'wrong' WHERE id = ?1",
+            [&label.id],
+        )
+        .unwrap();
+    drop(connection);
+    let error = store
+        .snapshot()
+        .expect_err("a mismatched persisted identity key is corruption");
+    assert!(matches!(error, StoreError::Corrupt(_)));
+    assert!(error.to_string().contains("identity key"));
+}
+
+#[test]
+fn label_rename_preserves_identity_and_delete_only_unassigns() {
+    let dir = TempDir::new("label-lifecycle");
+    let mut store = Store::open(dir.path()).expect("open store");
+    let (task_id, first_id, second_id) = store
+        .update(|data| {
+            let first = data.create_label("backend")?;
+            let second = data.create_label("release")?;
+            let task = data.create_task("ship", Vec::new(), "", 0, None)?;
+            data.set_task_labels(&task.id, vec![second.id.clone(), first.id.clone()])?;
+            Ok((task.id, first.id, second.id))
+        })
+        .expect("create and assign labels");
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(
+        snapshot.task(&task_id).unwrap().label_ids,
+        vec![first_id.clone(), second_id.clone()],
+        "task labels follow the store's deterministic global label order"
+    );
+
+    let renamed = store
+        .update(|data| data.edit_label(&first_id, "server"))
+        .expect("rename label");
+    assert_eq!(renamed.id, first_id);
+    assert_eq!(
+        store.snapshot().unwrap().task(&task_id).unwrap().label_ids[0],
+        first_id
+    );
+
+    let deleted = store
+        .update(|data| data.delete_label(&first_id))
+        .expect("delete label");
+    assert_eq!(deleted.id, first_id);
+    let reopened = Store::open(dir.path()).expect("reopen store");
+    let snapshot = reopened.snapshot().unwrap();
+    assert_eq!(snapshot.tasks.len(), 1);
+    assert_eq!(snapshot.task(&task_id).unwrap().label_ids, vec![second_id]);
+}
+
+#[test]
+fn invalid_task_label_assignment_is_atomic() {
+    let dir = TempDir::new("label-assignment-atomicity");
+    let mut store = Store::open(dir.path()).expect("open store");
+    let task = store
+        .update(|data| data.create_task("task", Vec::new(), "", 0, None))
+        .unwrap();
+    let revision = store.revision().unwrap();
+
+    let error = store
+        .update(|data| data.set_task_labels(&task.id, vec!["missing".into()]))
+        .expect_err("unknown labels must fail the whole transaction");
+    assert!(matches!(error, StoreError::Validation(_)));
+    assert_eq!(store.revision().unwrap(), revision);
+    assert!(
+        store
+            .snapshot()
+            .unwrap()
+            .task(&task.id)
+            .unwrap()
+            .label_ids
+            .is_empty()
+    );
+}
+
+#[test]
+fn label_count_and_per_task_limits_are_enforced_atomically() {
+    let dir = TempDir::new("label-limits");
+    let mut store = Store::open(dir.path()).expect("open store");
+    let (task_id, label_ids) = store
+        .update(|data| {
+            let mut label_ids = Vec::new();
+            for index in 0..mach::model::MAX_LABEL_COUNT {
+                label_ids.push(data.create_label(format!("label {index}"))?.id);
+            }
+            let task = data.create_task("task", Vec::new(), "", 0, None)?;
+            Ok((task.id, label_ids))
+        })
+        .expect("fill the bounded label collection");
+    let revision = store.revision().unwrap();
+
+    let too_many_global = store
+        .update(|data| data.create_label("overflow"))
+        .expect_err("the global label limit must be enforced");
+    assert!(too_many_global.to_string().contains("label limit"));
+    let too_many_assigned = store
+        .update(|data| {
+            data.set_task_labels(
+                &task_id,
+                label_ids[..mach::model::MAX_LABELS_PER_TASK + 1].to_vec(),
+            )
+        })
+        .expect_err("the per-task label limit must be enforced");
+    assert!(too_many_assigned.to_string().contains("label limit"));
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.revision, revision);
+    assert_eq!(snapshot.labels.len(), mach::model::MAX_LABEL_COUNT);
+    assert!(snapshot.task(&task_id).unwrap().label_ids.is_empty());
+}
+
+#[test]
+fn conditional_task_label_edit_preserves_unrelated_external_changes() {
+    let dir = TempDir::new("conditional-label-edit");
+    let mut form_store = Store::open(dir.path()).unwrap();
+    let (expected, second_id) = form_store
+        .update(|data| {
+            let first = data.create_label("first")?;
+            let second = data.create_label("second")?;
+            let task = data.create_task("task", Vec::new(), "", 0, None)?;
+            data.set_task_labels(&task.id, vec![first.id.clone()])?;
+            Ok((data.task(&task.id)?.clone(), second.id))
+        })
+        .unwrap();
+    let mut external = Store::open(dir.path()).unwrap();
+    external
+        .update(|data| data.set_task_done(&expected.id, true))
+        .unwrap();
+
+    let (_, committed) = form_store
+        .update_with_snapshot(|data| {
+            data.edit_task_if_unchanged(
+                &expected,
+                TaskPatch {
+                    label_ids: Some(vec![second_id.clone()]),
+                    ..TaskPatch::default()
+                },
+            )
+        })
+        .expect("unrelated done edit should be preserved");
+    let task = committed.task(&expected.id).unwrap();
+    assert!(task.done);
+    assert_eq!(task.label_ids, vec![second_id]);
+
+    let error = form_store
+        .update(|data| {
+            data.edit_task_if_unchanged(
+                &expected,
+                TaskPatch {
+                    label_ids: Some(Vec::new()),
+                    ..TaskPatch::default()
+                },
+            )
+        })
+        .expect_err("divergent edits to labels must conflict");
+    assert!(matches!(error, StoreError::StaleEntity { .. }));
 }
 
 #[test]
@@ -817,7 +1121,7 @@ fn database_v1_description_names_are_migrated_without_losing_tasks() {
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let columns: Vec<String> = connection
         .prepare("PRAGMA table_info(tasks)")
         .unwrap()
@@ -859,6 +1163,72 @@ fn database_v1_description_names_are_migrated_without_losing_tasks() {
 }
 
 #[test]
+fn database_v2_is_migrated_to_labels_without_changing_existing_data() {
+    let dir = TempDir::new("database-v2-label-migration");
+    let mut store = Store::open(dir.path()).expect("initialize current database");
+    let (category, task) = store
+        .update(|data| {
+            let category = data.create_category("Work", "preserved")?;
+            let task = data.create_task(
+                "existing task",
+                vec![mach::model::Block::text("existing description")],
+                "2026-08-20 09:30",
+                2,
+                Some(category.id.clone()),
+            )?;
+            data.update_settings(|settings| settings.hide_done = true)?;
+            Ok((category, task))
+        })
+        .expect("create v2-compatible data");
+    let before = store.snapshot().unwrap();
+    let database = store.database_path().to_path_buf();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX task_labels_by_label;
+             DROP TABLE task_labels;
+             DROP TABLE labels;
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(dir.path()).expect("migrate database v2 to v3");
+    let after = store.snapshot().expect("read migrated database");
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.categories, before.categories);
+    assert_eq!(after.tasks, before.tasks);
+    assert_eq!(after.settings, before.settings);
+    assert!(after.labels.is_empty());
+    assert_eq!(
+        after.category(&category.id).unwrap().description,
+        "preserved"
+    );
+    assert_eq!(after.task(&task.id).unwrap().importance, 2);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+    for table in ["labels", "task_labels"] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+                 )",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "migration did not create {table}");
+    }
+}
+
+#[test]
 fn unknown_database_schema_is_rejected_without_being_downgraded() {
     let dir = TempDir::new("future-schema");
     let database = dir.path().join("mach.db");
@@ -874,7 +1244,7 @@ fn unknown_database_schema_is_rejected_without_being_downgraded() {
         error,
         StoreError::UnsupportedDatabaseSchema {
             found: 99,
-            expected: 2,
+            expected: 3,
             ..
         }
     ));

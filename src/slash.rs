@@ -4,6 +4,7 @@
 pub enum SlashCommand {
     Search,
     Settings,
+    Labels,
     Help,
     WhatsNew,
     /// Copy the selected task's title to the clipboard.
@@ -25,9 +26,10 @@ pub enum SlashCommand {
 
 impl SlashCommand {
     /// Fixed palette order. Search is first when the menu opens empty.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Search,
         Self::Settings,
+        Self::Labels,
         Self::Help,
         Self::WhatsNew,
         Self::CopyTitle,
@@ -44,6 +46,7 @@ impl SlashCommand {
         match self {
             Self::Search => "search",
             Self::Settings => "settings",
+            Self::Labels => "labels",
             Self::Help => "help",
             Self::WhatsNew => "whatsnew",
             Self::CopyTitle => "copytitle",
@@ -68,6 +71,7 @@ impl SlashCommand {
         match self {
             Self::Search => "Search",
             Self::Settings => "Settings",
+            Self::Labels => "Labels",
             Self::Help => "Help",
             Self::WhatsNew => "What's new",
             Self::CopyTitle => "Copy title",
@@ -83,17 +87,18 @@ impl SlashCommand {
 
     pub fn hint(self) -> &'static str {
         match self {
-            Self::Search => "search tasks",
-            Self::Settings => "sort, theme, date, task preview",
+            Self::Search => "search tasks by text or label",
+            Self::Settings => "sort, theme, date, preview",
+            Self::Labels => "create, rename, delete labels",
             Self::Help => "key reference",
             Self::WhatsNew => "release highlights",
-            Self::CopyTitle => "copy selected task title",
-            Self::CopyTask => "copy selected task title and description",
-            Self::Export => "save timestamped archive to ./",
-            Self::Import => "merge the specified archive",
+            Self::CopyTitle => "copy task title",
+            Self::CopyTask => "copy task and description",
+            Self::Export => "save archive to ./",
+            Self::Import => "merge archive from file",
             Self::Done => "show or hide completed tasks",
             Self::Purge => "delete completed tasks in this view",
-            Self::Update => "install the latest checksum-verified build",
+            Self::Update => "install latest verified release",
             Self::Quit => "leave mach",
         }
     }
@@ -102,6 +107,7 @@ impl SlashCommand {
         match self {
             Self::Search => &["search"],
             Self::Settings => &["settings"],
+            Self::Labels => &["labels", "tags"],
             Self::Help => &["help"],
             Self::WhatsNew => &["whatsnew"],
             Self::CopyTitle => &["copytitle"],

@@ -20,6 +20,27 @@ use common::TempDir;
 mod render_common;
 use render_common::draw;
 
+fn find_cells(buffer: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16) {
+    let width = needle.chars().count() as u16;
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width.saturating_sub(width) {
+            let run: String = (x..x + width).map(|x| buffer[(x, y)].symbol()).collect();
+            if run == needle {
+                return (x, y);
+            }
+        }
+    }
+    let screen = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    panic!("{needle:?} is not on screen:\n{screen}");
+}
+
 fn app() -> App {
     let mut store = Store::open_in_memory_with_paths(
         std::env::temp_dir().join(format!("mach-keys-test-{}", uuid::Uuid::new_v4())),
@@ -862,6 +883,148 @@ fn task_form_can_move_an_existing_task_to_another_category() {
 }
 
 #[test]
+fn task_form_label_picker_toggles_multiple_labels_without_closing() {
+    let mut app = app();
+    let bug = app.create_label("bug").unwrap();
+    let backend = app.create_label("backend").unwrap();
+    app.select_category(1);
+    app.open_edit_task();
+    app.form
+        .as_mut()
+        .unwrap()
+        .set_field(mach::form::Field::Labels);
+
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(app.form.as_ref().unwrap().label_picker_open());
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+    assert!(app.form.as_ref().unwrap().label_picker_open());
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+    assert!(app.form.as_ref().unwrap().label_picker_open());
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(!app.form.as_ref().unwrap().label_picker_open());
+    press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+    assert_eq!(app.selected_task().unwrap().label_ids, vec![bug, backend]);
+}
+
+#[test]
+fn task_form_label_picker_supports_click_scroll_and_outside_close() {
+    let mut app = app();
+    for index in 0..10 {
+        app.create_label(&format!("label-{index}")).unwrap();
+    }
+    app.select_category(1);
+    app.open_edit_task();
+    app.form
+        .as_mut()
+        .unwrap()
+        .set_field(mach::form::Field::Labels);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    draw(&mut app, 60, 16);
+
+    let picker = app.form.as_ref().unwrap().label_picker_area().unwrap();
+    click(&mut app, picker.x + 1, picker.y + 2);
+    let form = app.form.as_ref().unwrap();
+    assert!(
+        form.label_picker_open(),
+        "clicking a row keeps the picker open"
+    );
+    assert_eq!(form.selected_label_names(), vec!["label-1"]);
+
+    scroll(
+        &mut app,
+        MouseEventKind::ScrollDown,
+        picker.x + 1,
+        picker.y + 1,
+    );
+    assert_eq!(app.form.as_ref().unwrap().label_picker.unwrap().index, 2);
+
+    let title = app.form.as_ref().unwrap().areas.title;
+    click(&mut app, title.x, title.y);
+    assert!(!app.form.as_ref().unwrap().label_picker_open());
+}
+
+#[test]
+fn label_picker_manage_row_returns_to_the_draft_with_refreshed_labels() {
+    let mut app = app();
+    let bug = app.create_label("bug").unwrap();
+    app.select_category(1);
+    app.open_edit_task();
+    app.form
+        .as_mut()
+        .unwrap()
+        .set_field(mach::form::Field::Labels);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+    press(&mut app, KeyCode::End, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.mode, Mode::Labels);
+
+    press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    for character in "backend".chars() {
+        press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+    assert_eq!(app.mode, Mode::TaskForm);
+    let form = app.form.as_ref().unwrap();
+    assert_eq!(form.label_ids(), &[bug]);
+    assert_eq!(
+        form.label_choices()
+            .map(|(_, name, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["bug", "backend"]
+    );
+
+    app.form.as_mut().unwrap().open_label_picker();
+    let buffer = draw(&mut app, 100, 30);
+    let (x, y) = find_cells(&buffer, "Manage");
+    click(&mut app, x, y);
+    assert_eq!(app.mode, Mode::Labels);
+}
+
+#[test]
+fn slash_labels_manager_creates_renames_and_deletes_a_global_label() {
+    let mut app = app();
+    press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+    for character in "labels".chars() {
+        press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.mode, Mode::Labels);
+
+    press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+    for character in "bug".chars() {
+        press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+    press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+    assert_eq!(
+        app.labels
+            .iter()
+            .map(|label| label.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bug"]
+    );
+    let label_id = app.labels[0].id.clone();
+    let task_id = app.selected_task().unwrap().id.clone();
+    app.set_task_labels(&task_id, vec![label_id]).unwrap();
+
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('!'), KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+    assert_eq!(app.labels[0].name, "bug!");
+
+    press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+    assert!(message(&app).contains("remove it from every task"));
+    press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+    assert!(app.labels.is_empty());
+    assert!(app.selected_task().unwrap().label_ids.is_empty());
+}
+
+#[test]
 fn image_preview_owns_undo_keys_until_it_is_closed() {
     let mut app = app();
     app.open_new_task();
@@ -882,6 +1045,25 @@ fn image_preview_owns_undo_keys_until_it_is_closed() {
         "x",
         "the hidden form must not be edited"
     );
+}
+
+#[test]
+fn double_clicking_a_label_starts_renaming_that_label() {
+    let mut app = app();
+    app.create_label("bug").unwrap();
+    app.create_label("backend").unwrap();
+    app.open_labels();
+    let buffer = draw(&mut app, 100, 30);
+    let (x, y) = find_cells(&buffer, "backend");
+
+    click(&mut app, x, y);
+    assert_eq!(app.label_index, 1);
+    assert!(app.label_input.is_none(), "the first click only selects");
+
+    click(&mut app, x, y);
+    let (editing, input) = app.label_input.as_ref().expect("rename input");
+    assert_eq!(editing.as_deref(), Some(app.labels[1].id.as_str()));
+    assert_eq!(input.value(), "backend");
 }
 
 #[test]

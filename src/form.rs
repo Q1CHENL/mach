@@ -9,7 +9,7 @@ use crate::description::DescriptionEditor;
 use crate::due;
 use crate::duepicker::DuePicker;
 use crate::image::{GifLoad, GifPlayback, TemporaryImage};
-use crate::model::{Block, Category, MAX_TITLE_LEN, Task};
+use crate::model::{Block, Category, Label, MAX_LABELS_PER_TASK, MAX_TITLE_LEN, Task};
 use crate::text_input::TextInput;
 use crate::undo::{EditKind, History};
 
@@ -17,6 +17,7 @@ use crate::undo::{EditKind, History};
 pub enum Field {
     Title,
     Category,
+    Labels,
     Due,
     Importance,
     Description,
@@ -27,7 +28,8 @@ impl Field {
     pub fn next(self) -> Self {
         match self {
             Self::Title => Self::Category,
-            Self::Category => Self::Due,
+            Self::Category => Self::Labels,
+            Self::Labels => Self::Due,
             Self::Due => Self::Importance,
             Self::Importance => Self::Description,
             Self::Description => Self::Title,
@@ -38,7 +40,8 @@ impl Field {
         match self {
             Self::Title => Self::Description,
             Self::Category => Self::Title,
-            Self::Due => Self::Category,
+            Self::Labels => Self::Category,
+            Self::Due => Self::Labels,
             Self::Importance => Self::Due,
             Self::Description => Self::Importance,
         }
@@ -216,6 +219,7 @@ impl Default for CategoryForm {
 pub struct FieldAreas {
     pub title: Rect,
     pub category: Rect,
+    pub labels: Rect,
     pub due: Rect,
     pub importance: Rect,
     pub description: Rect,
@@ -228,6 +232,8 @@ impl FieldAreas {
             Some(Field::Title)
         } else if self.category.contains(pos) {
             Some(Field::Category)
+        } else if self.labels.contains(pos) {
+            Some(Field::Labels)
         } else if self.due.contains(pos) {
             Some(Field::Due)
         } else if self.importance.contains(pos) {
@@ -243,6 +249,7 @@ impl FieldAreas {
         match field {
             Field::Title => self.title,
             Field::Category => self.category,
+            Field::Labels => self.labels,
             Field::Due => self.due,
             Field::Importance => self.importance,
             Field::Description => self.description,
@@ -256,6 +263,8 @@ pub struct TaskDraft {
     pub title: String,
     /// Real category UUID, or `None` for Uncategorized.
     pub category_id: Option<String>,
+    /// Stable label IDs, kept in the global label order.
+    pub label_ids: Vec<String>,
     pub due: String,
     pub importance: u8,
     pub description: Vec<Block>,
@@ -285,6 +294,7 @@ impl TaskDraft {
 struct TaskSnap {
     title: TextInput,
     category_id: Option<String>,
+    label_ids: Vec<String>,
     due: TextInput,
     importance: u8,
     description: DescriptionEditor,
@@ -295,6 +305,19 @@ struct TaskSnap {
 struct CategoryChoice {
     id: Option<String>,
     name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LabelChoice {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LabelPicker {
+    pub index: usize,
+    area: Rect,
+    start: usize,
 }
 
 impl CategoryChoice {
@@ -310,6 +333,8 @@ pub struct TaskForm {
     pub title: TextInput,
     category_id: Option<String>,
     category_choices: Vec<CategoryChoice>,
+    label_ids: Vec<String>,
+    label_choices: Vec<LabelChoice>,
     pub due: TextInput,
     pub importance: u8,
     pub description: DescriptionEditor,
@@ -329,6 +354,8 @@ pub struct TaskForm {
     pub gif_pending: Option<GifLoad>,
     /// The calendar, while a due date is being picked.
     pub picker: Option<DuePicker>,
+    /// The bounded multi-select list, while Labels is being edited.
+    pub label_picker: Option<LabelPicker>,
     /// Last description click (line index), for double-click to open a picture.
     pub last_description_click: Option<(Instant, usize)>,
     /// Whether the `/` menu was open last frame — used to re-emit images
@@ -370,6 +397,8 @@ impl TaskForm {
             title: TextInput::new("", MAX_TITLE_LEN),
             category_id: None,
             category_choices: vec![CategoryChoice::uncategorized()],
+            label_ids: Vec::new(),
+            label_choices: Vec::new(),
             due: TextInput::new("", 32),
             importance: 0,
             description,
@@ -382,6 +411,7 @@ impl TaskForm {
             gif: None,
             gif_pending: None,
             picker: None,
+            label_picker: None,
             last_description_click: None,
             menu_was_open: false,
             description_scroll: 0,
@@ -409,12 +439,14 @@ impl TaskForm {
         let mut form = Self::with_description(description);
         form.title = TextInput::new(&task.title, MAX_TITLE_LEN);
         form.category_id = task.category_id.clone();
+        form.label_ids = task.label_ids.clone();
         form.due = TextInput::new(&task.due, 32);
         form.importance = task.importance;
         form.editing = Some(task.id.clone());
         form.initial = TaskDraft {
             title: task.title.clone(),
             category_id: task.category_id.clone(),
+            label_ids: task.label_ids.clone(),
             due: task.due.clone(),
             importance: task.importance,
             description: initial_description,
@@ -504,6 +536,209 @@ impl TaskForm {
         }
         self.before_edit(EditKind::Atomic);
         self.category_id = None;
+    }
+
+    /// Install the global label vocabulary and canonicalize this task's
+    /// selected IDs into that same order. Call once when opening the form.
+    pub fn set_labels(&mut self, labels: &[Label], selected_ids: &[String]) {
+        self.label_choices = labels
+            .iter()
+            .map(|label| LabelChoice {
+                id: label.id.clone(),
+                name: label.name.clone(),
+            })
+            .collect();
+        self.label_ids = self
+            .label_choices
+            .iter()
+            .filter(|choice| selected_ids.contains(&choice.id))
+            .map(|choice| choice.id.clone())
+            .collect();
+        self.initial.label_ids = self.label_ids.clone();
+    }
+
+    /// Refresh the global vocabulary without discarding this form's draft or
+    /// undo history. Deleted IDs are removed and surviving IDs follow global
+    /// label order in every snapshot.
+    pub fn refresh_labels(&mut self, labels: &[Label]) {
+        self.label_choices = labels
+            .iter()
+            .map(|label| LabelChoice {
+                id: label.id.clone(),
+                name: label.name.clone(),
+            })
+            .collect();
+        let order = self
+            .label_choices
+            .iter()
+            .map(|choice| choice.id.clone())
+            .collect::<Vec<_>>();
+        let canonicalize = |ids: &mut Vec<String>| {
+            *ids = order
+                .iter()
+                .filter(|id| ids.contains(id))
+                .cloned()
+                .collect();
+        };
+        canonicalize(&mut self.label_ids);
+        canonicalize(&mut self.initial.label_ids);
+        self.history
+            .for_each_mut(|snapshot| canonicalize(&mut snapshot.label_ids));
+    }
+
+    pub fn label_ids(&self) -> &[String] {
+        &self.label_ids
+    }
+
+    pub fn selected_label_names(&self) -> Vec<&str> {
+        self.label_choices
+            .iter()
+            .filter(|choice| self.label_ids.contains(&choice.id))
+            .map(|choice| choice.name.as_str())
+            .collect()
+    }
+
+    pub fn label_choices(&self) -> impl Iterator<Item = (&str, &str, bool)> {
+        self.label_choices.iter().map(|choice| {
+            (
+                choice.id.as_str(),
+                choice.name.as_str(),
+                self.label_ids.contains(&choice.id),
+            )
+        })
+    }
+
+    pub fn label_picker_open(&self) -> bool {
+        self.label_picker.is_some()
+    }
+
+    pub fn open_label_picker(&mut self) {
+        self.history.break_coalesce();
+        self.field = Field::Labels;
+        self.picker = None;
+        self.description.close_menu();
+        let index = self
+            .label_choices
+            .iter()
+            .position(|choice| self.label_ids.contains(&choice.id))
+            .unwrap_or_default();
+        self.label_picker = Some(LabelPicker {
+            index,
+            area: Rect::default(),
+            start: 0,
+        });
+    }
+
+    pub fn close_label_picker(&mut self) {
+        self.label_picker = None;
+    }
+
+    pub(crate) fn set_label_picker_layout(&mut self, area: Rect, start: usize) {
+        if let Some(picker) = &mut self.label_picker {
+            picker.area = area;
+            picker.start = start;
+        }
+    }
+
+    pub fn label_picker_area(&self) -> Option<Rect> {
+        self.label_picker.as_ref().map(|picker| picker.area)
+    }
+
+    pub(crate) fn label_picker_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let picker = self.label_picker.as_ref()?;
+        if !picker.area.contains(ratatui::layout::Position { x, y })
+            || y <= picker.area.y
+            || y >= picker.area.bottom().saturating_sub(1)
+        {
+            return None;
+        }
+        let index = picker.start + usize::from(y - picker.area.y - 1);
+        (index <= self.label_choices.len()).then_some(index)
+    }
+
+    pub(crate) fn select_label_picker(&mut self, index: usize) {
+        if let Some(picker) = &mut self.label_picker
+            && index <= self.label_choices.len()
+        {
+            picker.index = index;
+        }
+    }
+
+    pub fn label_picker_manage_selected(&self) -> bool {
+        self.label_picker
+            .as_ref()
+            .is_some_and(|picker| picker.index == self.label_choices.len())
+    }
+
+    pub fn move_label_picker(&mut self, delta: isize) {
+        let count = self.label_choices.len().saturating_add(1);
+        let Some(picker) = &mut self.label_picker else {
+            return;
+        };
+        if count > 0 {
+            picker.index = (picker.index as isize + delta).clamp(0, count as isize - 1) as usize;
+        }
+    }
+
+    pub fn select_first_label(&mut self) {
+        if let Some(picker) = &mut self.label_picker {
+            picker.index = 0;
+        }
+    }
+
+    pub fn select_last_label(&mut self) {
+        if let Some(picker) = &mut self.label_picker {
+            picker.index = self.label_choices.len();
+        }
+    }
+
+    pub fn toggle_current_label(&mut self) -> Result<(), &'static str> {
+        let Some(index) = self.label_picker.as_ref().map(|picker| picker.index) else {
+            return Ok(());
+        };
+        let Some(id) = self
+            .label_choices
+            .get(index)
+            .map(|choice| choice.id.clone())
+        else {
+            return Ok(());
+        };
+        self.toggle_label(&id)
+    }
+
+    pub fn toggle_label(&mut self, id: &str) -> Result<(), &'static str> {
+        if self.label_ids.iter().any(|selected| selected == id) {
+            self.before_edit(EditKind::Atomic);
+            self.label_ids.retain(|selected| selected != id);
+            return Ok(());
+        }
+        if self.label_ids.len() >= MAX_LABELS_PER_TASK {
+            return Err("This task already has the maximum number of labels");
+        }
+        if !self.label_choices.iter().any(|choice| choice.id == id) {
+            return Ok(());
+        }
+        self.before_edit(EditKind::Atomic);
+        self.label_ids.push(id.to_string());
+        self.canonicalize_label_ids();
+        Ok(())
+    }
+
+    pub fn clear_labels(&mut self) {
+        if self.label_ids.is_empty() {
+            return;
+        }
+        self.before_edit(EditKind::Atomic);
+        self.label_ids.clear();
+    }
+
+    fn canonicalize_label_ids(&mut self) {
+        self.label_ids = self
+            .label_choices
+            .iter()
+            .filter(|choice| self.label_ids.contains(&choice.id))
+            .map(|choice| choice.id.clone())
+            .collect();
     }
 
     /// Open the full-size image viewer. GIF frames decode asynchronously;
@@ -603,6 +838,7 @@ impl TaskForm {
         TaskDraft {
             title: self.title.value(),
             category_id: self.category_id.clone(),
+            label_ids: self.label_ids.clone(),
             due: self.due.value(),
             importance: self.importance,
             description: self.description.value(),
@@ -621,6 +857,7 @@ impl TaskForm {
         TaskSnap {
             title: self.title.clone(),
             category_id: self.category_id.clone(),
+            label_ids: self.label_ids.clone(),
             due: self.due.clone(),
             importance: self.importance,
             description: self.description.clone(),
@@ -631,6 +868,7 @@ impl TaskForm {
     fn restore(&mut self, s: TaskSnap) {
         self.title = s.title;
         self.category_id = s.category_id;
+        self.label_ids = s.label_ids;
         self.due = s.due;
         self.importance = s.importance;
         self.description = s.description;
@@ -638,6 +876,7 @@ impl TaskForm {
         self.error = None;
         // Overlays are not part of content history.
         self.picker = None;
+        self.label_picker = None;
         self.preview = false;
         self.gif_pending = None;
         self.description.close_menu();
@@ -648,6 +887,7 @@ impl TaskForm {
         let Self {
             title,
             category_id,
+            label_ids,
             due,
             importance,
             description,
@@ -658,6 +898,7 @@ impl TaskForm {
         history.before_edit_with(kind, || TaskSnap {
             title: title.clone(),
             category_id: category_id.clone(),
+            label_ids: label_ids.clone(),
             due: due.clone(),
             importance: *importance,
             description: description.clone(),
@@ -698,6 +939,7 @@ impl TaskForm {
     pub fn open_due_picker(&mut self) {
         self.history.break_coalesce();
         self.field = Field::Due;
+        self.label_picker = None;
         self.picker = Some(DuePicker::new(self.due.value().trim()));
     }
 
@@ -731,12 +973,14 @@ impl TaskForm {
         }
         self.before_edit(EditKind::Atomic);
         self.picker = None;
+        self.label_picker = None;
         self.due = TextInput::new("", 32);
     }
 
     pub fn focus_next(&mut self) {
         self.history.break_coalesce();
         self.picker = None;
+        self.label_picker = None;
         self.description.close_menu();
         self.field = self.field.next();
     }
@@ -744,6 +988,7 @@ impl TaskForm {
     pub fn focus_prev(&mut self) {
         self.history.break_coalesce();
         self.picker = None;
+        self.label_picker = None;
         self.description.close_menu();
         self.field = self.field.prev();
     }
@@ -754,6 +999,9 @@ impl TaskForm {
         self.history.break_coalesce();
         if field != Field::Due {
             self.picker = None;
+        }
+        if field != Field::Labels {
+            self.label_picker = None;
         }
         if field != Field::Description {
             self.description.close_menu();
@@ -798,6 +1046,7 @@ impl TaskForm {
         Some(TaskDraft {
             title,
             category_id: self.category_id.clone(),
+            label_ids: self.label_ids.clone(),
             due: if due_text.is_empty() {
                 inline_due
             } else {

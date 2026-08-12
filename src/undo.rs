@@ -104,6 +104,13 @@ impl<T> History<T> {
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }
+
+    /// Update snapshots after an external vocabulary change invalidates or
+    /// reorders references stored inside them.
+    pub fn for_each_mut(&mut self, mut update: impl FnMut(&mut T)) {
+        self.undo.iter_mut().for_each(&mut update);
+        self.redo.iter_mut().for_each(update);
+    }
 }
 
 #[cfg(test)]

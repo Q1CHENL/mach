@@ -4,7 +4,7 @@
 //! mutations execute one fresh read-modify-write transaction. JSON mode emits
 //! exactly one document on stdout, including usage and runtime errors.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -14,13 +14,16 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
 use crate::VERSION;
-use crate::model::{Block, Category, Task};
-use crate::store::{CategoryPatch, PurgeScope, RelativePosition, Store, StoreError, TaskPatch};
+use crate::model::{Block, Category, Label, Task};
+use crate::store::{
+    CategoryPatch, PurgeScope, RelativePosition, Store, StoreData, StoreError, TaskPatch,
+};
 
 /// Full CLI reference under `mach --help`.
 const HELP: &str = "\
   list
     -c, --category NAME  only this category
+    --label NAME         require label (repeatable; all must match)
     --open               only incomplete
     --done               only completed
 
@@ -34,12 +37,19 @@ const HELP: &str = "\
       --clear-description
     delete NAME          delete category; tasks become uncategorized
 
+  labels
+    (no args)            list labels (done/total)
+    add NAME
+    edit NAME --name NEW rename label; assignments stay attached
+    delete NAME          delete label; tasks stay in place
+
   add [TITLE]
     -t, --title TITLE    title (required if no positional TITLE)
     -d, --description TEXT  description (newlines = lines; see DESCRIPTION MARKUP)
     --due DATE            YYYY-MM-DD | MM-DD | HH:MM | DATEThh:mm
     --time HH:MM         with --due, or alone = next occurrence
     -c, --category NAME  category (name or unique prefix)
+    --label NAME         existing label (repeatable)
     -i, --importance N   0–3 (default 0)
     --subtask TEXT       add subtask (repeatable)
 
@@ -64,6 +74,9 @@ const HELP: &str = "\
     --clear-due          remove due date/time
     -c, --category NAME
     --clear-category     uncategorized
+    --add-label NAME     assign existing label (repeatable)
+    --remove-label NAME  unassign label (repeatable)
+    --clear-labels       remove all labels; may combine with --add-label
     -i, --importance N   0–3
 
   DESCRIPTION MARKUP (add/edit --description, one block per line)
@@ -86,7 +99,7 @@ const HELP: &str = "\
       -t, --text TEXT
     delete INDEX         later indexes shift down
 
-  export [FILE]          portable .mach archive (tasks, categories, images)
+  export [FILE]          portable .mach archive (tasks, categories, labels, images)
                          default: ./mach-export-YYYYMMDD-HHMMSS.mach
 
   import FILE            safely merge a .mach archive
@@ -134,6 +147,9 @@ enum Command {
         /// Category name / prefix
         #[arg(short = 'c', long = "category", value_name = "NAME")]
         category: Option<String>,
+        /// Require label (repeatable; all must match)
+        #[arg(long = "label", value_name = "NAME")]
+        labels: Vec<String>,
         /// Incomplete only
         #[arg(long, conflicts_with = "done")]
         open: bool,
@@ -145,6 +161,11 @@ enum Command {
     Categories {
         #[command(subcommand)]
         action: Option<CatAction>,
+    },
+    /// List / add / edit / delete labels
+    Labels {
+        #[command(subcommand)]
+        action: Option<LabelAction>,
     },
     /// Add a task
     Add(AddArgs),
@@ -207,7 +228,7 @@ enum Command {
         #[command(subcommand)]
         action: Option<SubAction>,
     },
-    /// Export tasks, categories, and images to a portable archive
+    /// Export tasks, categories, labels, and images to a portable archive
     Export {
         /// Output file (default ./mach-export-YYYYMMDD-HHMMSS.mach)
         #[arg(value_name = "FILE")]
@@ -247,6 +268,9 @@ struct AddArgs {
     /// Category
     #[arg(short = 'c', long = "category", value_name = "NAME")]
     category: Option<String>,
+    /// Existing label (repeatable)
+    #[arg(long = "label", value_name = "NAME")]
+    labels: Vec<String>,
     /// Importance 0–3
     #[arg(
         short = 'i',
@@ -285,6 +309,15 @@ struct EditArgs {
     /// Uncategorized
     #[arg(long = "clear-category")]
     clear_cat: bool,
+    /// Assign existing label (repeatable)
+    #[arg(long = "add-label", value_name = "NAME")]
+    add_labels: Vec<String>,
+    /// Unassign label (repeatable)
+    #[arg(long = "remove-label", value_name = "NAME")]
+    remove_labels: Vec<String>,
+    /// Remove all labels; may be combined with --add-label
+    #[arg(long = "clear-labels")]
+    clear_labels: bool,
     /// Importance 0–3
     #[arg(short = 'i', long = "importance", value_name = "N")]
     importance: Option<u8>,
@@ -317,6 +350,30 @@ enum CatAction {
         clear_description: bool,
     },
     /// Delete category (tasks become uncategorized)
+    Delete {
+        /// Name / prefix
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum LabelAction {
+    /// List labels (default)
+    List,
+    /// Create label
+    Add {
+        /// Name
+        name: String,
+    },
+    /// Rename label
+    Edit {
+        /// Current name / prefix
+        name: String,
+        /// New name
+        #[arg(short = 'n', long = "name", value_name = "NEW")]
+        new_name: String,
+    },
+    /// Delete label (tasks remain in place)
     Delete {
         /// Name / prefix
         name: String,
@@ -619,9 +676,10 @@ fn dispatch(store: &mut Store, command: Command, json_mode: bool) -> Result<Rend
     match command {
         Command::List {
             category,
+            labels,
             open,
             done,
-        } => cmd_list(store, category.as_deref(), open, done, json_mode),
+        } => cmd_list(store, category.as_deref(), &labels, open, done, json_mode),
         Command::Categories { action } => match action {
             None | Some(CatAction::List) => cmd_categories_list(store, json_mode),
             Some(CatAction::Add { name, description }) => {
@@ -641,6 +699,14 @@ fn dispatch(store: &mut Store, command: Command, json_mode: bool) -> Result<Rend
                 json_mode,
             ),
             Some(CatAction::Delete { name }) => cmd_category_delete(store, &name, json_mode),
+        },
+        Command::Labels { action } => match action {
+            None | Some(LabelAction::List) => cmd_labels_list(store, json_mode),
+            Some(LabelAction::Add { name }) => cmd_label_add(store, &name, json_mode),
+            Some(LabelAction::Edit { name, new_name }) => {
+                cmd_label_edit(store, &name, &new_name, json_mode)
+            }
+            Some(LabelAction::Delete { name }) => cmd_label_delete(store, &name, json_mode),
         },
         Command::Add(arguments) => cmd_add(store, &arguments, json_mode),
         Command::Show { id } => cmd_show(store, &id, json_mode),
@@ -710,6 +776,7 @@ fn cmd_export(
                 "archive": summary.path.display().to_string(),
                 "tasks": summary.tasks,
                 "categories": summary.categories,
+                "labels": summary.labels,
                 "images": summary.images,
             })
         },
@@ -717,6 +784,7 @@ fn cmd_export(
             let contents = crate::archive::content_count_text(
                 summary.tasks,
                 summary.categories,
+                summary.labels,
                 summary.images,
             );
             format!(
@@ -743,6 +811,8 @@ fn cmd_import(
                 "tasks_unchanged": summary.tasks_unchanged,
                 "categories_added": summary.categories_added,
                 "categories_unchanged": summary.categories_unchanged,
+                "labels_added": summary.labels_added,
+                "labels_unchanged": summary.labels_unchanged,
                 "images_added": summary.images_added,
                 "images_unchanged": summary.images_unchanged,
             })
@@ -751,11 +821,13 @@ fn cmd_import(
             let added = crate::archive::content_count_text(
                 summary.tasks_added,
                 summary.categories_added,
+                summary.labels_added,
                 summary.images_added,
             );
             let unchanged = crate::archive::content_count_text(
                 summary.tasks_unchanged,
                 summary.categories_unchanged,
+                summary.labels_unchanged,
                 summary.images_unchanged,
             );
             if summary.changed() {
@@ -1010,11 +1082,46 @@ fn category_name<'a>(categories: &'a [Category], task: &Task) -> Option<&'a str>
         .map(|category| category.name.as_str())
 }
 
-fn task_json(categories: &[Category], task: &Task) -> Value {
-    task_json_with_category(task, category_name(categories, task))
+fn label_json(label: &Label) -> Value {
+    json!({
+        "id": label.id,
+        "name": label.name,
+    })
 }
 
-fn task_json_with_category(task: &Task, category_name: Option<&str>) -> Value {
+fn task_labels<'a>(labels: &'a [Label], task: &Task) -> Vec<&'a Label> {
+    labels
+        .iter()
+        .filter(|label| task.label_ids.contains(&label.id))
+        .collect()
+}
+
+fn task_label_text(labels: &[Label], task: &Task) -> String {
+    task_labels(labels, task)
+        .into_iter()
+        .map(|label| format!("#{}", terminal_text(&label.name)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn resolve_label_ids(data: &StoreData, queries: &[String]) -> Result<Vec<String>, StoreError> {
+    let mut selected = HashSet::with_capacity(queries.len());
+    for query in queries {
+        selected.insert(data.resolve_label_id(query)?);
+    }
+    Ok(data
+        .labels
+        .iter()
+        .filter(|label| selected.contains(&label.id))
+        .map(|label| label.id.clone())
+        .collect())
+}
+
+fn task_json(categories: &[Category], labels: &[Label], task: &Task) -> Value {
+    task_json_with_category(labels, task, category_name(categories, task))
+}
+
+fn task_json_with_category(labels: &[Label], task: &Task, category_name: Option<&str>) -> Value {
     let subtasks = collect_subtasks(&task.description);
     let subtasks_json = subtasks_to_json(&subtasks);
     json!({
@@ -1031,6 +1138,10 @@ fn task_json_with_category(task: &Task, category_name: Option<&str>) -> Value {
             "id": task.category_id,
             "name": category_name,
         },
+        "labels": task_labels(labels, task)
+            .into_iter()
+            .map(label_json)
+            .collect::<Vec<_>>(),
         "created": task.created,
     })
 }
@@ -1137,6 +1248,7 @@ fn due_for_edit(
 fn task_line(
     task: &Task,
     category_name: Option<&str>,
+    labels: &[Label],
     show_category: bool,
     date_format: &str,
 ) -> String {
@@ -1158,11 +1270,17 @@ fn task_line(
     } else {
         String::new()
     };
+    let label_text = task_label_text(labels, task);
+    let labels = if label_text.is_empty() {
+        String::new()
+    } else {
+        format!("  {label_text}")
+    };
     let progress = crate::model::todo_progress(task)
         .map(|(done, total)| format!("  ({done}/{total})"))
         .unwrap_or_default();
     format!(
-        "{} {check} {title}{category}{due}{flag}{progress}\n",
+        "{} {check} {title}{category}{labels}{due}{flag}{progress}\n",
         terminal_text(&short_id(&task.id))
     )
 }
@@ -1172,6 +1290,7 @@ fn task_line(
 fn cmd_list(
     store: &Store,
     category: Option<&str>,
+    label_queries: &[String],
     open_only: bool,
     done_only: bool,
     json_mode: bool,
@@ -1180,6 +1299,7 @@ fn cmd_list(
     let category_id = category
         .map(|query| data.resolve_category_id(query))
         .transpose()?;
+    let label_ids = resolve_label_ids(&data, label_queries)?;
     let show_category = category_id.is_none();
     let tasks: Vec<_> = data
         .tasks
@@ -1188,6 +1308,11 @@ fn cmd_list(
             category_id
                 .as_ref()
                 .is_none_or(|id| task.category_id.as_deref() == Some(id.as_str()))
+        })
+        .filter(|task| {
+            label_ids
+                .iter()
+                .all(|label_id| task.label_ids.contains(label_id))
         })
         .filter(|task| {
             if open_only {
@@ -1215,7 +1340,7 @@ fn cmd_list(
             Value::Array(
                 tasks
                     .iter()
-                    .map(|task| task_json_with_category(task, name_for(task)))
+                    .map(|task| task_json_with_category(&data.labels, task, name_for(task)))
                     .collect(),
             )
         },
@@ -1228,6 +1353,7 @@ fn cmd_list(
                     plain.push_str(&task_line(
                         task,
                         name_for(task),
+                        &data.labels,
                         show_category,
                         &data.settings.date_format,
                     ));
@@ -1382,6 +1508,108 @@ fn cmd_category_delete(
     ))
 }
 
+fn cmd_labels_list(store: &Store, json_mode: bool) -> Result<Rendered, CliError> {
+    let data = store.snapshot()?;
+    let label_indices: HashMap<_, _> = data
+        .labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| (label.id.as_str(), index))
+        .collect();
+    let mut counts = vec![(0usize, 0usize); data.labels.len()];
+    for task in &data.tasks {
+        for label_id in &task.label_ids {
+            if let Some(index) = label_indices.get(label_id.as_str()) {
+                counts[*index].0 += usize::from(task.done);
+                counts[*index].1 += 1;
+            }
+        }
+    }
+    Ok(rendered(
+        json_mode,
+        || {
+            json!({
+                "labels": data.labels.iter().zip(&counts).map(|(label, (done, total))| {
+                    json!({
+                        "id": label.id,
+                        "name": label.name,
+                        "total": total,
+                        "done": done,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        },
+        || {
+            if data.labels.is_empty() {
+                return "(no labels)\n".to_string();
+            }
+            data.labels
+                .iter()
+                .zip(&counts)
+                .map(|(label, (done, total))| {
+                    format!("#{}  {done}/{total}\n", terminal_text(&label.name))
+                })
+                .collect()
+        },
+    ))
+}
+
+fn cmd_label_add(store: &mut Store, name: &str, json_mode: bool) -> Result<Rendered, CliError> {
+    let label = store.update(|data| data.create_label(name))?;
+    Ok(rendered(
+        json_mode,
+        || label_json(&label),
+        || format!("created label #{}\n", terminal_text(&label.name)),
+    ))
+}
+
+fn cmd_label_edit(
+    store: &mut Store,
+    query: &str,
+    new_name: &str,
+    json_mode: bool,
+) -> Result<Rendered, CliError> {
+    let label = store.update(|data| {
+        let id = data.resolve_label_id(query)?;
+        data.edit_label(&id, new_name)
+    })?;
+    Ok(rendered(
+        json_mode,
+        || label_json(&label),
+        || format!("updated label #{}\n", terminal_text(&label.name)),
+    ))
+}
+
+fn cmd_label_delete(store: &mut Store, query: &str, json_mode: bool) -> Result<Rendered, CliError> {
+    let (label, tasks_unassigned) = store.update(|data| {
+        let id = data.resolve_label_id(query)?;
+        let tasks_unassigned = data
+            .tasks
+            .iter()
+            .filter(|task| task.label_ids.contains(&id))
+            .count();
+        let label = data.delete_label(&id)?;
+        Ok((label, tasks_unassigned))
+    })?;
+    Ok(rendered(
+        json_mode,
+        || {
+            json!({
+                "deleted": label.name,
+                "id": label.id,
+                "tasks_unassigned": tasks_unassigned,
+            })
+        },
+        || {
+            format!(
+                "deleted label #{} (unassigned from {tasks_unassigned} task{})\n",
+                terminal_text(&label.name),
+                if tasks_unassigned == 1 { "" } else { "s" }
+            )
+        },
+    ))
+}
+
 fn cmd_add(store: &mut Store, arguments: &AddArgs, json_mode: bool) -> Result<Rendered, CliError> {
     let raw_title = arguments
         .title
@@ -1413,19 +1641,24 @@ fn cmd_add(store: &mut Store, arguments: &AddArgs, json_mode: bool) -> Result<Re
         due_for_add(arguments.due.as_deref(), arguments.time.as_deref())?
     };
     let category_query = arguments.category.as_deref();
+    let label_queries = &arguments.labels;
     let importance = arguments.importance;
     let (task_id, snapshot) = store.update_with_snapshot(move |data| {
         let category_id = category_query
             .map(|query| data.resolve_category_id(query))
             .transpose()?;
+        let label_ids = resolve_label_ids(data, label_queries)?;
         let task = data.create_task(title, description, due, importance, category_id)?;
-        Ok(task.id)
+        let task_id = task.id;
+        data.set_task_labels(&task_id, label_ids)?;
+        Ok(task_id)
     })?;
     let task = snapshot.task(&task_id)?.clone();
     let categories = snapshot.categories;
+    let labels = snapshot.labels;
     Ok(rendered(
         json_mode,
-        || task_json(&categories, &task),
+        || task_json(&categories, &labels, &task),
         || {
             let subtasks = collect_subtasks(&task.description).len();
             if subtasks == 0 {
@@ -1453,14 +1686,16 @@ fn cmd_show(store: &Store, query: &str, json_mode: bool) -> Result<Rendered, Cli
     let task = data.task(&id)?;
     Ok(rendered(
         json_mode,
-        || task_json(&data.categories, task),
+        || task_json(&data.categories, &data.labels, task),
         || {
+            let labels = task_label_text(&data.labels, task);
             let mut plain = format!(
-                "id:         {}\ntitle:      {}\ndone:       {}\ncategory:   {}\ndue:        {}\nimportance: {} ({})\ncreated:    {}\n",
+                "id:         {}\ntitle:      {}\ndone:       {}\ncategory:   {}\nlabels:     {}\ndue:        {}\nimportance: {} ({})\ncreated:    {}\n",
                 terminal_text(&task.id),
                 terminal_text(&task.title),
                 task.done,
                 terminal_text(category_name(&data.categories, task).unwrap_or("—")),
+                if labels.is_empty() { "—" } else { &labels },
                 if task.due.is_empty() {
                     "—".into()
                 } else {
@@ -1545,9 +1780,10 @@ fn cmd_set_done(
         data.set_task_done(&id, done)
     })?;
     let categories = snapshot.categories;
+    let labels = snapshot.labels;
     Ok(rendered(
         json_mode,
-        || task_json(&categories, &task),
+        || task_json(&categories, &labels, &task),
         || {
             format!(
                 "{} {}  {}\n",
@@ -1565,9 +1801,10 @@ fn cmd_delete(store: &mut Store, query: &str, json_mode: bool) -> Result<Rendere
         data.delete_task(&id)
     })?;
     let categories = snapshot.categories;
+    let labels = snapshot.labels;
     Ok(rendered(
         json_mode,
-        || task_json(&categories, &task),
+        || task_json(&categories, &labels, &task),
         || {
             format!(
                 "deleted {}  {}\n",
@@ -1602,11 +1839,12 @@ fn cmd_move(
         Ok((task, target))
     })?;
     let categories = snapshot.categories;
+    let labels = snapshot.labels;
     Ok(rendered(
         json_mode,
         || {
             json!({
-                "moved": task_json(&categories, &task),
+                "moved": task_json(&categories, &labels, &task),
                 "relation": relation,
                 "target": { "id": target.id, "title": target.title },
             })
@@ -1634,13 +1872,14 @@ fn cmd_purge(
         data.purge_completed(&scope)
     })?;
     let categories = snapshot.categories;
+    let labels = snapshot.labels;
     Ok(rendered(
         json_mode,
         || {
             json!({
                 "purged": removed
                     .iter()
-                    .map(|task| task_json(&categories, task))
+                    .map(|task| task_json(&categories, &labels, task))
                     .collect::<Vec<_>>(),
                 "count": removed.len(),
             })
@@ -1661,10 +1900,13 @@ fn cmd_edit(
         && !arguments.clear_due
         && arguments.category.is_none()
         && !arguments.clear_cat
+        && arguments.add_labels.is_empty()
+        && arguments.remove_labels.is_empty()
+        && !arguments.clear_labels
         && arguments.importance.is_none()
     {
         return Err(CliError::validation(
-            "nothing to edit; pass --title / --description / --due / --time / --clear-due / --category / --clear-category / --importance",
+            "nothing to edit; pass --title / --description / --due / --time / --clear-due / --category / --clear-category / --add-label / --remove-label / --clear-labels / --importance",
         ));
     }
     if arguments.clear_due && (arguments.due.is_some() || arguments.time.is_some()) {
@@ -1675,6 +1917,11 @@ fn cmd_edit(
     if arguments.clear_cat && arguments.category.is_some() {
         return Err(CliError::validation(
             "--clear-category cannot be combined with --category",
+        ));
+    }
+    if arguments.clear_labels && !arguments.remove_labels.is_empty() {
+        return Err(CliError::validation(
+            "--clear-labels cannot be combined with --remove-label",
         ));
     }
     let query = arguments.id.as_str();
@@ -1691,9 +1938,24 @@ fn cmd_edit(
     let clear_due = arguments.clear_due;
     let category_query = arguments.category.as_deref();
     let clear_category = arguments.clear_cat;
+    let add_label_queries = &arguments.add_labels;
+    let remove_label_queries = &arguments.remove_labels;
+    let clear_labels = arguments.clear_labels;
     let importance = arguments.importance;
     let (task_id, snapshot) = store.update_with_snapshot(|data| {
         let id = data.resolve_task_id(query)?;
+        let add_label_ids = resolve_label_ids(data, add_label_queries)?;
+        let remove_label_ids = resolve_label_ids(data, remove_label_queries)?;
+        if let Some(label_id) = add_label_ids
+            .iter()
+            .find(|label_id| remove_label_ids.contains(label_id))
+        {
+            let label = data.label(label_id)?;
+            return Err(StoreError::validation(format!(
+                "label {:?} cannot be both added and removed",
+                label.name
+            )));
+        }
         let due = if clear_due {
             Some(String::new())
         } else if due_argument.is_none() && time_argument.is_none() && !inline_due.is_empty() {
@@ -1709,6 +1971,27 @@ fn cmd_edit(
                 .map(|query| data.resolve_category_id(query).map(Some))
                 .transpose()?
         };
+        let label_ids = if clear_labels || !add_label_ids.is_empty() || !remove_label_ids.is_empty()
+        {
+            let mut selected: HashSet<_> = if clear_labels {
+                HashSet::new()
+            } else {
+                data.task(&id)?.label_ids.iter().cloned().collect()
+            };
+            for label_id in remove_label_ids {
+                selected.remove(&label_id);
+            }
+            selected.extend(add_label_ids);
+            Some(
+                data.labels
+                    .iter()
+                    .filter(|label| selected.contains(&label.id))
+                    .map(|label| label.id.clone())
+                    .collect(),
+            )
+        } else {
+            None
+        };
         let task = data.edit_task(
             &id,
             TaskPatch {
@@ -1717,6 +2000,7 @@ fn cmd_edit(
                 due,
                 importance,
                 category_id,
+                label_ids,
                 ..TaskPatch::default()
             },
         )?;
@@ -1724,9 +2008,10 @@ fn cmd_edit(
     })?;
     let task = snapshot.task(&task_id)?.clone();
     let categories = snapshot.categories;
+    let labels = snapshot.labels;
     Ok(rendered(
         json_mode,
-        || task_json(&categories, &task),
+        || task_json(&categories, &labels, &task),
         || {
             format!(
                 "updated {}  {}\n",

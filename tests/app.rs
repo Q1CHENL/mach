@@ -115,6 +115,7 @@ fn loads_and_mutates_a_store_snapshot() {
         .create_task(&TaskDraft {
             title: "draft the release note [2030-05-06 07:08]".into(),
             category_id: Some(work_id.clone()),
+            label_ids: Vec::new(),
             due: String::new(),
             importance: 2,
             description: vec![
@@ -182,6 +183,29 @@ fn search_uses_the_same_unicode_caseless_identity_as_typeahead_and_categories() 
     app.start_search("Café");
     assert_eq!(app.task_count(), 1);
     assert_eq!(app.selected_task().unwrap().title, "accent note");
+}
+
+#[test]
+fn search_matches_assigned_label_names_with_or_without_the_display_hash() {
+    let mut app = setup();
+    let release = app.create_label("Release").expect("create label");
+    let task = app
+        .create_task(&TaskDraft {
+            title: "opaque title".into(),
+            label_ids: vec![release.clone()],
+            ..TaskDraft::default()
+        })
+        .expect("create labelled task");
+
+    for query in ["release", "#RELEASE"] {
+        app.start_search(query);
+        assert_eq!(app.task_count(), 1, "query {query:?}");
+        assert_eq!(app.selected_task().unwrap().id, task);
+        app.end_search();
+    }
+
+    app.start_search("##release");
+    assert_eq!(app.task_count(), 0, "only one display prefix is optional");
 }
 
 #[test]
@@ -444,6 +468,36 @@ fn external_commit_refreshes_without_losing_selected_task_identity() {
 }
 
 #[test]
+fn external_refresh_waits_while_the_label_manager_owns_an_edit() {
+    let mut pair = on_disk_pair();
+    pair.app.open_labels();
+    pair.app.begin_new_label();
+    pair.app
+        .label_input
+        .as_mut()
+        .unwrap()
+        .1
+        .insert_str("typed draft");
+    pair.external
+        .update(|data| {
+            data.create_label("external")?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(!pair.app.poll_external_changes());
+    assert_eq!(
+        pair.app.label_input.as_ref().unwrap().1.value(),
+        "typed draft"
+    );
+    assert!(pair.app.labels.is_empty());
+
+    pair.app.close_labels();
+    assert!(pair.app.poll_external_changes());
+    assert_eq!(pair.app.labels[0].name, "external");
+}
+
+#[test]
 fn repeated_external_poll_errors_do_not_disarm_a_confirmation() {
     let mut pair = on_disk_pair();
     let database = pair.dir.path().join("mach.db");
@@ -535,6 +589,45 @@ fn form_save_merges_disjoint_human_and_agent_fields() {
     let saved = app.tasks.iter().find(|task| task.id == "t-open").unwrap();
     assert_eq!(saved.title, "agent title");
     assert_eq!(saved.description, vec![Block::text("human description")]);
+}
+
+#[test]
+fn form_save_merges_label_edits_with_an_external_title_change() {
+    let mut pair = on_disk_pair();
+    let (app, external) = (&mut pair.app, &mut pair.external);
+    let release = app.create_label("release").expect("create release");
+    let backend = app.create_label("backend").expect("create backend");
+    app.select_category(0);
+    let pos = app
+        .view
+        .iter()
+        .position(|index| app.tasks[*index].id == "t-open")
+        .unwrap();
+    app.select_task(pos);
+    app.open_edit_task();
+
+    external
+        .update(|data| {
+            data.edit_task(
+                "t-open",
+                TaskPatch {
+                    title: Some("agent title".into()),
+                    ..TaskPatch::default()
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let form = app.form.as_mut().expect("task form open");
+    form.toggle_label(&release).unwrap();
+    form.toggle_label(&backend).unwrap();
+
+    app.submit_form();
+
+    assert!(app.form.is_none(), "disjoint fields should merge");
+    let saved = app.tasks.iter().find(|task| task.id == "t-open").unwrap();
+    assert_eq!(saved.title, "agent title");
+    assert_eq!(saved.label_ids, vec![release, backend]);
 }
 
 #[test]

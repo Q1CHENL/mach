@@ -452,6 +452,7 @@ fn task_category_and_subtask_workflow_keeps_one_json_contract() {
     let task: serde_json::Value = serde_json::from_slice(&added.stdout).unwrap();
     let id = task["id"].as_str().unwrap().to_string();
     assert_eq!(task["category"]["name"], "Work");
+    assert_eq!(task["labels"], serde_json::json!([]));
     assert_eq!(task["due"], "2099-12-31 09:30");
     assert_eq!(task["subtasks_total"], 2);
     assert!(
@@ -505,6 +506,258 @@ fn task_category_and_subtask_workflow_keeps_one_json_contract() {
     assert!(shown["category"]["id"].is_null());
     assert_eq!(shown["subtasks"][0]["done"], true);
     assert_eq!(shown["subtasks"][1]["text"], "second revised");
+}
+
+#[test]
+fn label_crud_preserves_identity_reports_counts_and_only_unassigns_tasks() {
+    let dir = TempDir::new("cli-label-crud");
+
+    let bug = mach(dir.path(), &["--json", "labels", "add", "Bug"]);
+    assert!(bug.status.success());
+    let bug: serde_json::Value = serde_json::from_slice(&bug.stdout).unwrap();
+    let bug_id = bug["id"].as_str().unwrap().to_string();
+    assert_eq!(bug["name"], "Bug");
+
+    let backend = mach(dir.path(), &["--json", "labels", "add", "Backend"]);
+    assert!(backend.status.success());
+    let backend: serde_json::Value = serde_json::from_slice(&backend.stdout).unwrap();
+    let backend_id = backend["id"].as_str().unwrap().to_string();
+
+    let first = mach(
+        dir.path(),
+        &[
+            "--json", "add", "first", "--label", "bug", "--label", "Back",
+        ],
+    );
+    assert!(first.status.success());
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let first_id = first["id"].as_str().unwrap().to_string();
+
+    let second = mach(dir.path(), &["--json", "add", "second", "--label", "Bug"]);
+    assert!(second.status.success());
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    let second_id = second["id"].as_str().unwrap().to_string();
+    assert!(mach(dir.path(), &["done", &second_id]).status.success());
+
+    let listed = mach(dir.path(), &["--json", "labels"]);
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(
+        listed,
+        serde_json::json!({
+            "labels": [
+                {"id": bug_id, "name": "Bug", "total": 2, "done": 1},
+                {"id": backend_id, "name": "Backend", "total": 1, "done": 0},
+            ]
+        })
+    );
+    let plain_labels = mach(dir.path(), &["labels"]);
+    let plain_labels = String::from_utf8(plain_labels.stdout).unwrap();
+    assert!(plain_labels.contains("#Bug  1/2"));
+    assert!(plain_labels.contains("#Backend  0/1"));
+
+    let renamed = mach(
+        dir.path(),
+        &["--json", "labels", "edit", "bug", "--name", "Defect"],
+    );
+    assert!(renamed.status.success());
+    let renamed: serde_json::Value = serde_json::from_slice(&renamed.stdout).unwrap();
+    assert_eq!(renamed["id"], bug_id);
+    assert_eq!(renamed["name"], "Defect");
+
+    let deleted = mach(dir.path(), &["--json", "labels", "delete", "Back"]);
+    assert!(deleted.status.success());
+    let deleted: serde_json::Value = serde_json::from_slice(&deleted.stdout).unwrap();
+    assert_eq!(deleted["id"], backend_id);
+    assert_eq!(deleted["deleted"], "Backend");
+    assert_eq!(deleted["tasks_unassigned"], 1);
+
+    let shown = mach(dir.path(), &["--json", "show", &first_id]);
+    assert!(shown.status.success(), "deleting a label deleted its task");
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(
+        shown["labels"],
+        serde_json::json!([{"id": bug_id, "name": "Defect"}])
+    );
+}
+
+#[test]
+fn repeatable_label_filters_are_conjunctive_and_compose_with_task_filters() {
+    let dir = TempDir::new("cli-label-filter");
+    for label in ["Backend", "Bug", "Release"] {
+        assert!(mach(dir.path(), &["labels", "add", label]).status.success());
+    }
+    for category in ["Work", "Home"] {
+        assert!(
+            mach(dir.path(), &["categories", "add", category])
+                .status
+                .success()
+        );
+    }
+
+    let add = |title: &str, category: &str, labels: &[&str]| {
+        let mut arguments = vec!["--json", "add", title, "--category", category];
+        for label in labels {
+            arguments.extend(["--label", label]);
+        }
+        let output = mach(dir.path(), &arguments);
+        assert!(
+            output.status.success(),
+            "add failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+
+    let both_open = add("both open", "Work", &["Bug", "Back", "bug"]);
+    let bug_only = add("bug only", "Work", &["Bug"]);
+    let backend_only = add("backend only", "Work", &["Backend"]);
+    let both_done = add("both done", "Home", &["Backend", "Bug"]);
+    assert!(
+        mach(dir.path(), &["done", both_done["id"].as_str().unwrap()])
+            .status
+            .success()
+    );
+
+    let labels = both_open["labels"].as_array().unwrap();
+    assert_eq!(
+        labels.len(),
+        2,
+        "duplicate --label values must be idempotent"
+    );
+    assert_eq!(labels[0]["name"], "Backend", "use global label order");
+    assert_eq!(labels[1]["name"], "Bug");
+
+    let filtered = mach(
+        dir.path(),
+        &["--json", "list", "--label", "bug", "--label", "back"],
+    );
+    assert!(filtered.status.success());
+    let filtered: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(
+        filtered
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["title"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["both open", "both done"]
+    );
+
+    let open_work = mach(
+        dir.path(),
+        &[
+            "--json",
+            "list",
+            "--label",
+            "bug",
+            "--label",
+            "back",
+            "--open",
+            "--category",
+            "Work",
+        ],
+    );
+    let open_work: serde_json::Value = serde_json::from_slice(&open_work.stdout).unwrap();
+    assert_eq!(open_work.as_array().unwrap().len(), 1);
+    assert_eq!(open_work[0]["id"], both_open["id"]);
+
+    let plain = mach(dir.path(), &["list", "--label", "Bug", "--open"]);
+    let plain = String::from_utf8(plain.stdout).unwrap();
+    assert!(plain.contains("#Backend #Bug"));
+    assert!(plain.contains("both open"));
+    assert!(plain.contains("bug only"));
+    assert!(!plain.contains("backend only"));
+
+    let shown = mach(dir.path(), &["show", both_open["id"].as_str().unwrap()]);
+    let shown = String::from_utf8(shown.stdout).unwrap();
+    assert!(shown.contains("labels:     #Backend #Bug"));
+
+    assert!(bug_only["labels"].is_array());
+    assert!(backend_only["labels"].is_array());
+}
+
+#[test]
+fn label_edits_are_idempotent_and_invalid_sets_do_not_partially_mutate() {
+    let dir = TempDir::new("cli-label-edits");
+    for label in ["Bug", "Backend", "Build", "Release"] {
+        assert!(mach(dir.path(), &["labels", "add", label]).status.success());
+    }
+    let unresolved_add = mach(
+        dir.path(),
+        &["--json", "add", "must not exist", "--label", "Missing"],
+    );
+    assert!(!unresolved_add.status.success());
+    let tasks = mach(dir.path(), &["--json", "list"]);
+    let tasks: serde_json::Value = serde_json::from_slice(&tasks.stdout).unwrap();
+    assert_eq!(tasks, serde_json::json!([]));
+
+    let added = mach(dir.path(), &["--json", "add", "task", "--label", "Bug"]);
+    assert!(added.status.success());
+    let added: serde_json::Value = serde_json::from_slice(&added.stdout).unwrap();
+    let id = added["id"].as_str().unwrap();
+
+    let expanded = mach(
+        dir.path(),
+        &[
+            "--json",
+            "edit",
+            id,
+            "--add-label",
+            "bug",
+            "--add-label",
+            "backend",
+            "--remove-label",
+            "Release",
+        ],
+    );
+    assert!(expanded.status.success());
+    let expanded: serde_json::Value = serde_json::from_slice(&expanded.stdout).unwrap();
+    assert_eq!(
+        expanded["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|label| label["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["Bug", "Backend"]
+    );
+
+    let replaced = mach(
+        dir.path(),
+        &[
+            "--json",
+            "edit",
+            id,
+            "--clear-labels",
+            "--add-label",
+            "Release",
+        ],
+    );
+    assert!(replaced.status.success());
+    let replaced: serde_json::Value = serde_json::from_slice(&replaced.stdout).unwrap();
+    assert_eq!(replaced["labels"][0]["name"], "Release");
+    assert_eq!(replaced["labels"].as_array().unwrap().len(), 1);
+
+    for invalid in [
+        vec!["--add-label", "Release", "--remove-label", "release"],
+        vec!["--clear-labels", "--remove-label", "Release"],
+        vec!["--add-label", "b"],
+        vec!["--add-label", "Missing"],
+    ] {
+        let mut arguments = vec!["--json", "edit", id];
+        arguments.extend(invalid);
+        let output = mach(dir.path(), &arguments);
+        assert!(!output.status.success());
+        assert!(output.stderr.is_empty());
+        let error: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("one JSON error document");
+        assert_eq!(error["ok"], false);
+
+        let shown = mach(dir.path(), &["--json", "show", id]);
+        let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+        assert_eq!(shown["labels"], replaced["labels"]);
+    }
 }
 
 #[test]
@@ -618,7 +871,7 @@ fn move_and_purge_expose_manual_order_and_completed_cleanup() {
 }
 
 #[test]
-fn archive_round_trip_preserves_tasks_categories_and_images() {
+fn archive_round_trip_preserves_tasks_categories_labels_and_images() {
     let source = TempDir::new("archive-source");
     let destination = TempDir::new("archive-destination");
     let output = TempDir::new("archive-output");
@@ -651,6 +904,11 @@ fn archive_round_trip_preserves_tasks_categories_and_images() {
         .status
         .success()
     );
+    assert!(
+        mach(source.path(), &["labels", "add", "Portable"])
+            .status
+            .success()
+    );
     let added = mach(
         source.path(),
         &[
@@ -659,6 +917,8 @@ fn archive_round_trip_preserves_tasks_categories_and_images() {
             "portable task",
             "--category",
             "Work",
+            "--label",
+            "Portable",
             "--description",
             &description,
             "--due",
@@ -689,6 +949,7 @@ fn archive_round_trip_preserves_tasks_categories_and_images() {
     let exported: serde_json::Value = serde_json::from_slice(&exported.stdout).unwrap();
     assert_eq!(exported["tasks"], 1);
     assert_eq!(exported["categories"], 2);
+    assert_eq!(exported["labels"], 1);
     assert_eq!(exported["images"], 1);
 
     let imported = mach(
@@ -704,6 +965,7 @@ fn archive_round_trip_preserves_tasks_categories_and_images() {
     let imported: serde_json::Value = serde_json::from_slice(&imported.stdout).unwrap();
     assert_eq!(imported["tasks_added"], 1);
     assert_eq!(imported["categories_added"], 2);
+    assert_eq!(imported["labels_added"], 1);
     assert_eq!(imported["images_added"], 1);
 
     let source_store = Store::open(source.path()).unwrap();
@@ -711,6 +973,7 @@ fn archive_round_trip_preserves_tasks_categories_and_images() {
     let destination_store = Store::open(destination.path()).unwrap();
     let destination_snapshot = destination_store.snapshot().unwrap();
     assert_eq!(destination_snapshot.categories, source_snapshot.categories);
+    assert_eq!(destination_snapshot.labels, source_snapshot.labels);
     assert_eq!(destination_snapshot.tasks, source_snapshot.tasks);
     assert_eq!(
         destination_snapshot.attachments(),

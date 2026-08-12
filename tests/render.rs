@@ -130,7 +130,7 @@ fn draws_every_overlay() {
         (Mode::Settings, "Sort"),
         (Mode::Welcome, "Welcome to mach"),
         (Mode::WhatsNew, "What's new in mach"),
-        (Mode::Slash, "search tasks"),
+        (Mode::Slash, "search tasks by text or label"),
     ] {
         let mut app = sample_app();
         app.mode = mode;
@@ -206,6 +206,109 @@ fn draws_the_task_dialog_with_a_description() {
 }
 
 #[test]
+fn preview_wraps_every_label_and_rows_compact_only_whole_label_tokens() {
+    let mut app = sample_app();
+    let labels = ["bug", "backend", "release", "customer-visible"]
+        .into_iter()
+        .map(|name| app.create_label(name).unwrap())
+        .collect::<Vec<_>>();
+    let task = app.selected_task().unwrap().id.clone();
+    app.set_task_labels(&task, labels).unwrap();
+    let labelled = app.tasks.iter_mut().find(|item| item.id == task).unwrap();
+    labelled.due.clear();
+    labelled.description.clear();
+    app.invalidate_preview();
+    app.rebuild_view();
+
+    let wide_buffer = draw(&mut app, 100, 30);
+    let wide = buffer_text(&wide_buffer);
+    for label in ["bug", "backend", "release", "customer-visible"] {
+        assert!(
+            wide.contains(label),
+            "missing {label:?} in preview:\n{wide}"
+        );
+    }
+    assert!(!wide.contains("#bug"), "TUI labels no longer use #: {wide}");
+    let (bug_x, bug_y) = find_cells(&wide_buffer, "bug");
+    assert_eq!(
+        wide_buffer[(bug_x, bug_y)].bg,
+        app.theme()
+            .label_badge(false)
+            .bg
+            .unwrap_or(ratatui::style::Color::Reset),
+        "task focus must not replace the label badge background"
+    );
+
+    app.settings.preview_position = "right".into();
+    let narrow = render(&mut app, 90, 30);
+    let task_row = narrow
+        .lines()
+        .find(|line| line.contains("[ ]") && line.contains("ship the"))
+        .expect("task row");
+    assert!(task_row.contains("bug"), "{task_row}");
+    assert!(
+        task_row.contains("+"),
+        "hidden labels need a count: {task_row}"
+    );
+    assert!(
+        !task_row.contains("back…"),
+        "label tokens must not truncate: {task_row}"
+    );
+}
+
+#[test]
+fn draws_labels_manager_and_task_label_picker_at_supported_sizes() {
+    for (width, height) in [(60, 16), (100, 30)] {
+        let mut app = sample_app();
+        app.create_label("bug").unwrap();
+        app.create_label("backend").unwrap();
+        if height == 16 {
+            for name in ["frontend", "design", "docs", "release", "blocked", "later"] {
+                app.create_label(name).unwrap();
+            }
+        }
+        app.mode = Mode::Labels;
+        let manager_buffer = draw(&mut app, width, height);
+        let manager = buffer_text(&manager_buffer);
+        assert!(manager.contains("Labels"), "{manager}");
+        assert!(manager.contains("bug"), "{manager}");
+        let (_, bug_y) = find_cells(&manager_buffer, "bug");
+        let (_, backend_y) = find_cells(&manager_buffer, "backend");
+        assert_eq!(bug_y, backend_y, "labels should flow across the row");
+
+        app.mode = Mode::Normal;
+        app.open_edit_task();
+        app.form
+            .as_mut()
+            .unwrap()
+            .set_field(mach::form::Field::Labels);
+        app.form.as_mut().unwrap().open_label_picker();
+        let picker_buffer = draw(&mut app, width, height);
+        let picker = buffer_text(&picker_buffer);
+        let form = app.form.as_ref().unwrap();
+        let picker_area = form.label_picker_area().unwrap();
+        if height == 16 {
+            assert!(
+                picker_area.y >= form.areas.labels.bottom(),
+                "short label picker must shrink below its field:\n{picker}"
+            );
+        }
+        let title_area = form.areas.title;
+        let overlaps_title = picker_area.x < title_area.right()
+            && picker_area.right() > title_area.x
+            && picker_area.y < title_area.bottom()
+            && picker_area.bottom() > title_area.y;
+        assert!(
+            !overlaps_title,
+            "label picker must shrink instead of covering Title:\n{picker}"
+        );
+        if width >= 100 {
+            assert!(picker.contains("bug"), "{picker}");
+        }
+    }
+}
+
+#[test]
 fn narrow_side_preview_uses_a_stacked_in_place_editor() {
     let mut app = sample_app();
     app.settings.preview_position = "right".into();
@@ -222,10 +325,11 @@ fn narrow_side_preview_uses_a_stacked_in_place_editor() {
 
     let (_, title_y) = find_cells(&buffer, " Title ");
     let (_, category_y) = find_cells(&buffer, " Category ");
+    let (_, labels_y) = find_cells(&buffer, " Labels ");
     let (_, due_y) = find_cells(&buffer, " Due ");
     let (_, flags_y) = find_cells(&buffer, " Flags ");
     assert!(
-        title_y < category_y && category_y < due_y && due_y < flags_y,
+        title_y < category_y && category_y < labels_y && labels_y < due_y && due_y < flags_y,
         "compact metadata fields should stack vertically\n{}",
         buffer_text(&buffer)
     );
@@ -337,6 +441,7 @@ fn survives_sizes_from_tiny_to_wide() {
             Mode::Normal,
             Mode::Help,
             Mode::Settings,
+            Mode::Labels,
             Mode::Welcome,
             Mode::WhatsNew,
             Mode::Slash,

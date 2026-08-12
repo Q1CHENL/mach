@@ -24,14 +24,15 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::due;
 use crate::model::{
-    Block, Category, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN, MAX_CATEGORY_DESC_LINES,
-    MAX_CATEGORY_NAME_LEN, MAX_DESCRIPTION_LINES, MAX_IMPORTANCE, MAX_NOTES_LINE_LEN,
-    MAX_TASK_COUNT, MAX_TITLE_LEN, SCHEMA_VERSION, Task, category_name_key, text_byte_limit,
+    Block, Category, Label, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN,
+    MAX_CATEGORY_DESC_LINES, MAX_CATEGORY_NAME_LEN, MAX_DESCRIPTION_LINES, MAX_IMPORTANCE,
+    MAX_LABEL_COUNT, MAX_LABEL_NAME_LEN, MAX_LABELS_PER_TASK, MAX_NOTES_LINE_LEN, MAX_TASK_COUNT,
+    MAX_TITLE_LEN, SCHEMA_VERSION, Task, category_name_key, label_name_key, text_byte_limit,
 };
 use crate::settings::{DATE_FORMATS, PREVIEW_POSITIONS, SORTS, Settings, THEMES};
 
 const DATABASE_FILE: &str = "mach.db";
-const DATABASE_SCHEMA_VERSION: i64 = 2;
+const DATABASE_SCHEMA_VERSION: i64 = 3;
 const LEGACY_MIGRATION_KEY: &str = "legacy_json_migrated";
 pub(crate) const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const ID_MAX_BYTES: usize = 128;
@@ -176,6 +177,7 @@ impl From<rusqlite::Error> for StoreError {
 pub struct StoreData {
     pub revision: u64,
     pub categories: Vec<Category>,
+    pub labels: Vec<Label>,
     pub tasks: Vec<Task>,
     pub settings: Settings,
     pub(crate) attachments: Vec<Attachment>,
@@ -208,6 +210,8 @@ pub struct TaskPatch {
     pub importance: Option<u8>,
     /// `None` leaves the category unchanged; `Some(None)` clears it.
     pub category_id: Option<Option<String>>,
+    /// `None` leaves labels unchanged; values are normalized into store order.
+    pub label_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -308,6 +312,46 @@ impl StoreData {
         }
     }
 
+    /// Resolve a label by id, Unicode-caseless name, or unique name prefix.
+    pub fn resolve_label_id(&self, query: &str) -> Result<String, StoreError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err(StoreError::validation("label name cannot be empty"));
+        }
+        if let Some(label) = self.labels.iter().find(|label| label.id == query) {
+            return Ok(label.id.clone());
+        }
+        validate_byte_limit(query, text_byte_limit(MAX_LABEL_NAME_LEN), "label query")?;
+        let folded = label_name_key(query);
+        if let Some(label) = self
+            .labels
+            .iter()
+            .find(|label| label_name_key(&label.name) == folded)
+        {
+            return Ok(label.id.clone());
+        }
+        let matches: Vec<_> = self
+            .labels
+            .iter()
+            .filter(|label| label_name_has_prefix(&label.name, &folded))
+            .collect();
+        match matches.as_slice() {
+            [label] => Ok(label.id.clone()),
+            [] => Err(StoreError::NotFound {
+                entity: "label",
+                query: query.to_string(),
+            }),
+            _ => Err(StoreError::Ambiguous {
+                entity: "label",
+                query: query.to_string(),
+                matches: matches
+                    .into_iter()
+                    .map(|label| label.name.clone())
+                    .collect(),
+            }),
+        }
+    }
+
     pub fn task(&self, id: &str) -> Result<&Task, StoreError> {
         self.task_index(id).map(|index| &self.tasks[index])
     }
@@ -324,6 +368,20 @@ impl StoreData {
 
     pub fn category(&self, id: &str) -> Result<&Category, StoreError> {
         self.category_index(id).map(|index| &self.categories[index])
+    }
+
+    pub fn label(&self, id: &str) -> Result<&Label, StoreError> {
+        self.label_index(id).map(|index| &self.labels[index])
+    }
+
+    fn label_index(&self, id: &str) -> Result<usize, StoreError> {
+        self.labels
+            .iter()
+            .position(|label| label.id == id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "label",
+                query: id.to_string(),
+            })
     }
 
     fn category_index(&self, id: &str) -> Result<usize, StoreError> {
@@ -389,6 +447,9 @@ impl StoreData {
             if let Some(category_id) = patch.category_id {
                 task.category_id = category_id;
             }
+            if let Some(label_ids) = patch.label_ids {
+                task.label_ids = label_ids;
+            }
         }
         if let Err(error) = self.normalize_and_validate_new_write() {
             self.tasks[index] = before;
@@ -430,6 +491,11 @@ impl StoreData {
                 patch.category_id.as_ref(),
                 &current.category_id,
                 &expected.category_id,
+            )
+            || field_conflicts(
+                patch.label_ids.as_ref(),
+                &current.label_ids,
+                &expected.label_ids,
             );
         if stale {
             return Err(StoreError::StaleEntity {
@@ -479,6 +545,20 @@ impl StoreData {
             id,
             TaskPatch {
                 category_id: Some(category_id),
+                ..TaskPatch::default()
+            },
+        )
+    }
+
+    pub fn set_task_labels(
+        &mut self,
+        id: &str,
+        label_ids: Vec<String>,
+    ) -> Result<Task, StoreError> {
+        self.edit_task(
+            id,
+            TaskPatch {
+                label_ids: Some(label_ids),
                 ..TaskPatch::default()
             },
         )
@@ -643,6 +723,42 @@ impl StoreData {
             }
         }
         Ok(category)
+    }
+
+    pub fn create_label(&mut self, name: impl Into<String>) -> Result<Label, StoreError> {
+        let name = name.into();
+        self.insert_label(Label::new(&name))
+    }
+
+    pub fn insert_label(&mut self, label: Label) -> Result<Label, StoreError> {
+        let index = self.labels.len();
+        self.labels.push(label);
+        if let Err(error) = self.normalize_and_validate_new_write() {
+            self.labels.truncate(index);
+            return Err(error);
+        }
+        Ok(self.labels[index].clone())
+    }
+
+    pub fn edit_label(&mut self, id: &str, name: impl Into<String>) -> Result<Label, StoreError> {
+        let index = self.label_index(id)?;
+        let before = self.labels[index].clone();
+        self.labels[index].name = name.into();
+        if let Err(error) = self.normalize_and_validate_new_write() {
+            self.labels[index] = before;
+            return Err(error);
+        }
+        Ok(self.labels[index].clone())
+    }
+
+    /// Delete a global label while preserving every task that used it.
+    pub fn delete_label(&mut self, id: &str) -> Result<Label, StoreError> {
+        let index = self.label_index(id)?;
+        let label = self.labels.remove(index);
+        for task in &mut self.tasks {
+            task.label_ids.retain(|label_id| label_id != id);
+        }
+        Ok(label)
     }
 
     pub fn move_category(&mut self, id: &str, target: usize) -> Result<(), StoreError> {
@@ -1004,6 +1120,7 @@ impl Store {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    labels: Vec::new(),
                     tasks: tasks_file.map(|file| file.tasks).unwrap_or_default(),
                     settings: settings.unwrap_or_default().normalized(),
                     attachments: Vec::new(),
@@ -1134,7 +1251,7 @@ fn configure_in_memory_connection(connection: &Connection) -> Result<(), StoreEr
 
 fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), StoreError> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if !matches!(version, 0 | 1 | DATABASE_SCHEMA_VERSION) {
+    if !matches!(version, 0 | 1 | 2 | DATABASE_SCHEMA_VERSION) {
         return Err(StoreError::UnsupportedDatabaseSchema {
             path: path.to_path_buf(),
             found: version,
@@ -1181,6 +1298,19 @@ fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), Sto
             importance INTEGER NOT NULL CHECK (importance BETWEEN 0 AND 3),
             category_id TEXT REFERENCES categories(id) ON DELETE SET NULL
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS labels (
+            id TEXT PRIMARY KEY,
+            position INTEGER NOT NULL UNIQUE CHECK (position >= 0),
+            name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+            name_key TEXT NOT NULL UNIQUE CHECK (length(name_key) > 0)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS task_labels (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            label_id TEXT NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL CHECK (position >= 0),
+            PRIMARY KEY (task_id, label_id),
+            UNIQUE (task_id, position)
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS attachments (
             id TEXT PRIMARY KEY,
             sha256 TEXT NOT NULL UNIQUE CHECK (sha256 = id),
@@ -1199,6 +1329,7 @@ fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), Sto
         ) STRICT;
         CREATE INDEX IF NOT EXISTS task_description_attachments_by_attachment
             ON task_description_attachments(attachment_id);
+        CREATE INDEX IF NOT EXISTS task_labels_by_label ON task_labels(label_id);
         ",
     )?;
     let settings = serde_json::to_string(&Settings::default()).map_err(|source| {
@@ -1317,6 +1448,37 @@ fn load_snapshot(connection: &Connection) -> Result<StoreData, StoreError> {
         categories.push(category);
     }
 
+    let mut labels_statement =
+        connection.prepare("SELECT position, id, name, name_key FROM labels ORDER BY position")?;
+    let label_rows = labels_statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            Label {
+                id: row.get(1)?,
+                name: row.get(2)?,
+            },
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut labels = Vec::new();
+    for (expected_position, row) in label_rows.enumerate() {
+        if expected_position >= MAX_LABEL_COUNT {
+            return Err(StoreError::Corrupt(format!(
+                "label count exceeds {MAX_LABEL_COUNT}"
+            )));
+        }
+        let (stored_position, label, stored_name_key) = row?;
+        validate_stored_position(stored_position, expected_position, "label")?;
+        let expected_name_key = label_name_key(&label.name);
+        if stored_name_key != expected_name_key {
+            return Err(StoreError::Corrupt(format!(
+                "label {:?} has identity key {stored_name_key:?}, expected {expected_name_key:?}",
+                label.id
+            )));
+        }
+        labels.push(label);
+    }
+
     let mut tasks_statement = connection.prepare(
         "SELECT position, id, title, description_json, due, created, done, importance, category_id
          FROM tasks ORDER BY position",
@@ -1369,12 +1531,42 @@ fn load_snapshot(connection: &Connection) -> Result<StoreData, StoreError> {
             done: done != 0,
             importance,
             category_id,
+            label_ids: Vec::new(),
         });
+    }
+    let task_indices: HashMap<_, _> = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| (task.id.clone(), index))
+        .collect();
+    let mut expected_label_positions: HashMap<String, usize> = HashMap::new();
+    let mut task_labels_statement = connection.prepare(
+        "SELECT task_id, position, label_id FROM task_labels ORDER BY task_id, position",
+    )?;
+    let task_label_rows = task_labels_statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in task_label_rows {
+        let (task_id, stored_position, label_id) = row?;
+        let task_index = task_indices.get(&task_id).copied().ok_or_else(|| {
+            StoreError::Corrupt(format!(
+                "task label assignment refers to unknown task {task_id:?}"
+            ))
+        })?;
+        let expected_position = expected_label_positions.entry(task_id.clone()).or_default();
+        validate_stored_position(stored_position, *expected_position, "task label")?;
+        *expected_position += 1;
+        tasks[task_index].label_ids.push(label_id);
     }
     validate_task_attachment_rows(connection, &tasks)?;
     let mut data = StoreData {
         revision,
         categories,
+        labels,
         tasks,
         settings,
         attachments,
@@ -1467,6 +1659,18 @@ fn persist_diff(
         .enumerate()
         .map(|(position, category)| (category.id.as_str(), (position, category)))
         .collect();
+    let before_labels: HashMap<&str, (usize, &Label)> = before
+        .labels
+        .iter()
+        .enumerate()
+        .map(|(position, label)| (label.id.as_str(), (position, label)))
+        .collect();
+    let after_labels: HashMap<&str, (usize, &Label)> = after
+        .labels
+        .iter()
+        .enumerate()
+        .map(|(position, label)| (label.id.as_str(), (position, label)))
+        .collect();
     let before_tasks: HashMap<&str, (usize, &Task)> = before
         .tasks
         .iter()
@@ -1555,6 +1759,23 @@ fn persist_diff(
             )?;
         }
     }
+    let mut temporary_label_name_index = 0usize;
+    for label in &before.labels {
+        let name_changed_or_removed = after_labels
+            .get(label.id.as_str())
+            .is_none_or(|(_, current)| current.name != label.name);
+        if name_changed_or_removed {
+            let temporary_name = format!("\u{1f}mach-label-{temporary_label_name_index}");
+            temporary_label_name_index += 1;
+            execute_one(
+                tx,
+                "UPDATE labels SET name = ?1, name_key = ?1 WHERE id = ?2",
+                params![temporary_name, label.id],
+                "label",
+                &label.id,
+            )?;
+        }
+    }
 
     let category_position_base = before.categories.len().max(after.categories.len());
     let mut category_position_offset = 0usize;
@@ -1599,6 +1820,36 @@ fn persist_diff(
         }
     }
 
+    let label_position_base = before.labels.len().max(after.labels.len());
+    let mut label_position_offset = 0usize;
+    for (old_position, label) in before.labels.iter().enumerate() {
+        if let Some((new_position, _)) = after_labels.get(label.id.as_str()).copied()
+            && new_position != old_position
+        {
+            let temporary =
+                temporary_position(label_position_base, label_position_offset, "labels")?;
+            label_position_offset += 1;
+            execute_one(
+                tx,
+                "UPDATE labels SET position = ?1 WHERE id = ?2",
+                params![temporary, label.id],
+                "label",
+                &label.id,
+            )?;
+        }
+    }
+    for label in &after.labels {
+        if !before_labels.contains_key(label.id.as_str()) {
+            let temporary =
+                temporary_position(label_position_base, label_position_offset, "labels")?;
+            label_position_offset += 1;
+            tx.execute(
+                "INSERT INTO labels(id, position, name, name_key) VALUES (?1, ?2, ?3, ?4)",
+                params![label.id, temporary, label.name, label_name_key(&label.name),],
+            )?;
+        }
+    }
+
     let task_position_base = before.tasks.len().max(after.tasks.len());
     let mut task_position_offset = 0usize;
     for (old_position, task) in before.tasks.iter().enumerate() {
@@ -1621,7 +1872,7 @@ fn persist_diff(
     // before obsolete categories are deleted.
     for task in &after.tasks {
         if let Some((_, previous)) = before_tasks.get(task.id.as_str()).copied()
-            && previous != task
+            && !task_row_equal(previous, task)
         {
             if previous.description == task.description {
                 execute_one(
@@ -1702,6 +1953,15 @@ fn persist_diff(
             insert_task_attachment_rows(tx, task)?;
         }
     }
+    for task in &after.tasks {
+        let labels_changed_or_new = before_tasks
+            .get(task.id.as_str())
+            .is_none_or(|(_, previous)| previous.label_ids != task.label_ids);
+        if labels_changed_or_new {
+            tx.execute("DELETE FROM task_labels WHERE task_id = ?1", [&task.id])?;
+            insert_task_label_rows(tx, task)?;
+        }
+    }
 
     for attachment in &before.attachments {
         if !after_attachments.contains_key(attachment.id.as_str()) {
@@ -1731,6 +1991,18 @@ fn persist_diff(
         }
     }
 
+    for label in &before.labels {
+        if !after_labels.contains_key(label.id.as_str()) {
+            execute_one(
+                tx,
+                "DELETE FROM labels WHERE id = ?1",
+                [label.id.as_str()],
+                "label",
+                &label.id,
+            )?;
+        }
+    }
+
     for category in &after.categories {
         if let Some((_, previous)) = before_categories.get(category.id.as_str()).copied()
             && previous != category
@@ -1748,6 +2020,19 @@ fn persist_diff(
                 ],
                 "category",
                 &category.id,
+            )?;
+        }
+    }
+    for label in &after.labels {
+        if let Some((_, previous)) = before_labels.get(label.id.as_str()).copied()
+            && previous != label
+        {
+            execute_one(
+                tx,
+                "UPDATE labels SET name = ?1, name_key = ?2 WHERE id = ?3",
+                params![label.name, label_name_key(&label.name), label.id],
+                "label",
+                &label.id,
             )?;
         }
     }
@@ -1770,6 +2055,21 @@ fn persist_diff(
             )?;
         }
     }
+    for (position, label) in after.labels.iter().enumerate() {
+        let moved_or_new = before_labels
+            .get(label.id.as_str())
+            .is_none_or(|(old_position, _)| *old_position != position);
+        if moved_or_new {
+            let position = sqlite_position(position, "labels")?;
+            execute_one(
+                tx,
+                "UPDATE labels SET position = ?1 WHERE id = ?2",
+                params![position, label.id],
+                "label",
+                &label.id,
+            )?;
+        }
+    }
     for (position, task) in after.tasks.iter().enumerate() {
         let moved_or_new = before_tasks
             .get(task.id.as_str())
@@ -1789,6 +2089,17 @@ fn persist_diff(
     let settings = (before.settings != after.settings).then_some(&after.settings);
     persist_app_state(tx, after.revision, settings)?;
     Ok(())
+}
+
+fn task_row_equal(left: &Task, right: &Task) -> bool {
+    left.id == right.id
+        && left.title == right.title
+        && left.description == right.description
+        && left.due == right.due
+        && left.created == right.created
+        && left.done == right.done
+        && left.importance == right.importance
+        && left.category_id == right.category_id
 }
 
 fn execute_one<P: rusqlite::Params>(
@@ -1836,6 +2147,19 @@ fn insert_task_attachment_rows(tx: &Transaction<'_>, task: &Task) -> Result<(), 
             task.id,
             sqlite_position(block_index, "task attachment blocks")?,
             attachment_id,
+        ])?;
+    }
+    Ok(())
+}
+
+fn insert_task_label_rows(tx: &Transaction<'_>, task: &Task) -> Result<(), StoreError> {
+    let mut statement =
+        tx.prepare("INSERT INTO task_labels(task_id, label_id, position) VALUES (?1, ?2, ?3)")?;
+    for (position, label_id) in task.label_ids.iter().enumerate() {
+        statement.execute(params![
+            task.id,
+            label_id,
+            sqlite_position(position, "task labels")?,
         ])?;
     }
     Ok(())
@@ -2415,6 +2739,11 @@ fn normalize_and_validate(
             "task limit is {MAX_TASK_COUNT}"
         )));
     }
+    if data.labels.len() > MAX_LABEL_COUNT {
+        return Err(StoreError::Validation(format!(
+            "label limit is {MAX_LABEL_COUNT}"
+        )));
+    }
 
     let attachment_ids = validate_attachments(&data.attachments)?;
 
@@ -2464,6 +2793,52 @@ fn normalize_and_validate(
             MAX_CATEGORY_DESC_LINE_LEN,
             "category description",
         )?;
+    }
+
+    let mut label_ids = HashSet::new();
+    let mut label_names = HashSet::new();
+    let mut label_positions = HashMap::new();
+    for (position, label) in data.labels.iter_mut().enumerate() {
+        validate_single_line(&label.id, "label id")?;
+        validate_byte_limit(&label.id, ID_MAX_BYTES, "label id")?;
+        if label.id.is_empty() || !label_ids.insert(label.id.clone()) {
+            return Err(StoreError::Validation(format!(
+                "label id {:?} must be nonempty and unique",
+                label.id
+            )));
+        }
+        validate_single_line(&label.name, "label name")?;
+        validate_byte_limit(
+            &label.name,
+            text_byte_limit(MAX_LABEL_NAME_LEN),
+            "label name",
+        )?;
+        let trimmed = label.name.trim();
+        if trimmed.is_empty() {
+            return Err(StoreError::Validation("label name cannot be empty".into()));
+        }
+        if trimmed.starts_with('#') {
+            return Err(StoreError::Validation(
+                "label name must not start with '#'".into(),
+            ));
+        }
+        if trimmed.graphemes(true).count() > MAX_LABEL_NAME_LEN {
+            return Err(StoreError::Validation(format!(
+                "label name {:?} exceeds {MAX_LABEL_NAME_LEN} characters",
+                label.name
+            )));
+        }
+        if matches!(due_mode, DueMode::Stored) && trimmed != label.name {
+            return Err(StoreError::Validation(format!(
+                "label {:?} has noncanonical surrounding whitespace",
+                label.id
+            )));
+        }
+        label.name = trimmed.to_string();
+        if !label_names.insert(label_name_key(&label.name)) {
+            return Err(StoreError::Validation("label names must be unique".into()));
+        }
+        label_positions.insert(label.id.clone(), position);
     }
 
     let mut task_ids = HashSet::new();
@@ -2533,6 +2908,38 @@ fn normalize_and_validate(
                 )));
             }
         }
+        if task.label_ids.len() > MAX_LABELS_PER_TASK {
+            return Err(StoreError::Validation(format!(
+                "task {:?} label limit is {MAX_LABELS_PER_TASK}",
+                task.id
+            )));
+        }
+        let mut assigned = HashSet::new();
+        for label_id in &task.label_ids {
+            validate_single_line(label_id, "task label id")?;
+            validate_byte_limit(label_id, ID_MAX_BYTES, "task label id")?;
+            if !assigned.insert(label_id.clone()) {
+                return Err(StoreError::Validation(format!(
+                    "task {:?} assigns label {label_id:?} more than once",
+                    task.id
+                )));
+            }
+            if !label_positions.contains_key(label_id) {
+                return Err(StoreError::Validation(format!(
+                    "task {:?} refers to unknown label {label_id:?}",
+                    task.id
+                )));
+            }
+        }
+        let mut canonical_label_ids = task.label_ids.clone();
+        canonical_label_ids.sort_by_key(|label_id| label_positions[label_id]);
+        if matches!(due_mode, DueMode::Stored) && canonical_label_ids != task.label_ids {
+            return Err(StoreError::Validation(format!(
+                "task {:?} labels are not in canonical store order",
+                task.id
+            )));
+        }
+        task.label_ids = canonical_label_ids;
         validate_single_line(&task.due, "task due")?;
         validate_byte_limit(&task.due, DUE_MAX_BYTES, "task due")?;
         let normalized_due = match due_mode {
@@ -2687,6 +3094,16 @@ fn category_name_has_prefix(name: &str, folded_query: &str) -> bool {
         .map(|(index, _)| index)
         .chain(std::iter::once(normalized.len()))
         .any(|end| category_name_key(&normalized[..end]) == folded_query)
+}
+
+fn label_name_has_prefix(name: &str, folded_query: &str) -> bool {
+    let normalized: String = name.trim().nfkc().collect();
+    normalized
+        .char_indices()
+        .skip(1)
+        .map(|(index, _)| index)
+        .chain(std::iter::once(normalized.len()))
+        .any(|end| label_name_key(&normalized[..end]) == folded_query)
 }
 
 fn validate_settings(settings: &Settings) -> Result<(), StoreError> {

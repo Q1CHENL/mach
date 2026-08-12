@@ -82,12 +82,12 @@ pub const HELP_COLUMNS: [HelpRow; 17] = [
         "/search  /settings  /help",
         "Tab ⇧Tab     next / previous field",
     ),
-    row("/whatsnew", "← → Space    choose category / flags"),
+    row("/whatsnew  /labels", "← → Space    choose category / flags"),
+    row("/copy  /copytitle · /done", "Enter / Space choose labels"),
     row(
-        "/copy  /copytitle · /done",
+        "/export  /import <FILE>",
         "Enter        calendar · new line · open",
     ),
-    row("/export  /import <FILE>", ""),
     row("/purge  /update  /quit", "Ctrl+Z / ⇧Z  undo · redo"),
     row("? this page", "Esc          back to the task list"),
 ];

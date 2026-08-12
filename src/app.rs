@@ -15,8 +15,8 @@ use crate::due;
 use crate::form::{CategoryForm, TaskDraft, TaskForm};
 use crate::image::ImageStore;
 use crate::model::{
-    ALL_CATEGORY, Category, MAX_CATEGORY_COUNT, MAX_CATEGORY_NAME_LEN, MAX_TASK_COUNT,
-    MAX_TITLE_LEN, Task, caseless_key, category_name_key,
+    ALL_CATEGORY, Category, Label, MAX_CATEGORY_COUNT, MAX_CATEGORY_NAME_LEN, MAX_LABEL_COUNT,
+    MAX_LABEL_NAME_LEN, MAX_TASK_COUNT, MAX_TITLE_LEN, Task, caseless_key, category_name_key,
 };
 use crate::settings::{LaunchState, Settings};
 use crate::store::{
@@ -47,6 +47,8 @@ pub enum Mode {
     TaskForm,
     /// The category dialog (new or edit).
     CategoryForm,
+    /// Global reusable label manager.
+    Labels,
     Help,
     Settings,
     Welcome,
@@ -69,6 +71,7 @@ impl Mode {
                 | Mode::WhatsNew
                 | Mode::TaskForm
                 | Mode::CategoryForm
+                | Mode::Labels
         )
     }
 }
@@ -116,6 +119,8 @@ pub enum Confirm {
     /// Esc again discards the current task/category draft.
     DiscardTask(Option<String>),
     DiscardCategory(Option<String>),
+    /// Backspace again deletes this exact label and unassigns it everywhere.
+    DeleteLabel(String),
     /// Ctrl+C again leaves mach.
     Quit,
 }
@@ -227,7 +232,7 @@ pub(crate) enum UpdateActivity {
 }
 
 /// Rects from the last frame, used to hit-test mouse events.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct Areas {
     pub sidebar: Rect,
     pub tasks: Rect,
@@ -245,6 +250,15 @@ pub struct Areas {
     pub slash_menu: Rect,
     /// Index of the first command drawn inside a clipped command palette.
     pub slash_menu_start: usize,
+    /// Final badge rectangles in the global label manager.
+    pub label_hits: Vec<(usize, Rect)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClickTarget {
+    Sidebar,
+    Tasks,
+    Labels,
 }
 
 pub const SETTINGS_ITEMS: [&str; 4] = ["Sort", "Theme", "Date format", "Task preview"];
@@ -266,6 +280,7 @@ pub struct App {
     store_revision: u64,
     pub tasks: Vec<Task>,
     pub categories: Vec<Category>,
+    pub labels: Vec<Label>,
     pub settings: Settings,
     pub focus: Focus,
     pub mode: Mode,
@@ -291,14 +306,20 @@ pub struct App {
     pub form: Option<TaskForm>,
     /// The open category dialog, if any.
     pub category_form: Option<CategoryForm>,
+    /// Selected row in the global label manager.
+    pub label_index: usize,
+    /// Inline create/rename input; `Some(None)` creates, `Some(Some(id))` renames.
+    pub label_input: Option<(Option<String>, TextInput)>,
+    pub label_error: Option<String>,
+    labels_return_to_form: bool,
     pub settings_index: usize,
     /// First help content row currently visible.
     pub help_scroll: usize,
     pub message: Option<Message>,
     /// Pending entity-bound destructive action and its deadline.
     pub pending: Option<(Confirm, Instant)>,
-    /// Last click `(time, panel, row)` for double-click detection.
-    pub last_click: Option<(Instant, Focus, usize)>,
+    /// Last click `(time, target, row)` for double-click detection.
+    pub(crate) last_click: Option<(Instant, ClickTarget, usize)>,
     pub should_quit: bool,
     pub areas: Areas,
     /// Description/preview image store.
@@ -380,6 +401,7 @@ impl App {
         let StoreData {
             revision,
             categories: real_cats,
+            labels,
             tasks,
             settings,
             attachments,
@@ -400,6 +422,7 @@ impl App {
             store_revision: revision,
             tasks,
             categories,
+            labels,
             settings,
             focus: Focus::Tasks,
             mode: match launch {
@@ -419,6 +442,10 @@ impl App {
             slash_index: 0,
             form: None,
             category_form: None,
+            label_index: 0,
+            label_input: None,
+            label_error: None,
+            labels_return_to_form: false,
             settings_index: 0,
             help_scroll: 0,
             message: None,
@@ -493,7 +520,11 @@ impl App {
                 ));
             }
         };
-        if revision == self.store_revision || self.form.is_some() || self.category_form.is_some() {
+        if revision == self.store_revision
+            || self.form.is_some()
+            || self.category_form.is_some()
+            || self.mode == Mode::Labels
+        {
             self.external_poll_failed = false;
             return false;
         }
@@ -533,12 +564,14 @@ impl App {
         let StoreData {
             revision,
             categories,
+            labels,
             tasks,
             settings,
             attachments,
         } = snapshot;
         self.store_revision = revision;
         self.tasks = tasks;
+        self.labels = labels;
         self.settings = settings;
         self.attachments = attachments;
         self.images.set_attachments(&self.attachments);
@@ -683,6 +716,7 @@ impl App {
                 let contents = crate::archive::content_count_text(
                     summary.tasks,
                     summary.categories,
+                    summary.labels,
                     summary.images,
                 );
                 self.archive_result(format!("Exported to {} · {contents}", summary.short_path()));
@@ -697,11 +731,13 @@ impl App {
                 let added = crate::archive::content_count_text(
                     summary.tasks_added,
                     summary.categories_added,
+                    summary.labels_added,
                     summary.images_added,
                 );
                 let unchanged = crate::archive::content_count_text(
                     summary.tasks_unchanged,
                     summary.categories_unchanged,
+                    summary.labels_unchanged,
                     summary.images_unchanged,
                 );
                 let message = if !summary.changed() {
@@ -1152,6 +1188,7 @@ impl App {
         let mut form =
             TaskForm::edit_with_images(&task, self.images.root().to_path_buf(), &self.attachments);
         form.set_categories(&self.categories, task.category_id.as_deref());
+        form.set_labels(&self.labels, &task.label_ids);
         self.preview_form = Some(form);
         self.preview_task_id = Some(id);
         self.preview_gen = generation;
@@ -1181,6 +1218,13 @@ impl App {
             .map(|c| c.name.as_str())
     }
 
+    pub fn label_name(&self, id: &str) -> Option<&str> {
+        self.labels
+            .iter()
+            .find(|label| label.id == id)
+            .map(|label| label.name.as_str())
+    }
+
     /// Recompute which tasks are shown and in what order.
     ///
     /// Sort applies **inside** each category. All Tasks (and search) stack
@@ -1197,12 +1241,19 @@ impl App {
         let hide_done = self.settings.hide_done;
         let candidates: Vec<usize> = if self.searching {
             let q = caseless_key(&self.search_query);
+            let label_query = self
+                .search_query
+                .strip_prefix('#')
+                .unwrap_or(&self.search_query);
+            let label_q = caseless_key(label_query);
             self.tasks
                 .iter()
                 .enumerate()
                 .filter(|(_, t)| {
                     !(hide_done && t.done)
-                        && (contains_ignore_case(&t.title, &q) || description_contains(t, &q))
+                        && (contains_ignore_case(&t.title, &q)
+                            || description_contains(t, &q)
+                            || task_labels_contain(t, &self.labels, &label_q))
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -1602,6 +1653,7 @@ impl App {
             TaskForm::new_with_images(self.images.root().to_path_buf(), &self.attachments);
         let category = (!self.is_all_view()).then(|| self.current_category_id());
         form.set_categories(&self.categories, category);
+        form.set_labels(&self.labels, &[]);
         self.task_edit_base = None;
         self.form = Some(form);
         self.mode = Mode::TaskForm;
@@ -1616,6 +1668,7 @@ impl App {
                 &self.attachments,
             );
             form.set_categories(&self.categories, task.category_id.as_deref());
+            form.set_labels(&self.labels, &task.label_ids);
             // Decode description pictures off the UI thread so the dialog opens
             // immediately; they fill in on the next frames.
             self.images.prefetch(form.description.images());
@@ -1659,10 +1712,12 @@ impl App {
         }
         let description = draft.description.clone();
         let category_id = draft.category_id.clone();
+        let label_ids = draft.label_ids.clone();
         let importance = draft.importance;
-        let task = match self
-            .update_store(|data| data.create_task(title, description, due, importance, category_id))
-        {
+        let task = match self.update_store(|data| {
+            let task = data.create_task(title, description, due, importance, category_id)?;
+            data.set_task_labels(&task.id, label_ids)
+        }) {
             Ok(task) => task,
             Err(error) => {
                 let message = error.to_string();
@@ -1697,6 +1752,7 @@ impl App {
                 importance: (draft.importance != base.importance).then_some(draft.importance),
                 category_id: (draft.category_id != base.category_id)
                     .then(|| draft.category_id.clone()),
+                label_ids: (draft.label_ids != base.label_ids).then(|| draft.label_ids.clone()),
                 ..TaskPatch::default()
             },
             None => TaskPatch {
@@ -1705,6 +1761,7 @@ impl App {
                 due: Some(due),
                 importance: Some(draft.importance),
                 category_id: Some(draft.category_id.clone()),
+                label_ids: Some(draft.label_ids.clone()),
                 ..TaskPatch::default()
             },
         };
@@ -1941,6 +1998,143 @@ impl App {
                 false
             }
         }
+    }
+
+    // --------------------------------------------------------------- labels
+
+    pub fn open_labels(&mut self) {
+        self.labels_return_to_form = false;
+        self.open_labels_manager();
+    }
+
+    pub fn open_labels_from_form(&mut self) {
+        if let Some(form) = &mut self.form {
+            form.close_label_picker();
+        }
+        self.labels_return_to_form = true;
+        self.open_labels_manager();
+    }
+
+    fn open_labels_manager(&mut self) {
+        self.mode = Mode::Labels;
+        self.label_index = self.label_index.min(self.labels.len().saturating_sub(1));
+        self.label_input = None;
+        self.label_error = None;
+        self.cancel_pending();
+        self.dirty = true;
+    }
+
+    pub fn close_labels(&mut self) {
+        if self.labels_return_to_form && self.form.is_some() {
+            if let Some(form) = &mut self.form {
+                form.refresh_labels(&self.labels);
+            }
+            self.mode = Mode::TaskForm;
+        } else {
+            self.mode = Mode::Normal;
+        }
+        self.labels_return_to_form = false;
+        self.label_input = None;
+        self.label_error = None;
+        self.cancel_pending();
+        self.dirty = true;
+    }
+
+    pub fn move_label_selection(&mut self, delta: isize) {
+        if self.labels.is_empty() {
+            return;
+        }
+        let last = self.labels.len() - 1;
+        self.label_index = (self.label_index as isize + delta).clamp(0, last as isize) as usize;
+        self.cancel_pending();
+        self.dirty = true;
+    }
+
+    pub fn begin_new_label(&mut self) {
+        if self.labels.len() >= MAX_LABEL_COUNT {
+            self.label_error = Some(format!("At most {MAX_LABEL_COUNT} labels"));
+            return;
+        }
+        self.label_input = Some((None, TextInput::new("", MAX_LABEL_NAME_LEN)));
+        self.label_error = None;
+        self.cancel_pending();
+    }
+
+    pub fn begin_rename_label(&mut self) {
+        let Some(label) = self.labels.get(self.label_index) else {
+            return;
+        };
+        self.label_input = Some((
+            Some(label.id.clone()),
+            TextInput::new(&label.name, MAX_LABEL_NAME_LEN),
+        ));
+        self.label_error = None;
+        self.cancel_pending();
+    }
+
+    pub fn cancel_label_input(&mut self) {
+        self.label_input = None;
+        self.label_error = None;
+        self.dirty = true;
+    }
+
+    pub fn submit_label_input(&mut self) {
+        let Some((editing, input)) = &self.label_input else {
+            return;
+        };
+        let editing = editing.clone();
+        let name = input.value();
+        let result = match editing {
+            Some(id) => self.update_store(|data| data.edit_label(&id, name)),
+            None => self.update_store(|data| data.create_label(name)),
+        };
+        match result {
+            Ok(label) => {
+                self.label_index = self
+                    .labels
+                    .iter()
+                    .position(|item| item.id == label.id)
+                    .unwrap_or_default();
+                self.label_input = None;
+                self.label_error = None;
+            }
+            Err(error) => {
+                self.label_error = Some(error.to_string());
+                self.dirty = true;
+            }
+        }
+    }
+
+    pub fn selected_label(&self) -> Option<&Label> {
+        self.labels.get(self.label_index)
+    }
+
+    pub fn delete_label_by_id(&mut self, id: &str) -> bool {
+        let id = id.to_string();
+        match self.update_store(|data| data.delete_label(&id)) {
+            Ok(_) => {
+                self.label_index = self.label_index.min(self.labels.len().saturating_sub(1));
+                self.cancel_pending();
+                true
+            }
+            Err(error) => {
+                self.report_store_error("Could not delete label", error);
+                false
+            }
+        }
+    }
+
+    pub fn create_label(&mut self, name: &str) -> Result<String, String> {
+        self.update_store(|data| data.create_label(name))
+            .map(|label| label.id)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn set_task_labels(&mut self, task_id: &str, label_ids: Vec<String>) -> Result<(), String> {
+        let id = task_id.to_string();
+        self.update_store(|data| data.set_task_labels(&id, label_ids))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     /// Reorder real categories while keeping the virtual All Tasks row fixed.
@@ -2235,6 +2429,15 @@ fn description_contains(task: &Task, query: &str) -> bool {
         | crate::model::Block::Number { text }
         | crate::model::Block::Link { url: text } => contains_ignore_case(text, query),
         crate::model::Block::Image { .. } => false,
+    })
+}
+
+fn task_labels_contain(task: &Task, labels: &[Label], query: &str) -> bool {
+    task.label_ids.iter().any(|id| {
+        labels
+            .iter()
+            .find(|label| label.id == *id)
+            .is_some_and(|label| contains_ignore_case(&label.name, query))
     })
 }
 

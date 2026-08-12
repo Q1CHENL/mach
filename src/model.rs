@@ -21,6 +21,9 @@ pub const MAX_CATEGORY_NAME_LEN: usize = 64;
 pub const MAX_CATEGORY_DESC_LINE_LEN: usize = 256;
 pub const MAX_CATEGORY_DESC_LINES: usize = 64;
 pub const MAX_CATEGORY_COUNT: usize = 128;
+pub const MAX_LABEL_COUNT: usize = 128;
+pub const MAX_LABELS_PER_TASK: usize = 32;
+pub const MAX_LABEL_NAME_LEN: usize = 64;
 
 /// Byte budget paired with a user-visible grapheme limit. This keeps a single
 /// grapheme with pathological combining sequences from bypassing every text
@@ -57,6 +60,9 @@ pub struct Task {
     /// Real category uuid, or `None` if uncategorized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category_id: Option<String>,
+    /// Stable label identities in the store's canonical label order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub label_ids: Vec<String>,
 }
 
 impl Task {
@@ -70,6 +76,7 @@ impl Task {
             done: false,
             importance: importance.min(MAX_IMPORTANCE),
             category_id,
+            label_ids: Vec::new(),
         }
     }
 }
@@ -190,6 +197,21 @@ impl Category {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Label {
+    pub id: String,
+    pub name: String,
+}
+
+impl Label {
+    pub fn new(name: &str) -> Self {
+        Self {
+            id: new_uuid(),
+            name: name.to_string(),
+        }
+    }
+}
+
 pub fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -204,6 +226,11 @@ pub const fn next_importance(importance: u8) -> u8 {
 
 /// Unicode-normalized, case-folded identity for category names.
 pub fn category_name_key(value: &str) -> String {
+    caseless_key(value.trim())
+}
+
+/// Unicode-normalized, case-folded identity for label names.
+pub fn label_name_key(value: &str) -> String {
     caseless_key(value.trim())
 }
 

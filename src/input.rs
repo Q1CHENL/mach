@@ -6,7 +6,7 @@ use ratatui::crossterm::event::{
 
 use std::time::{Duration, Instant};
 
-use crate::app::{App, Confirm, Focus, Mode};
+use crate::app::{App, ClickTarget, Confirm, Focus, Mode};
 use crate::form::Field;
 use crate::text_input::TextInput;
 use crate::undo::EditKind;
@@ -61,7 +61,7 @@ fn paste_text(app: &mut App, text: &str) {
                     form.title.insert_str(text);
                 }
                 // Selectors are changed with arrows/clicks, not pasted text.
-                Field::Category | Field::Due | Field::Importance => {}
+                Field::Category | Field::Labels | Field::Due | Field::Importance => {}
                 Field::Description => {
                     form.before_edit(EditKind::Atomic);
                     form.description.insert_str(text);
@@ -87,6 +87,13 @@ fn paste_text(app: &mut App, text: &str) {
         Mode::Search => {
             app.input.insert_str(text);
             app.update_search();
+        }
+        Mode::Labels => {
+            if let Some((_, input)) = &mut app.label_input {
+                input.insert_str(text);
+                app.label_error = None;
+                app.dirty = true;
+            }
         }
         _ => {}
     }
@@ -327,6 +334,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             _ => {}
         },
         Mode::Settings => handle_settings_key(app, key),
+        Mode::Labels => handle_labels_key(app, key),
         Mode::TaskForm => handle_form_key(app, key),
         Mode::CategoryForm => handle_category_key(app, key),
         Mode::Slash => handle_slash_key(app, key),
@@ -337,7 +345,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
 fn confirmation_key_matches(confirm: &Confirm, key: KeyEvent, mode: Mode) -> bool {
     match confirm {
-        Confirm::DeleteTask(_) | Confirm::DeleteCategory(_) => key.code == KeyCode::Backspace,
+        Confirm::DeleteTask(_) | Confirm::DeleteCategory(_) | Confirm::DeleteLabel(_) => {
+            key.code == KeyCode::Backspace
+        }
         Confirm::Purge(_) => key.code == KeyCode::Enter && mode == Mode::Normal,
         Confirm::DiscardTask(_) | Confirm::DiscardCategory(_) => key.code == KeyCode::Esc,
         Confirm::Quit => is_ctrl_c(key),
@@ -401,7 +411,7 @@ fn selected_text_in_app(app: &App) -> Option<String> {
             match form.field {
                 Field::Title => form.title.selected_text(),
                 Field::Description => form.description.selected_text(),
-                Field::Category | Field::Due | Field::Importance => None,
+                Field::Category | Field::Labels | Field::Due | Field::Importance => None,
             }
         }
         Mode::CategoryForm => {
@@ -785,6 +795,7 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
             app.settings_index = 0;
             app.mode = Mode::Settings;
         }
+        SlashCommand::Labels => app.open_labels(),
         SlashCommand::Help => {
             app.help_scroll = 0;
             app.mode = Mode::Help;
@@ -850,8 +861,8 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
 
 // ------------------------------------------------------------ task dialog
 
-/// Tab and the mouse move between fields; Enter saves, except in the
-/// description where it starts a new block.
+/// Tab and the mouse move between fields. Ctrl+S saves; Enter acts on the
+/// focused field (and starts a new block in the description).
 fn handle_form_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -929,6 +940,15 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if app
+        .form
+        .as_ref()
+        .is_some_and(|form| form.label_picker_open())
+    {
+        handle_label_picker_key(app, key);
+        return;
+    }
+
     // Slash menu: Esc closes the menu only (not the whole dialog).
     if app
         .form
@@ -974,6 +994,7 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
             let Some(form) = &mut app.form else { return };
             match form.field {
                 Field::Title | Field::Category | Field::Importance => form.focus_next(),
+                Field::Labels => form.open_label_picker(),
                 Field::Due => form.open_due_picker(),
                 // On a picture there is nothing to type, so Enter is
                 // what opens it.
@@ -1018,6 +1039,11 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
                     KeyCode::Backspace | KeyCode::Delete => form.clear_category(),
                     _ => form.break_coalesce(),
                 },
+                Field::Labels => match key.code {
+                    KeyCode::Char(' ') => form.open_label_picker(),
+                    KeyCode::Backspace | KeyCode::Delete => form.clear_labels(),
+                    _ => form.break_coalesce(),
+                },
                 // Nothing to type here: the arrows and the digits set
                 // how many flags the task carries.
                 Field::Importance => match key.code {
@@ -1051,6 +1077,42 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
+    }
+}
+
+fn handle_label_picker_key(app: &mut App, key: KeyEvent) {
+    let manage = app
+        .form
+        .as_ref()
+        .is_some_and(|form| form.label_picker_manage_selected());
+    if manage && matches!(key.code, KeyCode::Esc) {
+        if let Some(form) = &mut app.form {
+            form.close_label_picker();
+        }
+        return;
+    }
+    if manage && matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+        app.open_labels_from_form();
+        return;
+    }
+    let Some(form) = &mut app.form else { return };
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => form.close_label_picker(),
+        KeyCode::Up => form.move_label_picker(-1),
+        KeyCode::Down | KeyCode::Tab => form.move_label_picker(1),
+        KeyCode::BackTab => form.move_label_picker(-1),
+        KeyCode::PageUp => form.move_label_picker(-8),
+        KeyCode::PageDown => form.move_label_picker(8),
+        KeyCode::Home => form.select_first_label(),
+        KeyCode::End => form.select_last_label(),
+        KeyCode::Char(' ') => {
+            if let Err(error) = form.toggle_current_label() {
+                form.error = Some(error.to_string());
+            } else {
+                form.error = None;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1656,6 +1718,117 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_labels_key(app: &mut App, key: KeyEvent) {
+    if app.label_input.is_some() {
+        match key.code {
+            KeyCode::Esc => app.cancel_label_input(),
+            KeyCode::Enter => app.submit_label_input(),
+            KeyCode::Char('s') | KeyCode::Char('S')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                app.submit_label_input()
+            }
+            _ => {
+                if let Some((_, input)) = &mut app.label_input {
+                    edit_line(input, key);
+                }
+                app.label_error = None;
+                app.dirty = true;
+            }
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => app.close_labels(),
+        KeyCode::Left => app.move_label_selection(-1),
+        KeyCode::Right => app.move_label_selection(1),
+        KeyCode::Up => move_label_selection_row(app, false),
+        KeyCode::Down => move_label_selection_row(app, true),
+        KeyCode::PageUp => app.move_label_selection(-10),
+        KeyCode::PageDown => app.move_label_selection(10),
+        KeyCode::Home => {
+            if app.label_index != 0 {
+                app.label_index = 0;
+                app.cancel_pending();
+                app.dirty = true;
+            }
+        }
+        KeyCode::End => {
+            let last = app.labels.len().saturating_sub(1);
+            if app.label_index != last {
+                app.label_index = last;
+                app.cancel_pending();
+                app.dirty = true;
+            }
+        }
+        KeyCode::Char('a') | KeyCode::Char('A')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.begin_new_label()
+        }
+        KeyCode::Enter => app.begin_rename_label(),
+        KeyCode::Backspace => {
+            let Some(label) = app.selected_label().cloned() else {
+                return;
+            };
+            let confirm = Confirm::DeleteLabel(label.id.clone());
+            if app.awaiting(confirm.clone()) {
+                if app.delete_label_by_id(&label.id) {
+                    app.info(format!("Label #{} deleted and unassigned", label.name));
+                }
+            } else {
+                app.ask_confirm(
+                    confirm,
+                    format!(
+                        "Press Backspace again to delete #{} and remove it from every task",
+                        label.name
+                    ),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn move_label_selection_row(app: &mut App, down: bool) {
+    let Some((_, selected)) = app
+        .areas
+        .label_hits
+        .iter()
+        .find(|(index, _)| *index == app.label_index)
+        .copied()
+    else {
+        app.move_label_selection(if down { 1 } else { -1 });
+        return;
+    };
+    let selected_center = selected.x.saturating_add(selected.width / 2);
+    let candidate = app
+        .areas
+        .label_hits
+        .iter()
+        .filter(|(_, rect)| {
+            if down {
+                rect.y > selected.y
+            } else {
+                rect.y < selected.y
+            }
+        })
+        .min_by_key(|(_, rect)| {
+            let row_distance = selected.y.abs_diff(rect.y);
+            let center = rect.x.saturating_add(rect.width / 2);
+            (row_distance, selected_center.abs_diff(center))
+        })
+        .map(|(index, _)| *index);
+    if let Some(index) = candidate {
+        app.label_index = index;
+        app.cancel_pending();
+        app.dirty = true;
+    } else {
+        app.move_label_selection(if down { 1 } else { -1 });
+    }
+}
+
 #[derive(Clone, Copy)]
 enum FormCloseSource {
     Escape,
@@ -1713,6 +1886,10 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
     app.cancel_pending();
     if app.mode == Mode::Slash {
         handle_slash_mouse(app, m);
+        return;
+    }
+    if app.mode == Mode::Labels {
+        handle_labels_mouse(app, m);
         return;
     }
     if app.mode == Mode::TaskForm {
@@ -1813,7 +1990,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     return;
                 }
                 app.select_category(row);
-                if clicked_again(app, Focus::Sidebar, row) {
+                if clicked_again(app, ClickTarget::Sidebar, row) {
                     app.open_edit_category();
                 }
             } else if contains(tasks, x, y) {
@@ -1839,7 +2016,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     // Anywhere else selects, and selecting twice in
                     // quick succession opens the task.
                     app.select_task(row);
-                    if clicked_again(app, Focus::Tasks, row) {
+                    if clicked_again(app, ClickTarget::Tasks, row) {
                         app.open_edit_task();
                     }
                 }
@@ -1850,6 +2027,26 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             }
         }
         _ => {}
+    }
+}
+
+fn handle_labels_mouse(app: &mut App, mouse: MouseEvent) {
+    if app.label_input.is_some() || mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+    let Some(row) = app
+        .areas
+        .label_hits
+        .iter()
+        .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+        .map(|(index, _)| *index)
+    else {
+        return;
+    };
+    app.label_index = row;
+    app.dirty = true;
+    if clicked_again(app, ClickTarget::Labels, row) {
+        app.begin_rename_label();
     }
 }
 
@@ -1935,6 +2132,12 @@ fn click_on_panels(app: &App, m: MouseEvent) -> bool {
             return false;
         }
         if form
+            .label_picker_area()
+            .is_some_and(|area| contains(area, x, y))
+        {
+            return false;
+        }
+        if form
             .description_menu_area
             .is_some_and(|r| contains(r, x, y))
         {
@@ -1960,6 +2163,25 @@ fn click_on_panels(app: &App, m: MouseEvent) -> bool {
 /// a picture opens it, same as Enter. The due picker also takes clicks
 /// and scroll.
 fn handle_form_mouse(app: &mut App, m: MouseEvent) {
+    // The label picker owns wheel movement while the pointer is over it.
+    if matches!(
+        m.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) && app.form.as_ref().is_some_and(|form| {
+        form.label_picker_area()
+            .is_some_and(|area| contains(area, m.column, m.row))
+    }) {
+        let delta = if m.kind == MouseEventKind::ScrollUp {
+            -1
+        } else {
+            1
+        };
+        if let Some(form) = &mut app.form {
+            form.move_label_picker(delta);
+        }
+        return;
+    }
+
     // Scroll over the open date/time picker.
     if matches!(
         m.kind,
@@ -2004,6 +2226,46 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
             form.preview_click();
         }
         return;
+    }
+
+    // Consume picker chrome so re-clicking Labels cannot dismiss and
+    // immediately reopen the overlay.
+    if app
+        .form
+        .as_ref()
+        .is_some_and(|form| form.label_picker_open())
+    {
+        let inside = app.form.as_ref().is_some_and(|form| {
+            form.label_picker_area()
+                .is_some_and(|area| contains(area, m.column, m.row))
+        });
+        if inside {
+            let row = app
+                .form
+                .as_ref()
+                .and_then(|form| form.label_picker_row_at(m.column, m.row));
+            if let Some(index) = row {
+                let manage = if let Some(form) = &mut app.form {
+                    form.select_label_picker(index);
+                    form.label_picker_manage_selected()
+                } else {
+                    false
+                };
+                if manage {
+                    app.open_labels_from_form();
+                } else if let Some(form) = &mut app.form {
+                    if let Err(error) = form.toggle_current_label() {
+                        form.error = Some(error.to_string());
+                    } else {
+                        form.error = None;
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(form) = &mut app.form {
+            form.close_label_picker();
+        }
     }
 
     // Clicks on the date/time picker (days, hour, minute).
@@ -2073,6 +2335,10 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
             }
             Field::Category => {
                 form.cycle_category(1);
+                AfterClick::None
+            }
+            Field::Labels => {
+                form.open_label_picker();
                 AfterClick::None
             }
             Field::Description => {
@@ -2210,12 +2476,12 @@ fn click_form_slash_menu(app: &mut App, form_kind: OpenForm, x: u16, y: u16) -> 
 
 /// Whether this click lands on the row the last one did, soon enough to
 /// count as a double click. Records the click either way.
-fn clicked_again(app: &mut App, panel: Focus, row: usize) -> bool {
+fn clicked_again(app: &mut App, target: ClickTarget, row: usize) -> bool {
     let now = Instant::now();
-    let again = app.last_click.is_some_and(|(at, last_panel, last_row)| {
-        last_panel == panel && last_row == row && now.duration_since(at) < DOUBLE_CLICK
+    let again = app.last_click.is_some_and(|(at, last_target, last_row)| {
+        last_target == target && last_row == row && now.duration_since(at) < DOUBLE_CLICK
     });
-    app.last_click = (!again).then_some((now, panel, row));
+    app.last_click = (!again).then_some((now, target, row));
     again
 }
 

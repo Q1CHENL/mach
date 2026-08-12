@@ -2,8 +2,8 @@
 
 A terminal-first task manager for people who live in the shell and work with agents.
 
-Categories, due dates, subtasks, inline images, and a CLI that scripts or
-agents can drive.
+Categories, reusable labels, due dates, subtasks, inline images, and a CLI that
+scripts or agents can drive.
 
 ![Main screen](assets/screenshot.png)
 
@@ -26,9 +26,9 @@ Crate name **`mach-tui`**, binary **`mach`**.
 
 ## CLI
 
-`mach` with no args opens the TUI. Subcommands cover add / list / edit /
-done / delete / categories / subtasks and more, with flags for due dates,
-importance, category, description markup, and `--json` for scripts.
+`mach` with no args opens the TUI. Subcommands cover add / list / edit / done /
+delete / categories / labels / subtasks and more, with flags for due dates,
+importance, categories, labels, description markup, and `--json` for scripts.
 
 ```sh
 mach --help
@@ -37,8 +37,19 @@ mach --help
 Agents work well against the same CLI — stable flags, unique ID prefixes,
 and JSON output when you need it.
 
-Export every task, category and referenced image to one portable archive, then
-safely merge it into another mach data directory:
+Labels are global and reusable. Create them explicitly, assign multiple labels
+to a task, and repeat `--label` to require every named label when listing:
+
+```sh
+mach labels add bug
+mach labels add backend
+mach add "Fix retry handling" --label bug --label backend
+mach list --label bug --label backend --open
+mach edit TASK_ID --remove-label bug --add-label release
+```
+
+Export every task, category, label and referenced image to one portable archive,
+then safely merge it into another mach data directory:
 
 ```sh
 mach export tasks.mach
@@ -49,9 +60,9 @@ The TUI uses `/export` to create a timestamped `.mach` archive in the current
 directory and `/import <FILE>` to restore a specified archive. The CLI also
 accepts `mach export [FILE]`; without a file it uses the current directory.
 Export never overwrites an existing file.
-Re-importing identical records is a no-op. An ID, category-name or attachment
-metadata conflict aborts the whole merge before tasks, categories or attachment
-records change.
+Re-importing identical records is a no-op. An ID, category-name, label-name or
+attachment metadata conflict aborts the whole merge before tasks, categories or
+attachment records change.
 
 The TUI checks in the background, including while it stays open. A successful
 check schedules the next one 24 hours later. Failed checks retry after an hour
@@ -65,9 +76,9 @@ intentionally want to replace one with a release binary.
 
 ## Data
 
-Lives in **`~/.mach`**: tasks and settings in SQLite (`mach.db`), with managed
-images under `images/`. The CLI and TUI safely share the same store, and changes
-appear in the running app.
+Lives in **`~/.mach`**: tasks, categories, labels and settings in SQLite
+(`mach.db`), with managed images under `images/`. The CLI and TUI safely share
+the same store, and changes appear in the running app.
 
 Existing JSON data is imported automatically on first launch and left
 untouched. Back up the whole directory while mach is closed.

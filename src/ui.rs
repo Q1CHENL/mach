@@ -115,6 +115,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::Help => draw_help(f, app, &theme, area),
         Mode::Settings => draw_settings(f, app, &theme, area),
+        Mode::Labels => draw_labels(f, app, &theme, area),
         Mode::Welcome => draw_welcome(f, app, &theme, area),
         Mode::WhatsNew => draw_whats_new(f, &theme, area),
         Mode::CategoryForm => draw_category_form(f, app, &theme, area),
@@ -175,7 +176,7 @@ fn split_preview_right(right: Rect) -> Option<(Rect, Rect)> {
 // --------------------------------------------------------- task dialog
 
 const TASK_FORM_WIDE_CHROME: u16 = 9;
-const TASK_FORM_COMPACT_CHROME: u16 = 15;
+const TASK_FORM_COMPACT_CHROME: u16 = 18;
 const TASK_FORM_MIN_DESCRIPTION_HEIGHT: u16 = 3;
 const TASK_FORM_WIDE_MIN_WIDTH: u16 = 56;
 
@@ -210,7 +211,7 @@ fn docked_task_form_layout(area: Rect) -> Option<TaskFormLayout> {
     }
 }
 
-/// Title, category/due/flags metadata, then the description: a free stack of prose,
+/// Title, category/labels/due/flags metadata, then the description: a free stack of prose,
 /// to-dos and pictures with a `/` menu for making new ones.
 ///
 /// Docked layouts fill the permanent task preview pane. The modal layout is
@@ -253,9 +254,10 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
     f.render_widget(Clear, rect);
     f.render_widget(block, rect);
 
-    let (title_box, category_box, due_box, importance_box, description_box, hint) =
+    let (title_box, category_box, labels_box, due_box, importance_box, description_box, hint) =
         if layout.is_compact() {
-            let [title, category, due, importance, description, hint] = Layout::vertical([
+            let [title, category, labels, due, importance, description, hint] = Layout::vertical([
+                Constraint::Length(3),
                 Constraint::Length(3),
                 Constraint::Length(3),
                 Constraint::Length(3),
@@ -264,7 +266,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
                 Constraint::Length(1),
             ])
             .areas(inner);
-            (title, category, due, importance, description, hint)
+            (title, category, labels, due, importance, description, hint)
         } else {
             let [title, metadata, description, hint] = Layout::vertical([
                 Constraint::Length(3),
@@ -273,16 +275,17 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
                 Constraint::Length(1),
             ])
             .areas(inner);
-            // Category takes the rest; Due fits a formatted date+time;
-            // Flags fits ⚑⚑⚑.
-            let [category, due, importance] = Layout::horizontal([
+            // Category and labels share the flexible space; Due fits a
+            // formatted date+time and Flags fits ⚑⚑⚑.
+            let [category, labels, due, importance] = Layout::horizontal([
+                Constraint::Fill(1),
                 Constraint::Fill(1),
                 Constraint::Length(20),
                 Constraint::Length(9),
             ])
             .spacing(1)
             .areas(metadata);
-            (title, category, due, importance, description, hint)
+            (title, category, labels, due, importance, description, hint)
         };
 
     // --- title ----------------------------------------------------------
@@ -311,6 +314,26 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
         Paragraph::new(truncate(&category, box_inner.width as usize)),
         box_inner,
     );
+
+    // --- labels ---------------------------------------------------------
+    // The field is a summary; Enter opens the complete bounded picker.
+    let focused = form.field == Field::Labels;
+    let box_inner = render_field_box(f, field_block("Labels", focused, None, theme), labels_box);
+    form.areas.labels = labels_box;
+    let labels = form
+        .selected_label_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        render_or_placeholder(f, box_inner, "", "↵ choose", theme);
+    } else {
+        let shown = compact_label_tokens(&labels, box_inner.width as usize);
+        f.render_widget(
+            Paragraph::new(label_badges_line(&shown, theme.label_badge(false))),
+            box_inner,
+        );
+    }
 
     // --- due -------------------------------------------------------------
     // Picker-only: show the value, no text cursor (Enter / click opens UI).
@@ -385,6 +408,9 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
     if let Some(picker) = form.picker.as_mut() {
         draw_due_picker(f, theme, picker, form.areas.due, overlay);
     }
+    if form.label_picker_open() {
+        draw_label_picker(f, theme, form, form.areas.labels, overlay);
+    }
 
     // Preview the picture the cursor is on, or the first one otherwise.
     if form.preview
@@ -425,6 +451,12 @@ fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         })
         .collect();
     let todo = crate::model::todo_progress(&task);
+    let label_names = app
+        .labels
+        .iter()
+        .filter(|label| task.label_ids.contains(&label.id))
+        .map(|label| label.name.clone())
+        .collect::<Vec<_>>();
     let title = task.title;
     let done = task.done;
     let due_s = due::display(&task.due, &app.settings.date_format);
@@ -460,18 +492,17 @@ fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         Style::new().add_modifier(Modifier::BOLD)
     };
 
-    let (title_row, meta_row, description_area) = if meta.is_empty() {
-        let [t, b] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
-        (t, None, b)
-    } else {
-        let [t, m, b] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-        ])
-        .areas(inner);
-        (t, Some(m), b)
-    };
+    let label_lines =
+        wrapped_label_badges(&label_names, inner.width as usize, theme.label_badge(done));
+    let label_height = u16::try_from(label_lines.len()).unwrap_or(u16::MAX);
+    let meta_height = u16::from(!meta.is_empty());
+    let [title_row, meta_row, labels_area, description_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(meta_height),
+        Constraint::Length(label_height),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
 
     f.render_widget(
         Paragraph::new(Line::styled(
@@ -480,7 +511,7 @@ fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         )),
         title_row,
     );
-    if let Some(meta_row) = meta_row {
+    if meta_height > 0 {
         f.render_widget(
             Paragraph::new(Line::styled(
                 truncate(&meta, meta_row.width as usize),
@@ -488,6 +519,9 @@ fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             )),
             meta_row,
         );
+    }
+    if label_height > 0 {
+        f.render_widget(Paragraph::new(label_lines), labels_area);
     }
 
     if description_area.height == 0 {
@@ -1194,6 +1228,114 @@ fn draw_due_picker(
     };
 }
 
+/// Bounded, scrolling task-label selector. Selection changes remain in the
+/// task draft; dismissing the overlay does not save the form.
+fn draw_label_picker(
+    f: &mut Frame,
+    theme: &Theme,
+    form: &mut crate::form::TaskForm,
+    field: Rect,
+    area: Rect,
+) {
+    let choices = form
+        .label_choices()
+        .map(|(_, name, selected)| (name.to_string(), selected))
+        .collect::<Vec<_>>();
+    let total_rows = choices.len().saturating_add(1);
+    let selected = form
+        .label_picker
+        .as_ref()
+        .map(|picker| picker.index)
+        .unwrap_or_default()
+        .min(total_rows.saturating_sub(1));
+    let desired_rows = total_rows.clamp(1, 8) as u16;
+    let desired_height = desired_rows.saturating_add(2).min(area.height);
+    let width = field.width.min(area.width);
+    let below = field.bottom();
+    let below_space = area.bottom().saturating_sub(below);
+    let above_space = field.y.saturating_sub(area.y);
+    let place_below = below_space >= 3 || below_space >= above_space;
+    let available_height = if place_below {
+        below_space
+    } else {
+        above_space
+    };
+    let height = desired_height.min(available_height);
+    let rect = Rect {
+        x: field.x.min(area.right().saturating_sub(width)),
+        y: if place_below {
+            below
+        } else {
+            field.y.saturating_sub(height)
+        },
+        width,
+        height,
+    };
+    let footer = if let Some(error) = &form.error {
+        Line::styled(
+            format!(" {} ", truncate(error, width.saturating_sub(4) as usize)),
+            Style::new()
+                .fg(theme.error_color())
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Line::styled(" Space toggle ", Style::new().fg(theme.muted_color()))
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text())
+        .title_bottom(footer.right_aligned());
+    let inner = block.inner(rect);
+    let visible = inner.height as usize;
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(total_rows.saturating_sub(visible));
+    form.set_label_picker_layout(rect, start);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let row_width = inner.width as usize;
+    let lines = (start..total_rows)
+        .take(visible)
+        .map(|index| {
+            let mut line = if let Some((name, checked)) = choices.get(index) {
+                let marker = if *checked { "[✓]" } else { "[ ]" };
+                let name = truncate(name, row_width.saturating_sub(6));
+                let used = marker.width().saturating_add(1 + name.width());
+                Line::from(vec![
+                    Span::raw(format!("{marker} ")),
+                    Span::raw(name),
+                    Span::raw(" ".repeat(row_width.saturating_sub(used))),
+                ])
+            } else {
+                let available = row_width.saturating_sub(4);
+                let label = if "Manage labels ↵".width() <= available {
+                    "Manage labels ↵"
+                } else {
+                    "Manage ↵"
+                };
+                let content = truncate(label, available);
+                let padding = " ".repeat(row_width.saturating_sub(4 + content.width()));
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::raw(content),
+                    Span::raw(padding),
+                ])
+            };
+            if index == selected {
+                line = line.style(theme.selection());
+            }
+            line
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(lines), inner);
+    paint_scrollbar(f, theme, rect, total_rows, visible, start, true, 1);
+}
+
 /// A description image at whatever size the screen allows.
 fn draw_image_preview(
     f: &mut Frame,
@@ -1460,6 +1602,56 @@ fn render_or_placeholder(f: &mut Frame, area: Rect, text: &str, placeholder: &st
     f.render_widget(Paragraph::new(line), area);
 }
 
+fn label_badges_width(labels: &[String]) -> usize {
+    labels
+        .iter()
+        .map(|label| label.width().saturating_add(2))
+        .sum::<usize>()
+        .saturating_add(labels.len().saturating_sub(1))
+}
+
+fn label_badges_spans(labels: &[String], style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(labels.len().saturating_mul(2));
+    for (index, label) in labels.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(format!(" {label} "), style));
+    }
+    spans
+}
+
+fn label_badges_line(labels: &[String], style: Style) -> Line<'static> {
+    Line::from(label_badges_spans(labels, style))
+}
+
+fn wrapped_label_badges(labels: &[String], width: usize, style: Style) -> Vec<Line<'static>> {
+    if labels.is_empty() || width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut row = Vec::new();
+    let mut row_width = 0usize;
+    for label in labels {
+        let name = truncate(label, width.saturating_sub(2));
+        let badge_width = name.width().saturating_add(2);
+        let gap = usize::from(!row.is_empty());
+        if !row.is_empty() && row_width.saturating_add(gap + badge_width) > width {
+            lines.push(label_badges_line(&row, style));
+            row.clear();
+            row_width = 0;
+        }
+        row_width = row_width
+            .saturating_add(usize::from(!row.is_empty()))
+            .saturating_add(badge_width);
+        row.push(name);
+    }
+    if !row.is_empty() {
+        lines.push(label_badges_line(&row, style));
+    }
+    lines
+}
+
 fn draw_text_input(
     f: &mut Frame,
     input: &mut crate::text_input::TextInput,
@@ -1683,9 +1875,15 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             crate::app::TaskListRow::Task(view_idx) => {
                 let task = &app.tasks[app.view[*view_idx]];
                 task_row(
-                    TaskPresentation::new(task, &app.settings.date_format, today),
+                    TaskPresentation::new(task, &app.labels, &app.settings.date_format, today),
                     theme,
-                    *view_idx == app.task_index,
+                    (*view_idx == app.task_index).then(|| {
+                        if chrome_focus {
+                            theme.selection()
+                        } else {
+                            theme.selection_unfocused()
+                        }
+                    }),
                     content_width,
                     flags_visible,
                 )
@@ -1693,14 +1891,7 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         })
         .collect();
     // Selected-row wash stays on during edit; bold only when the list has chrome focus.
-    let table = Table::new(rows, widths)
-        .block(block)
-        .column_spacing(1)
-        .row_highlight_style(if chrome_focus {
-            theme.selection()
-        } else {
-            theme.selection_unfocused()
-        });
+    let table = Table::new(rows, widths).block(block).column_spacing(1);
 
     // Remember where the markers ended up, so a click can find them. The
     // flags sit at the right edge, the tick at the left.
@@ -1799,6 +1990,7 @@ fn extras(task: &crate::model::Task) -> String {
 /// Owned display data derived once for one task during a frame.
 struct TaskPresentation<'a> {
     title: &'a str,
+    labels: Vec<String>,
     extras: String,
     due: String,
     flags: String,
@@ -1806,9 +1998,19 @@ struct TaskPresentation<'a> {
 }
 
 impl<'a> TaskPresentation<'a> {
-    fn new(task: &'a crate::model::Task, date_format: &str, today: chrono::NaiveDate) -> Self {
+    fn new(
+        task: &'a crate::model::Task,
+        labels: &[crate::model::Label],
+        date_format: &str,
+        today: chrono::NaiveDate,
+    ) -> Self {
         Self {
             title: &task.title,
+            labels: labels
+                .iter()
+                .filter(|label| task.label_ids.contains(&label.id))
+                .map(|label| label.name.clone())
+                .collect(),
             extras: extras(task),
             due: due::display_compact_at(&task.due, date_format, today),
             flags: crate::model::importance_marks(task.importance),
@@ -1842,17 +2044,12 @@ fn category_rule(title: &str, width: usize, title_x: usize) -> String {
 fn task_row(
     presentation: TaskPresentation<'_>,
     theme: &Theme,
-    selected: bool,
+    selection: Option<Style>,
     content_width: usize,
     flags_visible: bool,
 ) -> Row<'static> {
-    let TaskPresentation {
-        title,
-        extras,
-        due,
-        flags,
-        done,
-    } = presentation;
+    let done = presentation.done;
+    let selected = selection.is_some();
     // A finished task is muted — but not on the selected row (even when
     // Categories has focus), where the tick and strikethrough say enough.
     // Due colour belongs to the due label rather than tinting the whole title.
@@ -1886,13 +2083,19 @@ fn task_row(
     } else {
         Style::new().fg(theme.accent)
     };
+    let labels_style = if done {
+        theme.label_badge(true)
+    } else {
+        theme.label_badge(false)
+    };
     cells.push(Cell::new(task_content_line(
-        title,
-        title_style,
-        extras,
-        metadata_style,
-        due,
-        due_style,
+        &presentation,
+        TaskContentStyles {
+            title: title_style,
+            labels: labels_style,
+            extras: metadata_style,
+            due: due_style,
+        },
         content_width,
     )));
     if flags_visible {
@@ -1902,41 +2105,65 @@ fn task_row(
             Style::new().fg(theme.error_color())
         };
         cells.push(Cell::new(Text::from(
-            Line::from(Span::styled(flags, flag_style)).right_aligned(),
+            Line::from(Span::styled(presentation.flags, flag_style)).right_aligned(),
         )));
     }
-    Row::new(cells)
+    let row = Row::new(cells);
+    if let Some(style) = selection {
+        row.style(style)
+    } else {
+        row
+    }
 }
 
 /// Build one task's content cell with row-local metadata at its right edge.
-/// Due is the highest-priority suffix; description/progress markers join it only when
-/// both complete values fit while retaining a recognisable title.
+/// Due is the highest-priority suffix. Labels then use whole tokens and a
+/// `+N` remainder; description/progress joins only when every value fits
+/// while retaining a recognisable title.
+#[derive(Clone, Copy)]
+struct TaskContentStyles {
+    title: Style,
+    labels: Style,
+    extras: Style,
+    due: Style,
+}
+
 fn task_content_line(
-    title: &str,
-    title_style: Style,
-    extras: String,
-    extras_style: Style,
-    due: String,
-    due_style: Style,
+    presentation: &TaskPresentation<'_>,
+    styles: TaskContentStyles,
     width: usize,
 ) -> Line<'static> {
     const TITLE_MIN: usize = 8;
     const META_GAP: usize = 1;
 
-    let title_floor = title.width().min(TITLE_MIN);
+    let title_floor = presentation.title.width().min(TITLE_MIN);
     let mut show_due = false;
     let mut show_extras = false;
+    let mut shown_labels = Vec::new();
     let mut metadata_width = 0;
 
-    if !due.is_empty() && title_floor + META_GAP + due.width() <= width {
+    if !presentation.due.is_empty() && title_floor + META_GAP + presentation.due.width() <= width {
         show_due = true;
-        metadata_width = due.width();
+        metadata_width = presentation.due.width();
     }
-    if !extras.is_empty() {
+
+    if !presentation.labels.is_empty() {
+        let reserved = title_floor
+            .saturating_add(META_GAP)
+            .saturating_add(metadata_width)
+            .saturating_add(usize::from(metadata_width > 0));
+        shown_labels = compact_label_tokens(&presentation.labels, width.saturating_sub(reserved));
+        if !shown_labels.is_empty() {
+            metadata_width = metadata_width
+                .saturating_add(usize::from(metadata_width > 0))
+                .saturating_add(label_badges_width(&shown_labels));
+        }
+    }
+    if !presentation.extras.is_empty() {
         let joined_width = if metadata_width == 0 {
-            extras.width()
+            presentation.extras.width()
         } else {
-            extras.width() + META_GAP + metadata_width
+            presentation.extras.width() + META_GAP + metadata_width
         };
         if title_floor + META_GAP + joined_width <= width {
             show_extras = true;
@@ -1945,26 +2172,49 @@ fn task_content_line(
     }
 
     if metadata_width == 0 {
-        return Line::from(Span::styled(truncate(title, width), title_style));
+        return Line::from(Span::styled(
+            truncate(presentation.title, width),
+            styles.title,
+        ));
     }
 
     let title_width = width.saturating_sub(META_GAP + metadata_width);
-    let title = truncate(title, title_width);
+    let title = truncate(presentation.title, title_width);
     let padding = width.saturating_sub(title.width() + metadata_width);
     let mut spans = vec![
-        Span::styled(title, title_style),
+        Span::styled(title, styles.title),
         Span::raw(" ".repeat(padding)),
     ];
+    if !shown_labels.is_empty() {
+        spans.extend(label_badges_spans(&shown_labels, styles.labels));
+        if show_extras || show_due {
+            spans.push(Span::raw(" "));
+        }
+    }
     if show_extras {
-        spans.push(Span::styled(extras, extras_style));
+        spans.push(Span::styled(presentation.extras.clone(), styles.extras));
         if show_due {
             spans.push(Span::raw(" "));
         }
     }
     if show_due {
-        spans.push(Span::styled(due, due_style));
+        spans.push(Span::styled(presentation.due.clone(), styles.due));
     }
     Line::from(spans)
+}
+
+fn compact_label_tokens(labels: &[String], width: usize) -> Vec<String> {
+    for shown in (0..=labels.len()).rev() {
+        let hidden = labels.len() - shown;
+        let mut parts = labels[..shown].to_vec();
+        if hidden > 0 {
+            parts.push(format!("+{hidden}"));
+        }
+        if label_badges_width(&parts) <= width {
+            return parts;
+        }
+    }
+    Vec::new()
 }
 
 // ------------------------------------------------------------ status bar
@@ -2128,7 +2378,13 @@ fn draw_slash_palette(f: &mut Frame, app: &mut App, theme: &Theme, status: Rect)
     if commands.is_empty() {
         return;
     }
-    let width = 53.min(status.width.saturating_sub(2)).max(24);
+    let desired_width = commands
+        .iter()
+        .map(|command| format!(" /{:<15}{} ", command.usage(), command.hint()).width() as u16)
+        .max()
+        .unwrap_or(22)
+        .saturating_add(3);
+    let width = desired_width.min(status.width.saturating_sub(2)).max(24);
     let height = u16::try_from(commands.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2)
@@ -2184,8 +2440,13 @@ fn dropdown_row(
     hint: &str,
     row_width: usize,
 ) -> Line<'static> {
-    let label_part = format!(" {label} ");
-    let hint_part = format!("{hint} ");
+    let label_part = truncate(&format!(" {label} "), row_width);
+    let hint_space = row_width.saturating_sub(label_part.width());
+    let hint_part = if hint_space == 0 {
+        String::new()
+    } else {
+        format!("{} ", truncate(hint, hint_space - 1))
+    };
     let used = label_part.width() + hint_part.width();
     let pad = " ".repeat(row_width.saturating_sub(used));
 
@@ -2340,6 +2601,147 @@ fn draw_settings(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         .padding(ratatui::widgets::Padding::horizontal(2));
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let editing = app.label_input.is_some();
+    let width = 48.min(area.width);
+    let content_width = width.saturating_sub(4);
+    let flow = label_flow_layout(&app.labels, content_width);
+    let flow_rows = flow.last().map_or(1, |(_, rect)| rect.y.saturating_add(1));
+    let desired_rows = flow_rows.clamp(3, 10);
+    let height = desired_rows
+        .saturating_add(if editing { 5 } else { 2 })
+        .min(area.height);
+    let rect = centered(area, width, height);
+    let hint = if let Some(error) = &app.label_error {
+        Line::styled(
+            format!(" {} ", truncate(error, width.saturating_sub(4) as usize)),
+            Style::new()
+                .fg(theme.error_color())
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if editing {
+        Line::styled(" Ctrl+S save ", Style::new().fg(theme.muted_color()))
+    } else {
+        Line::styled(
+            " Ctrl+A new · Backspace delete ",
+            Style::new().fg(theme.muted_color()),
+        )
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text())
+        .title(Span::styled(" Labels ", theme.accent_text().bold()))
+        .title_bottom(hint.right_aligned())
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let (list_area, input_area) = if editing {
+        let [list, input] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(inner);
+        (list, Some(input))
+    } else {
+        (inner, None)
+    };
+
+    if app.labels.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                "No labels yet",
+                Style::new().fg(theme.muted_color()),
+            )),
+            list_area,
+        );
+    } else {
+        let selected = app.label_index.min(app.labels.len() - 1);
+        let visible_rows = list_area.height;
+        let selected_row = flow.get(selected).map_or(0, |(_, badge)| badge.y);
+        let start_row = selected_row
+            .saturating_add(1)
+            .saturating_sub(visible_rows)
+            .min(flow_rows.saturating_sub(visible_rows));
+        for (index, (name, badge)) in flow.iter().enumerate() {
+            if badge.y < start_row || badge.y >= start_row.saturating_add(visible_rows) {
+                continue;
+            }
+            let screen = Rect {
+                x: list_area.x.saturating_add(badge.x),
+                y: list_area.y.saturating_add(badge.y - start_row),
+                width: badge.width,
+                height: 1,
+            };
+            app.areas.label_hits.push((index, screen));
+            let style = if index == selected {
+                theme.label_focus()
+            } else {
+                theme.label_badge(false)
+            };
+            f.render_widget(
+                Paragraph::new(Line::styled(format!(" {name} "), style)),
+                screen,
+            );
+        }
+        paint_scrollbar(
+            f,
+            theme,
+            rect,
+            flow_rows as usize,
+            visible_rows as usize,
+            start_row as usize,
+            true,
+            1,
+        );
+    }
+
+    if let Some(input_area) = input_area
+        && let Some((editing_id, input)) = &mut app.label_input
+    {
+        let label = if editing_id.is_some() {
+            "Rename label"
+        } else {
+            "New label"
+        };
+        let field = render_field_box(f, field_block(label, true, None, theme), input_area);
+        draw_text_input(f, input, field, "name without #", true, theme);
+    }
+}
+
+fn label_flow_layout(labels: &[crate::model::Label], width: u16) -> Vec<(String, Rect)> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut x: u16 = 0;
+    let mut y: u16 = 0;
+    labels
+        .iter()
+        .map(|label| {
+            let name = truncate(&label.name, width.saturating_sub(2) as usize);
+            let badge_width = u16::try_from(name.width())
+                .unwrap_or(u16::MAX)
+                .saturating_add(2)
+                .min(width);
+            if x > 0 && x.saturating_add(1).saturating_add(badge_width) > width {
+                x = 0;
+                y = y.saturating_add(1);
+            } else if x > 0 {
+                x = x.saturating_add(1);
+            }
+            let rect = Rect {
+                x,
+                y,
+                width: badge_width,
+                height: 1,
+            };
+            x = x.saturating_add(badge_width);
+            (name, rect)
+        })
+        .collect()
 }
 
 fn draw_welcome(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
