@@ -2,8 +2,6 @@
 
 use std::process::Command;
 
-use ratatui::Terminal;
-use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -15,10 +13,12 @@ use mach::form::{TaskDraft, TaskForm};
 use mach::input::handle_event;
 use mach::model::{Category, Task};
 use mach::store::Store;
-use mach::ui;
 
 mod common;
 use common::TempDir;
+#[path = "common/render.rs"]
+mod render_common;
+use render_common::draw;
 
 fn app() -> App {
     let mut store = Store::open_in_memory_with_paths(
@@ -57,12 +57,17 @@ fn app() -> App {
     app
 }
 
-fn file_app() -> (App, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("mach-keys-file-test-{}", uuid::Uuid::new_v4()));
-    let store = Store::open(&dir).unwrap();
+struct FileApp {
+    app: App,
+    dir: TempDir,
+}
+
+fn file_app() -> FileApp {
+    let dir = TempDir::new("keys-file-test");
+    let store = Store::open(dir.path()).unwrap();
     let mut app = App::with_store("test", store).unwrap();
     app.mode = Mode::Normal;
-    (app, dir)
+    FileApp { app, dir }
 }
 
 fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -91,13 +96,6 @@ fn release_click(app: &mut App, column: u16, row: u16) {
             modifiers: KeyModifiers::NONE,
         }),
     );
-}
-
-fn draw(app: &mut App, width: u16, height: u16) {
-    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
-    terminal
-        .draw(|frame| ui::draw(frame, app))
-        .expect("draw must not panic");
 }
 
 fn repeat(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -444,46 +442,42 @@ fn purge_names_the_count_and_requires_an_explicit_second_step() {
 
 #[test]
 fn slash_done_keeps_a_store_failure_visible() {
-    let (mut app, dir) = file_app();
-    let observer = rusqlite::Connection::open(dir.join("mach.db")).unwrap();
+    let mut fixture = file_app();
+    let observer = rusqlite::Connection::open(fixture.dir.path().join("mach.db")).unwrap();
     observer.execute("DELETE FROM app_state", []).unwrap();
 
-    press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+    press(&mut fixture.app, KeyCode::Char('/'), KeyModifiers::NONE);
     for c in "done".chars() {
-        press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        press(&mut fixture.app, KeyCode::Char(c), KeyModifiers::NONE);
     }
-    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut fixture.app, KeyCode::Enter, KeyModifiers::NONE);
 
     assert!(
-        message(&app).contains("Could not update settings"),
+        message(&fixture.app).contains("Could not update settings"),
         "the persistence error must not be replaced by a false success: {:?}",
-        message(&app)
+        message(&fixture.app)
     );
-    drop(observer);
-    drop(app);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn task_delete_keeps_a_store_failure_visible() {
-    let (mut app, dir) = file_app();
-    app.create_task(&mach::form::TaskDraft::new("keep me"))
+    let mut fixture = file_app();
+    fixture
+        .app
+        .create_task(&mach::form::TaskDraft::new("keep me"))
         .unwrap();
-    let observer = rusqlite::Connection::open(dir.join("mach.db")).unwrap();
+    let observer = rusqlite::Connection::open(fixture.dir.path().join("mach.db")).unwrap();
     observer.execute("DELETE FROM app_state", []).unwrap();
 
-    press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
-    press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut fixture.app, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut fixture.app, KeyCode::Backspace, KeyModifiers::NONE);
 
     assert!(
-        message(&app).contains("Could not delete task"),
+        message(&fixture.app).contains("Could not delete task"),
         "the persistence error must not be replaced by a false success: {:?}",
-        message(&app)
+        message(&fixture.app)
     );
-    assert!(app.tasks.iter().any(|task| task.title == "keep me"));
-    drop(observer);
-    drop(app);
-    let _ = std::fs::remove_dir_all(dir);
+    assert!(fixture.app.tasks.iter().any(|task| task.title == "keep me"));
 }
 
 // ----------------------------------------------------------- type-to-jump
@@ -582,15 +576,16 @@ fn slash_export_rejects_a_path_argument() {
 
 #[test]
 fn slash_import_uses_the_specified_archive_path() {
-    let (mut source, source_dir) = file_app();
+    let mut source = file_app();
     source
+        .app
         .create_task(&TaskDraft::new("portable from TUI"))
         .expect("create source task");
     let archive_dir = TempDir::new("keys-import-archive");
     let archive = archive_dir.path().join("tasks.mach");
     let exported = Command::new(env!("CARGO_BIN_EXE_mach"))
         .arg("--dir")
-        .arg(&source_dir)
+        .arg(source.dir.path())
         .arg("export")
         .arg(&archive)
         .output()
@@ -601,45 +596,45 @@ fn slash_import_uses_the_specified_archive_path() {
         String::from_utf8_lossy(&exported.stderr)
     );
 
-    let (mut destination, destination_dir) = file_app();
-    let lock = rusqlite::Connection::open(destination_dir.join("mach.db"))
+    let mut destination = file_app();
+    let lock = rusqlite::Connection::open(destination.dir.path().join("mach.db"))
         .expect("open destination database lock");
     lock.execute_batch("BEGIN IMMEDIATE")
         .expect("hold destination write lock");
-    press(&mut destination, KeyCode::Char('/'), KeyModifiers::NONE);
+    press(&mut destination.app, KeyCode::Char('/'), KeyModifiers::NONE);
     for character in format!("import {}", archive.display()).chars() {
         press(
-            &mut destination,
+            &mut destination.app,
             KeyCode::Char(character),
             KeyModifiers::NONE,
         );
     }
     let started = std::time::Instant::now();
-    press(&mut destination, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut destination.app, KeyCode::Enter, KeyModifiers::NONE);
     let elapsed = started.elapsed();
 
     assert!(
         elapsed < std::time::Duration::from_millis(500),
         "slash import blocked the input path for {elapsed:?}"
     );
-    press(&mut destination, KeyCode::Char('/'), KeyModifiers::NONE);
-    assert_eq!(destination.mode, Mode::Slash);
-    press(&mut destination, KeyCode::Esc, KeyModifiers::NONE);
+    press(&mut destination.app, KeyCode::Char('/'), KeyModifiers::NONE);
+    assert_eq!(destination.app.mode, Mode::Slash);
+    press(&mut destination.app, KeyCode::Esc, KeyModifiers::NONE);
     lock.execute_batch("ROLLBACK")
         .expect("release destination write lock");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while destination.tasks.is_empty() && std::time::Instant::now() < deadline {
-        destination.poll_external_changes();
+    while destination.app.tasks.is_empty() && std::time::Instant::now() < deadline {
+        destination.app.poll_external_changes();
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert_eq!(destination.tasks.len(), 1, "{}", message(&destination));
-    assert_eq!(destination.tasks[0].title, "portable from TUI");
-
-    drop(source);
-    drop(destination);
-    let _ = std::fs::remove_dir_all(source_dir);
-    let _ = std::fs::remove_dir_all(destination_dir);
+    assert_eq!(
+        destination.app.tasks.len(),
+        1,
+        "{}",
+        message(&destination.app)
+    );
+    assert_eq!(destination.app.tasks[0].title, "portable from TUI");
 }
 
 #[test]
@@ -891,19 +886,27 @@ fn image_preview_owns_undo_keys_until_it_is_closed() {
 
 #[test]
 fn image_preview_owns_clicks_over_the_underlying_panels() {
-    let (mut app, dir) = file_app();
+    let mut fixture = file_app();
     let mut draft = mach::form::TaskDraft::new("picture");
     draft.description = vec![mach::model::Block::image(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/assets/screenshot.png"
     ))];
-    app.create_task(&draft).unwrap();
-    app.open_edit_task();
-    assert!(app.form.as_mut().unwrap().open_image_preview().is_none());
-    lay_out(&mut app);
+    fixture.app.create_task(&draft).unwrap();
+    fixture.app.open_edit_task();
+    assert!(
+        fixture
+            .app
+            .form
+            .as_mut()
+            .unwrap()
+            .open_image_preview()
+            .is_none()
+    );
+    lay_out(&mut fixture.app);
 
     handle_event(
-        &mut app,
+        &mut fixture.app,
         Event::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 30,
@@ -912,10 +915,8 @@ fn image_preview_owns_clicks_over_the_underlying_panels() {
         }),
     );
 
-    assert_eq!(app.mode, Mode::TaskForm);
-    assert!(app.form.as_ref().is_some_and(|form| form.preview));
-    drop(app);
-    let _ = std::fs::remove_dir_all(dir);
+    assert_eq!(fixture.app.mode, Mode::TaskForm);
+    assert!(fixture.app.form.as_ref().is_some_and(|form| form.preview));
 }
 
 #[test]

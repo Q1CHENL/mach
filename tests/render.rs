@@ -5,8 +5,6 @@
 //! render each mode at a few sizes — including ones barely big enough —
 //! and assert the frame comes out with something recognisable on it.
 
-use ratatui::Terminal;
-use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 
@@ -16,22 +14,13 @@ use mach::model::{Block, Category, Task};
 use mach::store::Store;
 use mach::ui;
 
-/// Draw `app` at `width` x `height` and hand back the finished cells.
-fn draw(app: &mut App, width: u16, height: u16) -> Buffer {
-    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
-    terminal
-        .draw(|frame| ui::draw(frame, app))
-        .expect("draw must not panic");
-    terminal.backend().buffer().clone()
-}
+#[path = "common/render.rs"]
+mod render_common;
+use render_common::draw;
 
 /// The screen as text, one line per row.
 fn render(app: &mut App, width: u16, height: u16) -> String {
-    let buffer = draw(app, width, height);
-    (0..buffer.area.height)
-        .map(|y| row_text(&buffer, y))
-        .collect::<Vec<_>>()
-        .join("\n")
+    buffer_text(&draw(app, width, height))
 }
 
 fn row_text(buffer: &Buffer, y: u16) -> String {

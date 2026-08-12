@@ -5,6 +5,9 @@ use mach::form::TaskDraft;
 use mach::model::{Block, Category, Task};
 use mach::store::{CategoryPatch, RelativePosition, Store, TaskPatch};
 
+mod common;
+use common::TempDir;
+
 fn seed(store: &mut Store) {
     let categories = vec![
         Category {
@@ -45,21 +48,21 @@ fn setup() -> App {
     app
 }
 
-fn on_disk_pair() -> (App, Store, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("mach-app-agents-{}", uuid::Uuid::new_v4()));
-    let mut initial = Store::open(&dir).unwrap();
-    seed(&mut initial);
-    drop(initial);
-    let mut app = App::with_store("test", Store::open(&dir).unwrap()).unwrap();
-    app.mode = Mode::Normal;
-    let external = Store::open(&dir).unwrap();
-    (app, external, dir)
+struct OnDiskPair {
+    app: App,
+    external: Store,
+    dir: TempDir,
 }
 
-fn cleanup_on_disk(app: App, external: Store, dir: std::path::PathBuf) {
-    drop(external);
-    drop(app);
-    std::fs::remove_dir_all(dir).unwrap();
+fn on_disk_pair() -> OnDiskPair {
+    let dir = TempDir::new("app-agents");
+    let mut initial = Store::open(dir.path()).unwrap();
+    seed(&mut initial);
+    drop(initial);
+    let mut app = App::with_store("test", Store::open(dir.path()).unwrap()).unwrap();
+    app.mode = Mode::Normal;
+    let external = Store::open(dir.path()).unwrap();
+    OnDiskPair { app, external, dir }
 }
 
 fn replace_form_title(app: &mut App, title: &str) {
@@ -71,21 +74,16 @@ fn replace_form_title(app: &mut App, title: &str) {
 
 #[test]
 fn constructing_tui_state_does_not_consume_the_launch_screen() {
-    let dir = std::env::temp_dir().join(format!(
-        "mach-launch-pending-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let app = App::with_store("0.4.0", Store::open(&dir).unwrap()).unwrap();
+    let dir = TempDir::new("launch-pending");
+    let app = App::with_store("0.4.0", Store::open(dir.path()).unwrap()).unwrap();
     assert_eq!(app.mode, Mode::Welcome);
     drop(app);
 
-    let snapshot = Store::open(&dir).unwrap().snapshot().unwrap();
+    let snapshot = Store::open(dir.path()).unwrap().snapshot().unwrap();
     assert_eq!(
         snapshot.settings.last_run_version, None,
         "building App before terminal setup must not consume Welcome"
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -416,7 +414,8 @@ fn hide_done_and_purge_follow_the_category_view() {
 
 #[test]
 fn external_commit_refreshes_without_losing_selected_task_identity() {
-    let (mut app, mut external, dir) = on_disk_pair();
+    let mut pair = on_disk_pair();
+    let (app, external) = (&mut pair.app, &mut pair.external);
     app.select_category(0);
     let pos = app
         .view
@@ -442,13 +441,13 @@ fn external_commit_refreshes_without_losing_selected_task_identity() {
     assert!(app.poll_external_changes());
     assert_eq!(app.selected_task().unwrap().id, selected);
     assert_eq!(app.selected_task().unwrap().title, "agent-renamed");
-    cleanup_on_disk(app, external, dir);
 }
 
 #[test]
 fn repeated_external_poll_errors_do_not_disarm_a_confirmation() {
-    let (mut app, external, dir) = on_disk_pair();
-    let database = dir.join("mach.db");
+    let mut pair = on_disk_pair();
+    let database = pair.dir.path().join("mach.db");
+    let app = &mut pair.app;
     let observer = rusqlite::Connection::open(database).unwrap();
     observer.execute("DROP TABLE app_state", []).unwrap();
     drop(observer);
@@ -467,12 +466,12 @@ fn repeated_external_poll_errors_do_not_disarm_a_confirmation() {
         app.awaiting(Confirm::Quit),
         "background polling must not cancel an unrelated confirmation"
     );
-    cleanup_on_disk(app, external, dir);
 }
 
 #[test]
 fn form_save_preserves_an_external_done_toggle() {
-    let (mut app, mut external, dir) = on_disk_pair();
+    let mut pair = on_disk_pair();
+    let (app, external) = (&mut pair.app, &mut pair.external);
     app.select_category(0);
     let pos = app
         .view
@@ -487,7 +486,7 @@ fn form_save_preserves_an_external_done_toggle() {
             Ok(())
         })
         .unwrap();
-    replace_form_title(&mut app, "human title");
+    replace_form_title(app, "human title");
 
     app.submit_form();
 
@@ -498,12 +497,12 @@ fn form_save_preserves_an_external_done_toggle() {
     let saved = app.tasks.iter().find(|task| task.id == "t-open").unwrap();
     assert_eq!(saved.title, "human title");
     assert!(saved.done, "the external toggle must survive form save");
-    cleanup_on_disk(app, external, dir);
 }
 
 #[test]
 fn form_save_merges_disjoint_human_and_agent_fields() {
-    let (mut app, mut external, dir) = on_disk_pair();
+    let mut pair = on_disk_pair();
+    let (app, external) = (&mut pair.app, &mut pair.external);
     app.select_category(0);
     let pos = app
         .view
@@ -536,12 +535,12 @@ fn form_save_merges_disjoint_human_and_agent_fields() {
     let saved = app.tasks.iter().find(|task| task.id == "t-open").unwrap();
     assert_eq!(saved.title, "agent title");
     assert_eq!(saved.description, vec![Block::text("human description")]);
-    cleanup_on_disk(app, external, dir);
 }
 
 #[test]
 fn form_save_accepts_a_convergent_external_edit() {
-    let (mut app, mut external, dir) = on_disk_pair();
+    let mut pair = on_disk_pair();
+    let (app, external) = (&mut pair.app, &mut pair.external);
     app.select_category(0);
     let pos = app
         .view
@@ -550,7 +549,7 @@ fn form_save_accepts_a_convergent_external_edit() {
         .unwrap();
     app.select_task(pos);
     app.open_edit_task();
-    replace_form_title(&mut app, "shared title");
+    replace_form_title(app, "shared title");
     external
         .update(|data| {
             data.edit_task(
@@ -578,17 +577,12 @@ fn form_save_accepts_a_convergent_external_edit() {
             .title,
         "shared title"
     );
-    cleanup_on_disk(app, external, dir);
 }
 
 #[test]
 fn task_form_adopts_paths_against_its_store_before_taking_the_dirty_baseline() {
-    let dir = std::env::temp_dir().join(format!(
-        "mach-form-image-root-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let mut store = Store::open(&dir).unwrap();
+    let dir = TempDir::new("form-image-root");
+    let mut store = Store::open(dir.path()).unwrap();
     std::fs::create_dir_all(store.images_dir()).unwrap();
     std::fs::write(store.images_dir().join("active-root.png"), b"fixture").unwrap();
     let mut task = Task::new("picture path", 0, None, "");
@@ -612,14 +606,12 @@ fn task_form_adopts_paths_against_its_store_before_taking_the_dirty_baseline() {
         !form.is_dirty(),
         "path adoption during construction belongs in the initial baseline"
     );
-
-    drop(app);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn external_title_edit_returns_stale_entity_without_discarding_typed_form() {
-    let (mut app, mut external, dir) = on_disk_pair();
+    let mut pair = on_disk_pair();
+    let (app, external) = (&mut pair.app, &mut pair.external);
     app.select_category(0);
     let pos = app
         .view
@@ -640,7 +632,7 @@ fn external_title_edit_returns_stale_entity_without_discarding_typed_form() {
             Ok(())
         })
         .unwrap();
-    replace_form_title(&mut app, "human title");
+    replace_form_title(app, "human title");
 
     app.submit_form();
 
@@ -664,12 +656,12 @@ fn external_title_edit_returns_stale_entity_without_discarding_typed_form() {
             .title,
         "agent title"
     );
-    cleanup_on_disk(app, external, dir);
 }
 
 #[test]
 fn task_reorder_keeps_its_entity_target_across_an_external_insertion() {
-    let (mut app, mut external, dir) = on_disk_pair();
+    let mut pair = on_disk_pair();
+    let (app, external) = (&mut pair.app, &mut pair.external);
     app.select_category(0);
     let a = app.create_task(&TaskDraft::new("a")).unwrap();
     let b = app.create_task(&TaskDraft::new("b")).unwrap();
@@ -694,12 +686,12 @@ fn task_reorder_keeps_its_entity_target_across_an_external_insertion() {
     let b_position = snapshot.tasks.iter().position(|task| task.id == b).unwrap();
     let c_position = snapshot.tasks.iter().position(|task| task.id == c).unwrap();
     assert_eq!(b_position, c_position + 1, "b must remain targeted after c");
-    cleanup_on_disk(app, external, dir);
 }
 
 #[test]
 fn category_reorder_keeps_its_entity_target_across_an_external_insertion() {
-    let (mut app, mut external, dir) = on_disk_pair();
+    let mut pair = on_disk_pair();
+    let (app, external) = (&mut pair.app, &mut pair.external);
     let work_id = app.categories[1].id.clone();
     let home_id = app.categories[2].id.clone();
     app.select_category(2);
@@ -725,12 +717,12 @@ fn category_reorder_keeps_its_entity_target_across_an_external_insertion() {
         .position(|category| category.id == home_id)
         .unwrap();
     assert_eq!(home_position + 1, work_position);
-    cleanup_on_disk(app, external, dir);
 }
 
 #[test]
 fn category_form_merges_disjoint_human_and_agent_fields() {
-    let (mut app, mut external, dir) = on_disk_pair();
+    let mut pair = on_disk_pair();
+    let (app, external) = (&mut pair.app, &mut pair.external);
     app.select_category(1);
     app.open_edit_category();
     external
@@ -761,5 +753,4 @@ fn category_form_merges_disjoint_human_and_agent_fields() {
         .unwrap();
     assert_eq!(saved.name, "Agent work");
     assert_eq!(saved.description, "human description");
-    cleanup_on_disk(app, external, dir);
 }
