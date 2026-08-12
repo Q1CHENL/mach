@@ -2399,51 +2399,60 @@ fn wordmark_lines(theme: &Theme, available_width: u16) -> Vec<Line<'static>> {
 }
 
 fn draw_whats_new(f: &mut Frame, theme: &Theme, area: Rect) {
+    const OVERLAY_WIDTH: u16 = 62;
+    const BULLET_PREFIX: &str = "• ";
+    const DESCRIPTION_PREFIX: &str = "  ";
+    const RELEASE_NOTES_LABEL: &str = "Full release notes:";
+    const CONTINUE_HINT: &str = "Press Enter or Esc to continue";
+
+    let heading = format!("What's new in mach v{}", crate::VERSION);
+    let release_url = format!("github.com/Q1CHENL/mach/releases/tag/v{}", crate::VERSION);
+    let width = OVERLAY_WIDTH.min(area.width);
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text())
+        .padding(Padding::horizontal(2));
+    let content_width = usize::from(block.inner(Rect::new(0, 0, width, area.height)).width);
+    let description_width = content_width.saturating_sub(DESCRIPTION_PREFIX.width());
+
     let mut lines = vec![
-        Line::styled(
-            format!("What's new in mach v{}", crate::VERSION),
-            Style::new().add_modifier(Modifier::BOLD),
-        )
-        .centered(),
+        Line::styled(heading, Style::new().add_modifier(Modifier::BOLD)).centered(),
         Line::raw(""),
     ];
     for (index, (title, description)) in banner::WHATS_NEW.into_iter().enumerate() {
         lines.push(Line::from(vec![
-            Span::styled("• ", theme.accent_text()),
+            Span::styled(BULLET_PREFIX, theme.accent_text()),
             Span::styled(title, Style::new().add_modifier(Modifier::BOLD)),
         ]));
-        lines.push(Line::raw(format!("  {description}")));
+        let graphemes = description
+            .graphemes(true)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        lines.extend(
+            crate::text_input::wrap_breaks(&graphemes, description_width)
+                .into_iter()
+                .map(|(start, end)| {
+                    let text = graphemes[start..end].concat();
+                    Line::raw(format!("{DESCRIPTION_PREFIX}{}", text.trim_end()))
+                }),
+        );
         if index + 1 < banner::WHATS_NEW.len() {
             lines.push(Line::raw(""));
         }
     }
     lines.push(Line::raw(""));
-    lines
-        .push(Line::styled("Full release notes:", Style::new().fg(theme.muted_color())).centered());
-    lines.push(
-        Line::styled(
-            format!("github.com/Q1CHENL/mach/releases/tag/v{}", crate::VERSION),
-            Style::new().fg(theme.muted_color()),
-        )
-        .centered(),
-    );
-    lines.push(
-        Line::styled(
-            "Press Enter or Esc to continue",
-            Style::new().fg(theme.muted_color()),
-        )
-        .centered(),
-    );
+    lines.push(Line::styled(RELEASE_NOTES_LABEL, Style::new().fg(theme.muted_color())).centered());
+    lines.push(Line::styled(release_url, Style::new().fg(theme.muted_color())).centered());
+    lines.push(Line::styled(CONTINUE_HINT, Style::new().fg(theme.muted_color())).centered());
 
+    if lines.len().saturating_add(2) > usize::from(area.height) {
+        lines.retain(|line| line.width() > 0);
+    }
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2)
         .min(area.height);
-    let rect = centered(area, 62.min(area.width), height);
-    let block = Block::bordered()
-        .border_type(BorderType::Thick)
-        .border_style(theme.accent_text())
-        .padding(Padding::horizontal(2));
+    let rect = centered(area, width, height);
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }

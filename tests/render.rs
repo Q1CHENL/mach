@@ -154,6 +154,22 @@ fn draws_every_overlay() {
 }
 
 #[test]
+fn whats_new_shows_complete_highlight_descriptions() {
+    for (width, height) in [(60, 16), (100, 30)] {
+        let mut app = sample_app();
+        app.mode = Mode::WhatsNew;
+        let screen = render(&mut app, width, height);
+
+        for ending in ["cancelled.", "screens.", "version."] {
+            assert!(
+                screen.contains(ending),
+                "{ending:?} was clipped at {width}x{height}:\n{screen}"
+            );
+        }
+    }
+}
+
+#[test]
 fn help_marks_both_section_headings() {
     let mut app = sample_app();
     app.mode = Mode::Help;
