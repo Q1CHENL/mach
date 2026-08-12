@@ -311,10 +311,8 @@ printf '%s\n' "$tag" \
   || fail "MACH_VERSION must be an exact stable semver tag (for example v0.2.0)"
 target_version=${tag#v}
 
-expected_asset_url=${RELEASE_BASE}/${tag}/${asset}
-expected_checksums_url=${RELEASE_BASE}/${tag}/${CHECKSUMS_ASSET}
-asset_url=$expected_asset_url
-checksums_url=$expected_checksums_url
+asset_url=${RELEASE_BASE}/${tag}/${asset}
+checksums_url=${RELEASE_BASE}/${tag}/${CHECKSUMS_ASSET}
 
 mkdir -p "$INSTALL_DIR"
 dest_tmp=$(mktemp "${INSTALL_DIR}/.mach.XXXXXX")
@@ -355,7 +353,6 @@ acquire_install_lock
 [ ! -d "$destination" ] \
   || fail "install destination is a directory: $destination"
 install_action=Installed
-installed_version=$target_version
 if installed_version=$(receipted_destination_version "$destination"); then
   if version_is_at_least "$installed_version" "$target_version"; then
     install_action=Kept

@@ -21,6 +21,8 @@ jobs:
     name: verify tag and release contract
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    outputs:
+      version: ${{ steps.release_version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,6 +42,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Verify tag, version, and main ancestry
+        id: release_version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -48,6 +51,7 @@ jobs:
               | jq -er '.packages | map(select(.name == "mach-tui")) | if length == 1 then .[0].version else error("expected exactly one mach-tui package") end'
           )"
           printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           test "${GITHUB_REF_NAME}" = "v${version}"
           git fetch --no-tags origin +main:refs/remotes/origin/main
           git merge-base --is-ancestor HEAD origin/main
@@ -128,10 +132,7 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/mach" "dist/mach-${{ matrix.target }}"
           chmod 755 "dist/mach-${{ matrix.target }}"
-          version="$(
-            cargo metadata --locked --no-deps --format-version 1 \
-              | jq -er '.packages | map(select(.name == "mach-tui")) | if length == 1 then .[0].version else error("expected exactly one mach-tui package") end'
-          )"
+          version="${{ needs.verify.outputs.version }}"
           scripts/smoke-release.sh "dist/mach-${{ matrix.target }}" "${{ matrix.target }}" "$version" 2.28
 
       - name: Upload artifact
@@ -177,10 +178,7 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/mach" "dist/mach-${{ matrix.target }}"
           chmod 755 "dist/mach-${{ matrix.target }}"
-          version="$(
-            cargo metadata --locked --no-deps --format-version 1 \
-              | jq -er '.packages | map(select(.name == "mach-tui")) | if length == 1 then .[0].version else error("expected exactly one mach-tui package") end'
-          )"
+          version="${{ needs.verify.outputs.version }}"
           scripts/smoke-release.sh "dist/mach-${{ matrix.target }}" "${{ matrix.target }}" "$version" "${{ matrix.deployment_target }}"
 
       - name: Upload artifact
@@ -300,10 +298,7 @@ jobs:
       - name: Prepare the crate release
         id: crate
         run: |
-          version="$(
-            cargo metadata --locked --no-deps --format-version 1 \
-              | jq -er '.packages | map(select(.name == "mach-tui")) | if length == 1 then .[0].version else error("expected exactly one mach-tui package") end'
-          )"
+          version="${{ needs.verify.outputs.version }}"
           cargo package --locked
           crate_path="target/package/mach-tui-${version}.crate"
           test -f "$crate_path"
