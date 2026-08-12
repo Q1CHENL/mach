@@ -15,16 +15,16 @@ pub const BANNER_WIDTH: u16 = 35;
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
     (
-        "Responsive backups",
-        "Export and import run in the background and can be cancelled.",
+        "Description, everywhere",
+        "CLI and JSON now use description (-d replaces -b; due dates use --due), with numbered lists and links.",
     ),
     (
-        "Steadier forms",
-        "Editors keep drafts across clicks, menus, and launch screens.",
+        "Mixed clipboard paste",
+        "Task descriptions paste clipboard text and images together; category descriptions keep text only.",
     ),
     (
-        "Safer self-updates",
-        "Only release installs update, and only to a newer version.",
+        "Safer editing",
+        "Outside clicks keep drafts, and Esc confirmations stay visible long enough to act.",
     ),
 ];
 
