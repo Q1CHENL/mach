@@ -119,7 +119,7 @@ fn loads_and_mutates_a_store_snapshot() {
             category_id: Some(work_id.clone()),
             due: String::new(),
             importance: 2,
-            body: vec![
+            description: vec![
                 Block::text("with notes"),
                 Block::todo("step one", true),
                 Block::todo("step two", false),
@@ -129,7 +129,7 @@ fn loads_and_mutates_a_store_snapshot() {
     let added = app.selected_task().expect("new task is selected");
     assert_eq!(added.title, "draft the release note");
     assert_eq!(added.due, "2030-05-06 07:08");
-    assert_eq!(added.body[0], Block::text("with notes"));
+    assert_eq!(added.description[0], Block::text("with notes"));
     assert_eq!(added.category_id.as_deref(), Some(work_id.as_str()));
     assert_eq!(mach::model::todo_progress(added), Some((1, 2)));
     assert!(mach::model::has_prose_or_image(added));
@@ -153,7 +153,10 @@ fn loads_and_mutates_a_store_snapshot() {
     let task = app.tasks.iter().find(|task| task.id == id).unwrap();
     assert_eq!(task.title, "renamed task");
     assert!(task.due.ends_with("09:00"), "{}", task.due);
-    assert!(task.body.is_empty(), "the body can be cleared");
+    assert!(
+        task.description.is_empty(),
+        "the description can be cleared"
+    );
     assert_eq!(task.category_id, None, "editing can move a task");
 
     let before = app.tasks.len();
@@ -169,9 +172,10 @@ fn search_uses_the_same_unicode_caseless_identity_as_typeahead_and_categories() 
     let mut app = setup();
     app.create_task(&TaskDraft::new("Maße"))
         .expect("create Unicode title");
-    let mut body_task = TaskDraft::new("accent note");
-    body_task.body = vec![Block::text("Cafe\u{301}")];
-    app.create_task(&body_task).expect("create decomposed body");
+    let mut description_task = TaskDraft::new("accent note");
+    description_task.description = vec![Block::text("Cafe\u{301}")];
+    app.create_task(&description_task)
+        .expect("create decomposed description");
 
     app.start_search("MASSE");
     assert_eq!(app.task_count(), 1);
@@ -260,7 +264,7 @@ fn filters_by_category_and_sorts_as_configured() {
         .create_task(&TaskDraft {
             title: "plain title".into(),
             category_id: Some(home_id),
-            body: vec![Block::text("buried in the body")],
+            description: vec![Block::text("buried in the description")],
             ..TaskDraft::default()
         })
         .unwrap();
@@ -523,15 +527,15 @@ fn form_save_merges_disjoint_human_and_agent_fields() {
     app.form
         .as_mut()
         .expect("task form open")
-        .body
-        .insert_str("human body");
+        .description
+        .insert_str("human description");
 
     app.submit_form();
 
     assert!(app.form.is_none(), "disjoint fields should merge");
     let saved = app.tasks.iter().find(|task| task.id == "t-open").unwrap();
     assert_eq!(saved.title, "agent title");
-    assert_eq!(saved.body, vec![Block::text("human body")]);
+    assert_eq!(saved.description, vec![Block::text("human description")]);
     cleanup_on_disk(app, external, dir);
 }
 
@@ -588,7 +592,7 @@ fn task_form_adopts_paths_against_its_store_before_taking_the_dirty_baseline() {
     std::fs::create_dir_all(store.images_dir()).unwrap();
     std::fs::write(store.images_dir().join("active-root.png"), b"fixture").unwrap();
     let mut task = Task::new("picture path", 0, None, "");
-    task.body = vec![Block::text("active-root.png")];
+    task.description = vec![Block::text("active-root.png")];
     store
         .update(|data| {
             data.tasks.push(task);
@@ -600,7 +604,10 @@ fn task_form_adopts_paths_against_its_store_before_taking_the_dirty_baseline() {
     app.mode = Mode::Normal;
     app.open_edit_task();
     let form = app.form.as_ref().expect("task form open");
-    assert_eq!(form.body.value(), vec![Block::image("active-root.png")]);
+    assert_eq!(
+        form.description.value(),
+        vec![Block::image("active-root.png")]
+    );
     assert!(
         !form.is_dirty(),
         "path adoption during construction belongs in the initial baseline"

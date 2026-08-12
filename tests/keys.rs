@@ -755,7 +755,7 @@ fn category_description_slash_menu_rows_are_clickable() {
         .category_form
         .as_ref()
         .unwrap()
-        .body_menu_area
+        .description_menu_area
         .expect("menu layout");
     assert!(
         app.category_form
@@ -852,9 +852,9 @@ fn image_preview_owns_undo_keys_until_it_is_closed() {
     app.open_new_task();
     press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
     let form = app.form.as_mut().unwrap();
-    form.body
+    form.description
         .insert_block(mach::model::Block::image("preview.png"));
-    form.body.up();
+    form.description.up();
     assert!(form.open_image_preview().is_none());
     assert!(form.preview);
 
@@ -873,7 +873,7 @@ fn image_preview_owns_undo_keys_until_it_is_closed() {
 fn image_preview_owns_clicks_over_the_underlying_panels() {
     let (mut app, dir) = file_app();
     let mut draft = mach::form::TaskDraft::new("picture");
-    draft.body = vec![mach::model::Block::image(concat!(
+    draft.description = vec![mach::model::Block::image(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/assets/screenshot.png"
     ))];
@@ -943,21 +943,21 @@ fn ctrl_s_commits_the_open_due_picker_before_saving() {
 }
 
 #[test]
-fn ctrl_s_rejects_an_unresolved_body_command() {
+fn ctrl_s_rejects_an_unresolved_description_command() {
     let mut app = app();
     app.select_category(1);
     app.open_new_task();
     let form = app.form.as_mut().unwrap();
     form.title.insert_str("menu task");
-    form.field = mach::form::Field::Body;
+    form.field = mach::form::Field::Description;
     for c in "/todo".chars() {
-        form.body.insert(c);
+        form.description.insert(c);
     }
 
     press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
 
     assert_eq!(app.mode, Mode::TaskForm);
-    assert!(app.form.as_ref().unwrap().body.menu.is_some());
+    assert!(app.form.as_ref().unwrap().description.menu.is_some());
     assert!(message(&app).contains("command"));
 }
 

@@ -16,8 +16,8 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::model::{
-    Block, Category, MAX_BODY_LINES, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN,
-    MAX_CATEGORY_DESC_LINES, MAX_CATEGORY_NAME_LEN, MAX_NOTES_LINE_LEN, MAX_TASK_COUNT,
+    Block, Category, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN, MAX_CATEGORY_DESC_LINES,
+    MAX_CATEGORY_NAME_LEN, MAX_DESCRIPTION_LINES, MAX_NOTES_LINE_LEN, MAX_TASK_COUNT,
     MAX_TITLE_LEN, Task, caseless_key, text_byte_limit,
 };
 use crate::settings::Settings;
@@ -27,10 +27,11 @@ use crate::store::{
 };
 
 const ARCHIVE_FORMAT: &str = "mach-archive";
-const ARCHIVE_SCHEMA: u32 = 1;
+const ARCHIVE_SCHEMA: u32 = 2;
+const MIN_ARCHIVE_SCHEMA: u32 = 1;
 const MANIFEST_PATH: &str = "manifest.json";
 const JSON_ESCAPE_EXPANSION: u64 = 6;
-const MAX_ARCHIVE_BLOCK_COUNT: usize = MAX_TASK_COUNT * MAX_BODY_LINES;
+const MAX_ARCHIVE_BLOCK_COUNT: usize = MAX_TASK_COUNT * MAX_DESCRIPTION_LINES;
 const MAX_ARCHIVE_ATTACHMENT_COUNT: usize = MAX_ARCHIVE_BLOCK_COUNT;
 const MAX_ARCHIVE_FORMAT_BYTES: usize = 64;
 const MAX_ARCHIVE_MEDIA_TYPE_BYTES: usize = 32;
@@ -505,7 +506,7 @@ impl<'a> From<&'a Category> for ExportCategory<'a> {
 struct ExportTask<'a> {
     id: &'a str,
     title: &'a str,
-    body: &'a [Block],
+    description: &'a [Block],
     due: &'a str,
     created: &'a str,
     done: bool,
@@ -518,7 +519,7 @@ impl<'a> From<&'a Task> for ExportTask<'a> {
         Self {
             id: &task.id,
             title: &task.title,
-            body: &task.body,
+            description: &task.description,
             due: &task.due,
             created: &task.created,
             done: task.done,
@@ -581,7 +582,8 @@ struct ArchiveTask {
     #[serde(deserialize_with = "deserialize_task_title")]
     title: String,
     #[serde(deserialize_with = "deserialize_blocks")]
-    body: Vec<ArchiveBlock>,
+    #[serde(alias = "body")]
+    description: Vec<ArchiveBlock>,
     #[serde(deserialize_with = "deserialize_due")]
     due: String,
     #[serde(deserialize_with = "deserialize_created")]
@@ -597,7 +599,7 @@ impl From<ArchiveTask> for Task {
         Self {
             id: task.id,
             title: task.title,
-            body: task.body.into_iter().map(Block::from).collect(),
+            description: task.description.into_iter().map(Block::from).collect(),
             due: task.due,
             created: task.created,
             done: task.done,
@@ -770,7 +772,7 @@ where
     deserialize_bounded_string(
         deserializer,
         text_byte_limit(MAX_NOTES_LINE_LEN),
-        "task body value",
+        "task description value",
     )
 }
 
@@ -879,7 +881,11 @@ fn deserialize_blocks<'de, D>(deserializer: D) -> Result<Vec<ArchiveBlock>, D::E
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_bounded_vec(deserializer, MAX_BODY_LINES, "task body block")
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_DESCRIPTION_LINES,
+        "task description block",
+    )
 }
 
 fn deserialize_attachments<'de, D>(deserializer: D) -> Result<Vec<ArchiveAttachment>, D::Error>
@@ -1133,15 +1139,7 @@ pub(crate) fn import_with_progress(
 }
 
 fn manifest_from_snapshot(snapshot: &StoreData) -> Result<ExportManifest<'_>, ArchiveError> {
-    let referenced: BTreeSet<_> = snapshot
-        .tasks
-        .iter()
-        .flat_map(|task| task.body.iter())
-        .filter_map(|block| match block {
-            Block::Image { attachment_id } => Some(attachment_id.as_str()),
-            _ => None,
-        })
-        .collect();
+    let referenced = referenced_attachment_ids(&snapshot.tasks);
     let by_id: HashMap<_, _> = snapshot
         .attachments()
         .iter()
@@ -1150,8 +1148,8 @@ fn manifest_from_snapshot(snapshot: &StoreData) -> Result<ExportManifest<'_>, Ar
     let attachments = referenced
         .into_iter()
         .map(|id| {
-            let attachment = by_id.get(id).copied().ok_or_else(|| {
-                ArchiveError::Invalid(format!("task refers to unknown image attachment {id}"))
+            let attachment = by_id.get(id.as_str()).copied().ok_or_else(|| {
+                ArchiveError::Invalid(format!("content refers to unknown image attachment {id}"))
             })?;
             Ok(ExportAttachment::from_store(attachment))
         })
@@ -1167,6 +1165,18 @@ fn manifest_from_snapshot(snapshot: &StoreData) -> Result<ExportManifest<'_>, Ar
         tasks: snapshot.tasks.iter().map(ExportTask::from).collect(),
         attachments,
     })
+}
+
+fn referenced_attachment_ids(tasks: &[Task]) -> BTreeSet<String> {
+    tasks
+        .iter()
+        .flat_map(|task| {
+            task.description.iter().filter_map(|block| match block {
+                Block::Image { attachment_id } => Some(attachment_id.clone()),
+                _ => None,
+            })
+        })
+        .collect()
 }
 
 fn inspect_entries(
@@ -1241,10 +1251,10 @@ fn read_manifest(
             manifest.format
         )));
     }
-    if manifest.schema != ARCHIVE_SCHEMA {
+    if !(MIN_ARCHIVE_SCHEMA..=ARCHIVE_SCHEMA).contains(&manifest.schema) {
         return Err(ArchiveError::Invalid(format!(
-            "unsupported archive schema {}; expected {}",
-            manifest.schema, ARCHIVE_SCHEMA
+            "unsupported archive schema {}; expected {} through {}",
+            manifest.schema, MIN_ARCHIVE_SCHEMA, ARCHIVE_SCHEMA
         )));
     }
 
@@ -1285,21 +1295,14 @@ fn validate_imported_data(
     tasks: &[Task],
     attachments: &[ImportedAttachment],
 ) -> Result<(), ArchiveError> {
-    let referenced: HashSet<_> = tasks
+    let referenced = referenced_attachment_ids(tasks);
+    let declared: BTreeSet<_> = attachments
         .iter()
-        .flat_map(|task| task.body.iter())
-        .filter_map(|block| match block {
-            Block::Image { attachment_id } => Some(attachment_id.as_str()),
-            _ => None,
-        })
-        .collect();
-    let declared: HashSet<_> = attachments
-        .iter()
-        .map(|attachment| attachment.metadata.id.as_str())
+        .map(|attachment| attachment.metadata.id.clone())
         .collect();
     if referenced != declared {
         return Err(ArchiveError::Invalid(
-            "archive image entries must exactly match task image references".into(),
+            "archive image entries must exactly match task description image references".into(),
         ));
     }
     let mut data = StoreData {
@@ -1738,12 +1741,80 @@ mod tests {
         store
             .update(|data| {
                 let mut task = Task::new("with image", 0, None, "");
-                task.body = vec![Block::image(source.to_str().unwrap())];
+                task.description = vec![Block::image(source.to_str().unwrap())];
                 data.insert_task(task)?;
                 Ok(())
             })
             .unwrap();
         store
+    }
+
+    fn write_manifest_archive(path: &Path, manifest: &serde_json::Value) {
+        let file = File::create(path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::DEFAULT
+            .compression_method(CompressionMethod::Stored)
+            .unix_permissions(0o600);
+        writer.start_file(MANIFEST_PATH, options).unwrap();
+        serde_json::to_writer_pretty(&mut writer, manifest).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn archive_v2_exports_description_and_imports_v1_body() {
+        let source_directory = TestDirectory::new("description-schema-source");
+        let output_directory = TestDirectory::new("description-schema-output");
+        let destination_directory = TestDirectory::new("description-schema-destination");
+        let mut source = Store::open(&source_directory.0).unwrap();
+        source
+            .update(|data| {
+                data.create_task("current", vec![Block::text("new description")], "", 0, None)?;
+                Ok(())
+            })
+            .unwrap();
+        let current_path = output_directory.0.join("current.mach");
+        export(&source, Some(&current_path)).unwrap();
+        let current_manifest: serde_json::Value = {
+            let file = File::open(&current_path).unwrap();
+            let mut archive = ZipArchive::new(file).unwrap();
+            let mut manifest = String::new();
+            archive
+                .by_name(MANIFEST_PATH)
+                .unwrap()
+                .read_to_string(&mut manifest)
+                .unwrap();
+            serde_json::from_str(&manifest).unwrap()
+        };
+        assert_eq!(current_manifest["schema"], 2);
+        assert!(current_manifest["tasks"][0].get("description").is_some());
+        assert!(current_manifest["tasks"][0].get("body").is_none());
+
+        let legacy_path = output_directory.0.join("legacy.mach");
+        write_manifest_archive(
+            &legacy_path,
+            &serde_json::json!({
+                "format": ARCHIVE_FORMAT,
+                "schema": 1,
+                "categories": [],
+                "tasks": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "title": "legacy",
+                    "body": [{"type": "text", "text": "old description"}],
+                    "due": "",
+                    "created": "2026-08-12 12:00:00",
+                    "done": false,
+                    "importance": 0,
+                    "category_id": null
+                }],
+                "attachments": []
+            }),
+        );
+        let mut destination = Store::open(&destination_directory.0).unwrap();
+        import(&mut destination, &legacy_path).expect("import archive schema v1");
+        assert_eq!(
+            destination.snapshot().unwrap().tasks[0].description,
+            vec![Block::text("old description")]
+        );
     }
 
     #[test]
@@ -1841,15 +1912,15 @@ mod tests {
     }
 
     #[test]
-    fn manifest_limit_covers_every_store_valid_task_body() {
-        let maximum_raw_body_bytes = crate::model::MAX_TASK_COUNT as u64
-            * crate::model::MAX_BODY_LINES as u64
+    fn manifest_limit_covers_every_store_valid_task_description() {
+        let maximum_raw_description_bytes = crate::model::MAX_TASK_COUNT as u64
+            * crate::model::MAX_DESCRIPTION_LINES as u64
             * crate::model::text_byte_limit(crate::model::MAX_NOTES_LINE_LEN) as u64;
 
-        let escaped_body_bytes = maximum_raw_body_bytes * 6;
+        let escaped_description_bytes = maximum_raw_description_bytes * 6;
 
         assert!(
-            MAX_MANIFEST_BYTES > escaped_body_bytes,
+            MAX_MANIFEST_BYTES > escaped_description_bytes,
             "the archive ceiling must cover worst-case JSON escaping plus metadata"
         );
     }
@@ -1900,7 +1971,7 @@ mod tests {
                 serde_json::json!({
                     "id": format!("task-{index}"),
                     "title": "task",
-                    "body": [],
+                    "description": [],
                     "due": "",
                     "created": "2026-08-10 00:00:00",
                     "done": false,
@@ -1932,7 +2003,7 @@ mod tests {
             "tasks": [{
                 "id": "task-1",
                 "title": "task",
-                "body": [{"type": "text", "text": "x".repeat(text_byte_limit(MAX_NOTES_LINE_LEN) + 1)}],
+                "description": [{"type": "text", "text": "x".repeat(text_byte_limit(MAX_NOTES_LINE_LEN) + 1)}],
                 "due": "",
                 "created": "2026-08-10 00:00:00",
                 "done": false,
@@ -1945,6 +2016,6 @@ mod tests {
         let error = serde_json::from_value::<Manifest>(manifest)
             .expect_err("invalid field bytes must be rejected during deserialization");
 
-        assert!(error.to_string().contains("task body value exceeds"));
+        assert!(error.to_string().contains("task description value exceeds"));
     }
 }

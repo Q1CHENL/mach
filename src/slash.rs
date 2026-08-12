@@ -8,7 +8,7 @@ pub enum SlashCommand {
     WhatsNew,
     /// Copy the selected task's title to the clipboard.
     CopyTitle,
-    /// Copy the selected task's title and body to the clipboard.
+    /// Copy the selected task's title and description to the clipboard.
     CopyTask,
     /// Export every task, category, and image to a portable archive.
     Export,
@@ -88,7 +88,7 @@ impl SlashCommand {
             Self::Help => "key reference",
             Self::WhatsNew => "release highlights",
             Self::CopyTitle => "copy selected task title",
-            Self::CopyTask => "copy selected task title and body",
+            Self::CopyTask => "copy selected task title and description",
             Self::Export => "save timestamped archive to ./",
             Self::Import => "merge the specified archive",
             Self::Done => "show or hide completed tasks",

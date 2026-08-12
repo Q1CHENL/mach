@@ -16,7 +16,7 @@ pub const MAX_TASK_COUNT: usize = 1024;
 pub const MAX_IMPORTANCE: u8 = 3;
 pub const MAX_TITLE_LEN: usize = 256;
 pub const MAX_NOTES_LINE_LEN: usize = 512;
-pub const MAX_BODY_LINES: usize = 256;
+pub const MAX_DESCRIPTION_LINES: usize = 256;
 pub const MAX_CATEGORY_NAME_LEN: usize = 64;
 pub const MAX_CATEGORY_DESC_LINE_LEN: usize = 256;
 pub const MAX_CATEGORY_DESC_LINES: usize = 64;
@@ -44,8 +44,8 @@ pub struct Task {
     /// Stable identity.
     pub id: String,
     pub title: String,
-    #[serde(default)]
-    pub body: Vec<Block>,
+    #[serde(default, alias = "body")]
+    pub description: Vec<Block>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub due: String,
     #[serde(default)]
@@ -64,7 +64,7 @@ impl Task {
         Self {
             id: new_uuid(),
             title: title.to_string(),
-            body: Vec::new(),
+            description: Vec::new(),
             due: due.to_string(),
             created: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             done: false,
@@ -201,7 +201,7 @@ pub fn importance_marks(importance: u8) -> String {
 pub fn todo_progress(task: &Task) -> Option<(usize, usize)> {
     let mut done = 0usize;
     let mut total = 0usize;
-    for b in &task.body {
+    for b in &task.description {
         if let Block::Todo { done: d, .. } = b {
             total += 1;
             if *d {
@@ -213,7 +213,7 @@ pub fn todo_progress(task: &Task) -> Option<(usize, usize)> {
 }
 
 pub fn has_prose_or_image(task: &Task) -> bool {
-    task.body
+    task.description
         .iter()
         .any(|b| !matches!(b, Block::Todo { .. }) && !b.is_empty())
 }

@@ -22,7 +22,7 @@ use ratatui_image::protocol::StatefulProtocol;
 
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
-/// Max long edge for stills in body / preview.
+/// Max long edge for stills in description / preview.
 const MAX_STILL_EDGE: u32 = 1920;
 /// Max long edge for GIF frames (encoded once per index).
 const MAX_GIF_EDGE: u32 = 720;
@@ -36,9 +36,105 @@ const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
 /// Reject implausibly large canvases before a decoder allocates them.
 const MAX_DECODE_DIMENSION: u32 = 8192;
 const MAX_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
-/// Decode work is CPU and memory heavy; keep the UI responsive under a body
+/// Decode work is CPU and memory heavy; keep the UI responsive under a description
 /// containing many images instead of spawning one thread per path.
 const MAX_DECODE_WORKERS: usize = 2;
+
+/// A private PNG staged from clipboard pixels for the lifetime of an open
+/// form. Saving imports it into the content-addressed store; cancelling or
+/// closing the form removes the source file.
+#[derive(Debug)]
+pub(crate) struct TemporaryImage {
+    path: PathBuf,
+}
+
+impl TemporaryImage {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryImage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Validate RGBA clipboard pixels and encode them into a private temporary
+/// PNG. The returned owner keeps the source alive until a form is saved or
+/// dismissed.
+pub(crate) fn stage_clipboard_image(
+    image: arboard::ImageData<'_>,
+) -> Result<TemporaryImage, String> {
+    use image::ImageEncoder;
+    use std::io::Write;
+
+    let width = u32::try_from(image.width)
+        .map_err(|_| "clipboard image width exceeds the supported limit".to_string())?;
+    let height = u32::try_from(image.height)
+        .map_err(|_| "clipboard image height exceeds the supported limit".to_string())?;
+    if width == 0 || height == 0 {
+        return Err("clipboard image dimensions must be nonzero".into());
+    }
+    if width > MAX_DECODE_DIMENSION || height > MAX_DECODE_DIMENSION {
+        return Err(format!(
+            "clipboard image dimensions exceed the {MAX_DECODE_DIMENSION}-pixel safety limit"
+        ));
+    }
+    let expected = image
+        .width
+        .checked_mul(image.height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "clipboard image dimensions overflow its pixel buffer".to_string())?;
+    if expected != image.bytes.len() {
+        return Err(format!(
+            "clipboard image pixel buffer has {} bytes; expected {expected}",
+            image.bytes.len()
+        ));
+    }
+    if expected as u64 > MAX_DECODE_ALLOC {
+        return Err(format!(
+            "clipboard image pixel buffer exceeds the {} MiB safety limit",
+            MAX_DECODE_ALLOC / 1024 / 1024
+        ));
+    }
+
+    let path = std::env::temp_dir().join(format!("mach-clipboard-{}.png", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("could not create clipboard image staging file: {error}"))?;
+    let encoded = (|| {
+        image::codecs::png::PngEncoder::new(&mut file)
+            .write_image(&image.bytes, width, height, image::ColorType::Rgba8.into())
+            .map_err(|error| format!("could not encode clipboard image as PNG: {error}"))?;
+        file.flush()
+            .map_err(|error| format!("could not flush clipboard image: {error}"))?;
+        let byte_len = file
+            .metadata()
+            .map_err(|error| format!("could not inspect clipboard image: {error}"))?
+            .len();
+        if byte_len > crate::store::MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "clipboard image exceeds the {} MiB attachment limit",
+                crate::store::MAX_ATTACHMENT_BYTES / 1024 / 1024
+            ));
+        }
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = encoded {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(TemporaryImage { path })
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AttachmentCatalog {
@@ -58,6 +154,10 @@ impl AttachmentCatalog {
             .get(reference)
             .map(|storage_name| images_root.join(storage_name))
             .unwrap_or_else(|| expand_in(reference, images_root))
+    }
+
+    pub fn contains(&self, reference: &str) -> bool {
+        self.files.contains_key(reference)
     }
 }
 
@@ -136,7 +236,7 @@ pub fn expand_in(path: &str, images_root: &Path) -> PathBuf {
 }
 
 /// Extract the path from either `path.png` or `![alt](path.png)`.
-fn reference_path(text: &str) -> Option<&str> {
+pub(crate) fn reference_path(text: &str) -> Option<&str> {
     let text = text.trim();
     if !text.starts_with("![") {
         return (!text.is_empty()).then_some(text);
@@ -376,9 +476,9 @@ impl GifLoad {
     }
 }
 
-/// One file: decoded pixels stay in RAM. Body and full-screen preview keep
+/// One file: decoded pixels stay in RAM. Description and full-screen preview keep
 /// separate protocols so closing the preview does not force a slow
-/// re-encode the next time it opens (body is ~10 rows; preview is large).
+/// re-encode the next time it opens (description is ~10 rows; preview is large).
 struct CachedImage {
     image: Arc<DynamicImage>,
     protocol: Option<StatefulProtocol>,
@@ -662,7 +762,7 @@ impl ImageStore {
         self.protocol_for(path, false)
     }
 
-    /// Full-screen preview protocol — kept separate from the body thumb so
+    /// Full-screen preview protocol — kept separate from the description thumb so
     /// open → close → open does not thrash encode size every time.
     pub fn get_preview(&mut self, path: &Path) -> ImageReady<'_> {
         self.protocol_for(path, true)
@@ -691,7 +791,7 @@ impl ImageStore {
             return ImageReady::Loading;
         };
 
-        // Body and preview hold separate protocols so switching between them
+        // Description and preview hold separate protocols so switching between them
         // does not re-encode the decoded image.
         let slot = if preview { preview_protocol } else { protocol };
         let protocol = match slot {
@@ -727,7 +827,7 @@ impl ImageStore {
         self.gif_protocols.clear();
     }
 
-    /// Drop the body protocols (the terminal deletes those pictures) but
+    /// Drop the description protocols (the terminal deletes those pictures) but
     /// keep the decoded pixels. The next `get` rebuilds from RAM — no disk.
     ///
     /// Needed after a Clear over a graphics-protocol image, e.g. when the
@@ -771,7 +871,7 @@ pub fn short(path: &Path) -> String {
 
 /// Stable fallback used by standalone editor tests. Production injects the
 /// active store's images directory into [`ImageStore`] and
-/// [`crate::body::BodyEditor`].
+/// [`crate::description::DescriptionEditor`].
 pub fn default_images_root() -> PathBuf {
     dirs::home_dir()
         .map(|home| home.join(".mach"))
@@ -824,6 +924,45 @@ mod tests {
             path_if_image_in("![diagram](diagram.png)", &root),
             Some(path)
         );
+    }
+
+    #[test]
+    fn clipboard_pixels_are_staged_as_a_private_temporary_png() {
+        use std::borrow::Cow;
+
+        let staged = stage_clipboard_image(arboard::ImageData {
+            width: 2,
+            height: 1,
+            bytes: Cow::Owned(vec![255, 0, 0, 255, 0, 255, 0, 255]),
+        })
+        .expect("stage clipboard image");
+        let path = staged.path().to_path_buf();
+        let decoded = load_dynamic(&path).expect("decode staged PNG");
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        drop(staged);
+        assert!(!path.exists(), "form-owned clipboard staging must clean up");
+    }
+
+    #[test]
+    fn malformed_clipboard_pixel_buffers_are_rejected_before_encoding() {
+        use std::borrow::Cow;
+
+        let error = stage_clipboard_image(arboard::ImageData {
+            width: 2,
+            height: 2,
+            bytes: Cow::Owned(vec![0; 4]),
+        })
+        .expect_err("RGBA buffer is shorter than its dimensions");
+        assert!(error.contains("pixel buffer"), "{error}");
     }
 
     #[test]

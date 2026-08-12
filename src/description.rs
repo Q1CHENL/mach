@@ -1,20 +1,21 @@
-//! The body editor: one free-form stack of blocks — prose, bullets,
+//! The description editor: one free-form stack of blocks — prose, bullets,
 //! numbered items, links, to-dos and pictures. A bullet is `- ` at the
 //! head of a line, a number is `1. `, a picture is a pasted or typed
 //! path, and the `/` menu turns a line into a to-do, bullet, number or
-//! link, or copies the text out. Backspace at the head of a list item
-//! turns it back into prose.
+//! link, pastes clipboard content, or copies content out. Backspace at the
+//! head of a list item turns it back into prose.
 
 use std::path::{Path, PathBuf};
 
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::model::{
-    Block, MAX_BODY_LINES, MAX_CATEGORY_DESC_LINE_LEN, MAX_CATEGORY_DESC_LINES, MAX_NOTES_LINE_LEN,
+    Block, MAX_CATEGORY_DESC_LINE_LEN, MAX_CATEGORY_DESC_LINES, MAX_DESCRIPTION_LINES,
+    MAX_NOTES_LINE_LEN,
 };
 use crate::text_input::TextInput;
 
-/// How many rows a picture takes in the body, its frame included.
+/// How many rows a picture takes in the description, its frame included.
 pub const IMAGE_ROWS: u16 = 10;
 /// `[ ] ` / `[✓] ` before a subtask (same width open or done).
 pub const TODO_INDENT: usize = 4;
@@ -29,15 +30,17 @@ pub enum Command {
     Bullet,
     Number,
     Link,
-    /// Copy non-image body text to the clipboard.
+    /// Insert system clipboard content at the caret.
+    Paste,
+    /// Copy non-image description text to the clipboard.
     Copy,
-    /// Copy a picture from the body to the clipboard.
+    /// Copy a picture from the description to the clipboard.
     CopyImage,
-    /// Copy the whole body as HTML (text + embedded pictures).
+    /// Copy the whole description as HTML (text + embedded pictures).
     CopyAll,
 }
 
-/// One line of a "copy all" export, in body order.
+/// One line of a "copy all" export, in description order.
 #[derive(Debug, Clone)]
 pub enum CopyLine {
     Text(String),
@@ -54,18 +57,33 @@ pub enum CopyPayload {
     All(Vec<CopyLine>),
 }
 
+/// Clipboard work requested by an editor command. The input layer owns the
+/// platform clipboard; the editor only owns command parsing and content.
+#[derive(Debug, Clone)]
+pub enum CommandRequest {
+    Copy(CopyPayload),
+    Paste,
+}
+
 impl Command {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Todo,
         Self::Bullet,
         Self::Number,
         Self::Link,
+        Self::Paste,
         Self::Copy,
         Self::CopyImage,
         Self::CopyAll,
     ];
-    /// Categories: bullets and text copy (no to-dos or pictures).
-    pub const PLAIN: [Self; 2] = [Self::Bullet, Self::Copy];
+    /// Category descriptions: prose, lists, links, text paste, and text copy.
+    pub const PLAIN: [Self; 5] = [
+        Self::Bullet,
+        Self::Number,
+        Self::Link,
+        Self::Paste,
+        Self::Copy,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -73,21 +91,27 @@ impl Command {
             Self::Bullet => "Bullet point",
             Self::Number => "Numbered list",
             Self::Link => "Link",
+            Self::Paste => "Paste",
             Self::Copy => "Copy text",
             Self::CopyImage => "Copy image",
             Self::CopyAll => "Copy all",
         }
     }
 
-    pub fn hint(self) -> &'static str {
-        match self {
-            Self::Todo => "tick it off with Ctrl+D",
-            Self::Bullet => "or type - and a space",
-            Self::Number => "or type 1. and a space",
-            Self::Link => "click or ⌘↵ to open",
-            Self::Copy => "prose, bullets, to-dos",
-            Self::CopyImage => "nearest picture in the body",
-            Self::CopyAll => "text and pictures together",
+    fn hint(self, plain: bool) -> &'static str {
+        match (self, plain) {
+            (Self::Paste, true) => "text from clipboard",
+            (Self::Copy, true) => "prose, lists, and links",
+            (command, _) => match command {
+                Self::Todo => "tick it off with Ctrl+D",
+                Self::Bullet => "or type - and a space",
+                Self::Number => "or type 1. and a space",
+                Self::Link => "click or ⌘↵ to open",
+                Self::Paste => "text and images from clipboard",
+                Self::Copy => "prose, bullets, to-dos",
+                Self::CopyImage => "nearest picture in the description",
+                Self::CopyAll => "text and pictures together",
+            },
         }
     }
 
@@ -97,6 +121,7 @@ impl Command {
             Self::Bullet => &["bullet", "point", "dash", "item", "list"],
             Self::Number => &["number", "numbered", "ordered", "ol", "1"],
             Self::Link => &["link", "url", "href", "http", "https", "www"],
+            Self::Paste => &["paste", "insert"],
             Self::Copy => &["copy", "clipboard", "text"],
             Self::CopyImage => &["image", "picture", "pic", "img", "photo"],
             Self::CopyAll => &["copyall", "all", "everything", "rich"],
@@ -221,6 +246,22 @@ fn link_url_from_line(s: &str) -> String {
     s.to_string()
 }
 
+fn has_explicit_supported_link_scheme(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("mailto:")
+        || value.starts_with("file:")
+}
+
+fn plain_link_value(url: &str) -> String {
+    if has_explicit_supported_link_scheme(url) {
+        url.to_string()
+    } else {
+        format!("[link]({url})")
+    }
+}
+
 /// Display width of `n. ` (e.g. `1. ` → 3, `10. ` → 4).
 fn number_indent(n: usize) -> usize {
     let n = n.max(1);
@@ -271,6 +312,23 @@ fn line_from_block(block: &Block, line_max_len: usize) -> Line {
             path: attachment_id.clone(),
         },
     }
+}
+
+fn plain_line_to_block(line: &str) -> Block {
+    if let Some(rest) = line.strip_prefix("- ") {
+        return Block::bullet(rest);
+    }
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0
+        && let Some(rest) = line.get(digits..).and_then(|rest| rest.strip_prefix(". "))
+    {
+        return Block::number(rest);
+    }
+    let link = link_url_from_line(line);
+    if link != line || has_explicit_supported_link_scheme(&link) {
+        return Block::link(&link);
+    }
+    Block::text(line)
 }
 
 fn block_from_input(input: &TextInput, make: impl FnOnce(&str) -> Block) -> Option<Block> {
@@ -355,9 +413,9 @@ impl TextKind {
 
 pub struct Placed {
     pub block: Painted,
-    /// Index into the body line list (for image hit-testing).
+    /// Index into the description line list (for image hit-testing).
     pub line: usize,
-    /// Row of the body box this block starts on, and how tall it is.
+    /// Row of the description box this block starts on, and how tall it is.
     pub y: u16,
     pub rows: u16,
     /// Whether the cursor is on this block. A picture cannot hold a text
@@ -375,31 +433,31 @@ struct LineLayout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BodyEditor {
+pub struct DescriptionEditor {
     lines: Vec<Line>,
     cursor: usize,
     scroll: usize,
     pub menu: Option<SlashMenu>,
-    /// Prose only: no `/` menu, no pictures. Categories use this.
+    /// Restricted command set. Category descriptions use this.
     plain: bool,
     /// Cap on how many blocks may be added (existing oversize files stay).
     max_lines: usize,
     /// Cap passed to each line's [`crate::text_input::TextInput`].
     line_max_len: usize,
-    /// Last body width used for layout (for wrap / click / vertical move).
+    /// Last description width used for layout (for wrap / click / vertical move).
     layout_width: usize,
     /// Total content rows from the last [`Self::layout`] (for the scrollbar).
     content_height: usize,
     /// Preferred display column when moving up/down across wrap rows.
     prefer_col: u16,
-    /// Body-level selection anchor `(line, grapheme)`. Cursor is the other end.
+    /// Description-level selection anchor `(line, grapheme)`. Cursor is the other end.
     /// Used for Shift(+Option) motions that can span multiple lines.
     sel_anchor: Option<(usize, usize)>,
     image_root: PathBuf,
     attachments: crate::image::AttachmentCatalog,
 }
 
-impl BodyEditor {
+impl DescriptionEditor {
     pub fn new(blocks: &[Block]) -> Self {
         Self::new_with_images(blocks, crate::image::default_images_root(), &[])
     }
@@ -413,7 +471,7 @@ impl BodyEditor {
         catalog.set(attachments);
         Self::from_blocks(
             blocks,
-            MAX_BODY_LINES,
+            MAX_DESCRIPTION_LINES,
             MAX_NOTES_LINE_LEN,
             false,
             image_root,
@@ -421,16 +479,10 @@ impl BodyEditor {
         )
     }
 
-    /// A prose editor with bullets: for category descriptions. No to-dos
-    /// or pictures — `/` only offers a bullet.
+    /// A text-only editor for category descriptions. It supports prose,
+    /// bullets, numbered lists, and links, but not task-only to-dos or images.
     pub fn plain(text: &str) -> Self {
-        let blocks: Vec<Block> = text
-            .split('\n')
-            .map(|line| match line.strip_prefix("- ") {
-                Some(rest) => Block::bullet(rest),
-                None => Block::text(line),
-            })
-            .collect();
+        let blocks: Vec<Block> = text.split('\n').map(plain_line_to_block).collect();
         Self::from_blocks(
             &blocks,
             MAX_CATEGORY_DESC_LINES,
@@ -471,8 +523,8 @@ impl BodyEditor {
             image_root,
             attachments,
         };
-        // Turn bare image paths in the body into picture blocks.
         if !plain {
+            // Turn bare image paths in a task description into picture blocks.
             editor.adopt_pasted_paths();
         }
         editor
@@ -496,6 +548,9 @@ impl BodyEditor {
 
     pub fn set_attachments(&mut self, attachments: &[crate::store::Attachment]) {
         self.attachments.set(attachments);
+        if !self.plain {
+            self.adopt_pasted_paths();
+        }
     }
 
     pub fn image_root(&self) -> &std::path::Path {
@@ -523,6 +578,10 @@ impl BodyEditor {
             .unwrap_or_default()
     }
 
+    pub fn command_hint(&self, command: Command) -> &'static str {
+        command.hint(self.plain)
+    }
+
     /// The prose back out, one block per line.
     pub fn plain_value(&self) -> String {
         let mut n = 0usize;
@@ -543,7 +602,7 @@ impl BodyEditor {
                 }
                 Block::Link { url } => {
                     n = 0;
-                    Some(url.clone())
+                    Some(plain_link_value(url))
                 }
                 _ => {
                     n = 0;
@@ -555,7 +614,7 @@ impl BodyEditor {
     }
 
     /// The blocks worth saving. Empty prose lines are layout and round-trip
-    /// with surrounding content; an entirely empty editor stays an empty body.
+    /// with surrounding content; an entirely empty editor stays an empty description.
     pub fn value(&self) -> Vec<Block> {
         if self.is_empty() {
             return Vec::new();
@@ -607,7 +666,7 @@ impl BodyEditor {
         self.cursor
     }
 
-    /// Whether any body or in-line selection is active (no string build).
+    /// Whether any description or in-line selection is active (no string build).
     pub fn has_selection(&self) -> bool {
         if self.ordered_selection().is_some() {
             return true;
@@ -617,7 +676,7 @@ impl BodyEditor {
             .is_some_and(|t| t.has_selection())
     }
 
-    /// Selected text: multi-line body selection if active, else the
+    /// Selected text: multi-line description selection if active, else the
     /// current line's in-line selection. Pictures become `[image: path]`.
     pub fn selected_text(&self) -> Option<String> {
         if let Some(payload) = self.selected_payload() {
@@ -710,7 +769,7 @@ impl BodyEditor {
         matches!(self.lines.get(i), Some(Line::Image { .. }))
     }
 
-    /// Whether line `i` sits inside the body selection (for frames / paint).
+    /// Whether line `i` sits inside the description selection (for frames / paint).
     /// A picture is selected as a whole unit whenever the range covers it
     /// (including when the caret has only just landed on it).
     pub fn line_in_selection(&self, i: usize) -> bool {
@@ -824,7 +883,7 @@ impl BodyEditor {
         }
     }
 
-    fn clear_body_selection(&mut self) {
+    fn clear_description_selection(&mut self) {
         self.sel_anchor = None;
         for line in &mut self.lines {
             if let Some(input) = line.input() {
@@ -833,9 +892,9 @@ impl BodyEditor {
         }
     }
 
-    /// Delete body-level or in-line selection. Returns true if anything
+    /// Delete description-level or in-line selection. Returns true if anything
     /// was removed.
-    pub fn delete_body_selection(&mut self) -> bool {
+    pub fn delete_description_selection(&mut self) -> bool {
         if let Some(((al, ac), (bl, bc))) = self.ordered_selection() {
             if al == bl {
                 // One line: cut the selected range out and rebuild the
@@ -931,7 +990,7 @@ impl BodyEditor {
         }
     }
 
-    /// URL under a rendered body cell. Padding to the right of a short link
+    /// URL under a rendered description cell. Padding to the right of a short link
     /// is deliberately not interactive.
     pub fn link_url_at_position(&self, row: u16, col: usize) -> Option<String> {
         use unicode_width::UnicodeWidthStr;
@@ -979,7 +1038,7 @@ impl BodyEditor {
         }
     }
 
-    /// Every image in the body, so the dialog can preview one.
+    /// Every image in the description, so the dialog can preview one.
     pub fn images(&self) -> Vec<PathBuf> {
         self.lines
             .iter()
@@ -1029,7 +1088,7 @@ impl BodyEditor {
 
     pub fn insert(&mut self, c: char) {
         // Typing over a selection replaces it.
-        if self.has_selection() && !self.delete_body_selection() {
+        if self.has_selection() && !self.delete_description_selection() {
             return;
         }
         if self.input().is_none() {
@@ -1081,7 +1140,7 @@ impl BodyEditor {
 
     pub fn insert_str(&mut self, text: &str) {
         self.close_menu();
-        if self.has_selection() && !self.delete_body_selection() {
+        if self.has_selection() && !self.delete_description_selection() {
             return;
         }
         // Paste may wrap a long path across lines; flatten if it is one image path.
@@ -1163,7 +1222,7 @@ impl BodyEditor {
             }
         }
         let had_selection = self.has_selection();
-        if self.delete_body_selection() {
+        if self.delete_description_selection() {
             return;
         }
         if had_selection {
@@ -1222,7 +1281,7 @@ impl BodyEditor {
     pub fn delete(&mut self) {
         self.close_menu();
         let had_selection = self.has_selection();
-        if self.delete_body_selection() {
+        if self.delete_description_selection() {
             return;
         }
         if had_selection {
@@ -1286,7 +1345,7 @@ impl BodyEditor {
 
     pub fn up(&mut self) {
         self.close_menu();
-        self.clear_body_selection();
+        self.clear_description_selection();
         // Already on a picture: leave it upward (may insert a blank above).
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
             self.leave_image_backward();
@@ -1328,7 +1387,7 @@ impl BodyEditor {
 
     pub fn down(&mut self) {
         self.close_menu();
-        self.clear_body_selection();
+        self.clear_description_selection();
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
             self.leave_image_forward();
             return;
@@ -1369,7 +1428,7 @@ impl BodyEditor {
     pub fn left(&mut self) {
         self.close_menu();
         self.prefer_col = u16::MAX;
-        self.clear_body_selection();
+        self.clear_description_selection();
         // On a picture there is no text caret — ← steps into the line above
         // (creating an empty one when the picture is first).
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
@@ -1396,7 +1455,7 @@ impl BodyEditor {
     pub fn right(&mut self) {
         self.close_menu();
         self.prefer_col = u16::MAX;
-        self.clear_body_selection();
+        self.clear_description_selection();
         // On a picture there is no text caret — → steps into a line below
         // (creating an empty one when needed) so the user can type again.
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
@@ -1463,7 +1522,7 @@ impl BodyEditor {
 
     pub fn home(&mut self) {
         self.close_menu();
-        self.clear_body_selection();
+        self.clear_description_selection();
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
             self.leave_image_backward();
             return;
@@ -1475,7 +1534,7 @@ impl BodyEditor {
 
     pub fn end(&mut self) {
         self.close_menu();
-        self.clear_body_selection();
+        self.clear_description_selection();
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
             self.leave_image_forward();
             return;
@@ -1487,7 +1546,7 @@ impl BodyEditor {
 
     pub fn word_left(&mut self) {
         self.close_menu();
-        self.clear_body_selection();
+        self.clear_description_selection();
         self.prefer_col = u16::MAX;
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
             self.leave_image_backward();
@@ -1512,7 +1571,7 @@ impl BodyEditor {
 
     pub fn word_right(&mut self) {
         self.close_menu();
-        self.clear_body_selection();
+        self.clear_description_selection();
         self.prefer_col = u16::MAX;
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
             self.leave_image_forward();
@@ -1777,7 +1836,7 @@ impl BodyEditor {
             .join("\n")
     }
 
-    /// Full body in order for `/copyall` — text lines and pictures.
+    /// Full description in order for `/copyall` — text lines and pictures.
     pub fn lines_for_copy_all(&self) -> Vec<CopyLine> {
         self.lines
             .iter()
@@ -1832,9 +1891,9 @@ impl BodyEditor {
         None
     }
 
-    /// Removes the typed `/command` and applies it. Returns clipboard
-    /// payload for copy commands.
-    pub fn apply(&mut self, command: Command) -> Option<CopyPayload> {
+    /// Removes the typed `/command` and applies it. Returns work that needs
+    /// access to the platform clipboard.
+    pub fn apply(&mut self, command: Command) -> Option<CommandRequest> {
         if !self.allowed_commands().contains(&command) {
             self.close_menu();
             return None;
@@ -1848,10 +1907,18 @@ impl BodyEditor {
                 input.backspace();
             }
         }
-        let payload = match command {
-            Command::Copy => Some(CopyPayload::Text(self.text_for_copy())),
-            Command::CopyImage => self.image_for_copy().map(CopyPayload::Image),
-            Command::CopyAll => Some(CopyPayload::All(self.lines_for_copy_all())),
+        let request = match command {
+            Command::Paste => Some(CommandRequest::Paste),
+            Command::Copy => Some(CommandRequest::Copy(CopyPayload::Text(
+                self.text_for_copy(),
+            ))),
+            Command::CopyImage => self
+                .image_for_copy()
+                .map(CopyPayload::Image)
+                .map(CommandRequest::Copy),
+            Command::CopyAll => Some(CommandRequest::Copy(CopyPayload::All(
+                self.lines_for_copy_all(),
+            ))),
             Command::Todo | Command::Bullet | Command::Number | Command::Link => {
                 let text = match self.line() {
                     Line::Text(text)
@@ -1869,7 +1936,9 @@ impl BodyEditor {
                         let url = link_url_from_line(&text.value());
                         Line::Link(TextInput::new(&url, self.line_max_len))
                     }
-                    Command::Copy | Command::CopyImage | Command::CopyAll => return None,
+                    Command::Paste | Command::Copy | Command::CopyImage | Command::CopyAll => {
+                        return None;
+                    }
                 };
                 None
             }
@@ -1881,12 +1950,15 @@ impl BodyEditor {
         {
             self.remove_block();
         }
-        payload
+        request
     }
 
     /// Puts a block in at the cursor, replacing the line when it is an
     /// empty one and pushing it down otherwise.
-    pub fn insert_block(&mut self, block: Block) {
+    pub fn insert_block(&mut self, block: Block) -> bool {
+        if self.plain && matches!(block, Block::Todo { .. } | Block::Image { .. }) {
+            return false;
+        }
         self.close_menu();
         let is_image = matches!(block, Block::Image { .. });
         let replace = match &self.lines[self.cursor] {
@@ -1900,7 +1972,7 @@ impl BodyEditor {
             (false, false) => 1,
         };
         if extra > 0 && !self.can_add_lines(extra) {
-            return;
+            return false;
         }
         let line = line_from_block(&block, self.line_max_len);
         if replace {
@@ -1914,6 +1986,7 @@ impl BodyEditor {
             self.lines.insert(self.cursor + 1, self.empty_line());
             self.cursor += 1;
         }
+        true
     }
 
     /// Turn bare image-file paths into image blocks (paste / leave-line).
@@ -1932,10 +2005,18 @@ impl BodyEditor {
             return;
         };
         let value = text.value();
-        if !crate::image::looks_like_image(&value) {
+        let reference = crate::image::reference_path(&value);
+        if !crate::image::looks_like_image(&value)
+            && !reference.is_some_and(|reference| self.attachments.contains(reference))
+        {
             return;
         }
-        if let Some(path) = crate::image::path_if_image_in(&value, &self.image_root) {
+        if let Some(reference) = reference.filter(|reference| self.attachments.contains(reference))
+        {
+            self.lines[i] = Line::Image {
+                path: reference.to_string(),
+            };
+        } else if let Some(path) = crate::image::path_if_image_in(&value, &self.image_root) {
             self.lines[i] = Line::Image {
                 path: crate::image::short_in(&path, &self.image_root),
             };
@@ -2105,7 +2186,7 @@ impl BodyEditor {
         (placed, cursor_at)
     }
 
-    /// Body scroll offset after the last [`Self::layout`] call.
+    /// Description scroll offset after the last [`Self::layout`] call.
     pub fn scroll(&self) -> usize {
         self.scroll
     }
@@ -2115,7 +2196,7 @@ impl BodyEditor {
         self.content_height
     }
 
-    /// Moves the cursor to a clicked cell of the body box.
+    /// Moves the cursor to a clicked cell of the description box.
     /// Returns `true` when the click landed on a real block (not empty
     /// padding below the content).
     pub fn click(&mut self, row: u16, col: usize) -> bool {
@@ -2143,7 +2224,7 @@ impl BodyEditor {
         }
         self.close_menu();
         self.prefer_col = u16::MAX;
-        self.clear_body_selection();
+        self.clear_description_selection();
         hit
     }
 }
@@ -2152,11 +2233,11 @@ impl BodyEditor {
 mod tests {
     use super::*;
 
-    fn editor(blocks: &[Block]) -> BodyEditor {
-        BodyEditor::new(blocks)
+    fn editor(blocks: &[Block]) -> DescriptionEditor {
+        DescriptionEditor::new(blocks)
     }
 
-    fn type_in(editor: &mut BodyEditor, text: &str) {
+    fn type_in(editor: &mut DescriptionEditor, text: &str) {
         for c in text.chars() {
             editor.insert(c);
         }
@@ -2172,7 +2253,7 @@ mod tests {
     }
 
     #[test]
-    fn body_value_round_trips_blank_rows_around_content() {
+    fn description_value_round_trips_blank_rows_around_content() {
         let mut e = editor(&[]);
         assert!(e.newline());
         type_in(&mut e, "first");
@@ -2195,7 +2276,7 @@ mod tests {
 
     #[test]
     fn refuses_more_lines_than_the_cap() {
-        let mut e = BodyEditor::from_blocks(
+        let mut e = DescriptionEditor::from_blocks(
             &[],
             2,
             32,
@@ -2212,7 +2293,7 @@ mod tests {
 
     #[test]
     fn plain_description_uses_shorter_line_cap() {
-        let mut e = BodyEditor::plain("");
+        let mut e = DescriptionEditor::plain("");
         type_in(&mut e, &"x".repeat(MAX_CATEGORY_DESC_LINE_LEN + 10));
         assert_eq!(
             e.value()[0],
@@ -2358,8 +2439,8 @@ mod tests {
     }
 
     #[test]
-    fn moving_the_cursor_closes_the_body_command_menu() {
-        let mut editor = BodyEditor::new(&[]);
+    fn moving_the_cursor_closes_the_description_command_menu() {
+        let mut editor = DescriptionEditor::new(&[]);
         for c in "/todo".chars() {
             editor.insert(c);
         }
@@ -2376,7 +2457,7 @@ mod tests {
 
     #[test]
     fn link_hit_testing_excludes_blank_row_padding() {
-        let mut editor = BodyEditor::new(&[Block::link("https://example.com")]);
+        let mut editor = DescriptionEditor::new(&[Block::link("https://example.com")]);
         let _ = editor.layout(40, 4);
 
         assert_eq!(
@@ -2413,7 +2494,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_in_the_body_becomes_a_picture() {
+    fn a_path_in_the_description_becomes_a_picture() {
         // A real file, so the check that it is readable passes.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/screenshot.png");
         let e = editor(&[Block::text(path), Block::text("below")]);
@@ -2552,7 +2633,7 @@ mod tests {
 
     #[test]
     fn plain_text_round_trips_its_bullets() {
-        let e = BodyEditor::plain("intro\n- first\n- second");
+        let e = DescriptionEditor::plain("intro\n- first\n- second");
         assert_eq!(e.value().len(), 3);
         assert_eq!(e.plain_value(), "intro\n- first\n- second");
     }
@@ -2560,18 +2641,18 @@ mod tests {
     #[test]
     fn plain_description_round_trips_blank_rows() {
         let description = "\nfirst\n\nsecond\n";
-        let e = BodyEditor::plain(description);
+        let e = DescriptionEditor::plain(description);
 
         assert_eq!(e.plain_value(), description);
         assert_eq!(
-            BodyEditor::plain(&e.plain_value()).plain_value(),
+            DescriptionEditor::plain(&e.plain_value()).plain_value(),
             description
         );
     }
 
     #[test]
     fn plain_mode_rejects_todo_slash_command() {
-        let mut e = BodyEditor::plain("");
+        let mut e = DescriptionEditor::plain("");
         type_in(&mut e, "/todo");
         assert!(e.menu.is_none(), "no to-do command in plain mode");
         assert_eq!(e.value(), vec![Block::text("/todo")]);
@@ -2579,12 +2660,86 @@ mod tests {
 
     #[test]
     fn plain_mode_slash_makes_a_bullet() {
-        let mut e = BodyEditor::plain("");
+        let mut e = DescriptionEditor::plain("");
         type_in(&mut e, "/bul");
         assert_eq!(e.menu_selected(), Some(Command::Bullet));
         e.apply(Command::Bullet);
         type_in(&mut e, "a point");
         assert_eq!(e.plain_value(), "- a point");
+    }
+
+    #[test]
+    fn plain_mode_supports_numbered_lists_and_links_but_not_images() {
+        let mut numbered = DescriptionEditor::plain("");
+        type_in(&mut numbered, "/num");
+        assert_eq!(numbered.menu_selected(), Some(Command::Number));
+        numbered.apply(Command::Number);
+        type_in(&mut numbered, "first");
+        assert_eq!(numbered.plain_value(), "1. first");
+        assert!(matches!(
+            DescriptionEditor::plain(&numbered.plain_value()).value().as_slice(),
+            [Block::Number { text }] if text == "first"
+        ));
+
+        let mut link = DescriptionEditor::plain("https://example.com");
+        link.end();
+        type_in(&mut link, "/link");
+        assert_eq!(link.menu_selected(), Some(Command::Link));
+        link.apply(Command::Link);
+        assert!(matches!(link.value().as_slice(), [Block::Link { .. }]));
+        assert!(matches!(
+            DescriptionEditor::plain(&link.plain_value()).value().as_slice(),
+            [Block::Link { url }] if url == "https://example.com"
+        ));
+
+        let mut bare_link = DescriptionEditor::plain("example.com");
+        bare_link.end();
+        type_in(&mut bare_link, "/link");
+        bare_link.apply(Command::Link);
+        assert_eq!(bare_link.plain_value(), "[link](example.com)");
+        assert!(matches!(
+            DescriptionEditor::plain(&bare_link.plain_value())
+                .value()
+                .as_slice(),
+            [Block::Link { url }] if url == "example.com"
+        ));
+
+        assert!(
+            !DescriptionEditor::plain("")
+                .allowed_commands()
+                .contains(&Command::CopyImage)
+        );
+        assert!(
+            !DescriptionEditor::plain("")
+                .allowed_commands()
+                .contains(&Command::CopyAll)
+        );
+    }
+
+    #[test]
+    fn plain_description_does_not_adopt_image_files() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/screenshot.png");
+        let mut editor = DescriptionEditor::plain(path);
+
+        assert_eq!(editor.value(), vec![Block::text(path)]);
+        assert!(!editor.insert_block(Block::image(path)));
+        assert_eq!(editor.value(), vec![Block::text(path)]);
+    }
+
+    #[test]
+    fn plain_description_slash_paste_requests_clipboard_content() {
+        let mut e = DescriptionEditor::plain("before");
+        e.end();
+        e.newline();
+        type_in(&mut e, "/paste");
+
+        assert_eq!(e.menu_selected(), Some(Command::Paste));
+        assert!(matches!(
+            e.apply(Command::Paste),
+            Some(CommandRequest::Paste)
+        ));
+        e.insert_str("clipboard\n- item");
+        assert_eq!(e.plain_value(), "before\nclipboard\n- item");
     }
 
     #[test]
@@ -2628,13 +2783,37 @@ mod tests {
         e.newline();
         type_in(&mut e, "/copy");
         assert_eq!(e.menu_selected(), Some(Command::Copy));
-        match e.apply(Command::Copy).expect("copy yields payload") {
-            CopyPayload::Text(text) => assert_eq!(text, "keep me"),
-            CopyPayload::Image(_) | CopyPayload::All(_) => panic!("expected text"),
+        match e.apply(Command::Copy).expect("copy yields request") {
+            CommandRequest::Copy(CopyPayload::Text(text)) => assert_eq!(text, "keep me"),
+            CommandRequest::Copy(CopyPayload::Image(_) | CopyPayload::All(_))
+            | CommandRequest::Paste => panic!("expected text copy"),
         }
         assert!(e.menu.is_none());
         // The `/copy` line is gone (it was empty after stripping).
         assert_eq!(e.value(), vec![Block::text("keep me")]);
+    }
+
+    #[test]
+    fn description_slash_paste_requests_clipboard_content() {
+        let mut e = editor(&[Block::text("before")]);
+        e.end();
+        e.newline();
+        type_in(&mut e, "/pas");
+
+        assert_eq!(e.menu_selected(), Some(Command::Paste));
+        assert!(matches!(
+            e.apply(Command::Paste),
+            Some(CommandRequest::Paste)
+        ));
+        e.insert_str("clipboard\n- item");
+        assert_eq!(
+            e.value(),
+            vec![
+                Block::text("before"),
+                Block::text("clipboard"),
+                Block::text("- item")
+            ]
+        );
     }
 
     #[test]
@@ -2659,9 +2838,12 @@ mod tests {
         e.down();
         type_in(&mut e, "/img");
         assert_eq!(e.menu_selected(), Some(Command::CopyImage));
-        match e.apply(Command::CopyImage).expect("image payload") {
-            CopyPayload::Image(p) => assert!(p.ends_with("screenshot.png")),
-            CopyPayload::Text(_) | CopyPayload::All(_) => panic!("expected image"),
+        match e.apply(Command::CopyImage).expect("image request") {
+            CommandRequest::Copy(CopyPayload::Image(p)) => {
+                assert!(p.ends_with("screenshot.png"))
+            }
+            CommandRequest::Copy(CopyPayload::Text(_) | CopyPayload::All(_))
+            | CommandRequest::Paste => panic!("expected image copy"),
         }
     }
 
@@ -2762,21 +2944,21 @@ mod tests {
     }
 
     #[test]
-    fn narrow_maximum_body_keeps_the_last_row_addressable() {
+    fn narrow_maximum_description_keeps_the_last_row_addressable() {
         let line = "x".repeat(MAX_NOTES_LINE_LEN);
-        let blocks = vec![Block::text(&line); MAX_BODY_LINES];
+        let blocks = vec![Block::text(&line); MAX_DESCRIPTION_LINES];
         let mut e = editor(&blocks);
         e.cursor = e.lines.len() - 1;
         e.input().unwrap().end();
 
         let (_, cursor) = e.layout(1, 10);
 
-        let expected_height = MAX_BODY_LINES * MAX_NOTES_LINE_LEN;
+        let expected_height = MAX_DESCRIPTION_LINES * MAX_NOTES_LINE_LEN;
         assert_eq!(e.content_height() as usize, expected_height);
         assert_eq!(e.scroll() as usize, expected_height - 10);
         assert_eq!(cursor, Some((9, 1)));
         assert!(e.click(0, 0));
-        assert_eq!(e.cursor_line(), MAX_BODY_LINES - 1);
+        assert_eq!(e.cursor_line(), MAX_DESCRIPTION_LINES - 1);
     }
 
     #[test]

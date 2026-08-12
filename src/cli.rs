@@ -35,8 +35,8 @@ const HELP: &str = "\
 
   add [TITLE]
     -t, --title TITLE    title (required if no positional TITLE)
-    -b, --body TEXT      body (newlines = lines; see BODY MARKUP)
-    -d, --due DATE       YYYY-MM-DD | MM-DD | HH:MM | DATEThh:mm
+    -d, --description TEXT  description (newlines = lines; see DESCRIPTION MARKUP)
+    --due DATE            YYYY-MM-DD | MM-DD | HH:MM | DATEThh:mm
     --time HH:MM         with --due, or alone = next occurrence
     -c, --category NAME  category (name or unique prefix)
     -i, --importance N   0–3 (default 0)
@@ -57,15 +57,15 @@ const HELP: &str = "\
 
   edit ID                only given flags change
     -t, --title TITLE
-    -b, --body TEXT      replace entire body (BODY MARKUP; wipes old body)
-    -d, --due DATE       date-only keeps existing time
+    -d, --description TEXT  replace entire description (DESCRIPTION MARKUP; wipes old description)
+    --due DATE            date-only keeps existing time
     --time HH:MM         keeps existing date if no --due
     --clear-due          remove due date/time
     -c, --category NAME
     --clear-category     uncategorized
     -i, --importance N   0–3
 
-  BODY MARKUP (add/edit --body, one block per line)
+  DESCRIPTION MARKUP (add/edit --description, one block per line)
     plain text
     [ ] item / [x] item  subtask
     - item / • item      bullet
@@ -234,11 +234,11 @@ struct AddArgs {
     /// Title
     #[arg(short = 't', long = "title")]
     title: Option<String>,
-    /// Body text (newlines → lines)
-    #[arg(short = 'b', long = "body")]
-    body: Option<String>,
+    /// Description text (newlines → lines)
+    #[arg(short = 'd', long = "description")]
+    description: Option<String>,
     /// Due date
-    #[arg(short = 'd', long = "due", value_name = "DATE")]
+    #[arg(long = "due", value_name = "DATE")]
     due: Option<String>,
     /// Due time HH:MM (with --due, or alone = next occurrence)
     #[arg(long = "time", value_name = "HH:MM")]
@@ -266,11 +266,11 @@ struct EditArgs {
     /// New title
     #[arg(short = 't', long = "title")]
     title: Option<String>,
-    /// Replace body
-    #[arg(short = 'b', long = "body")]
-    body: Option<String>,
+    /// Replace description
+    #[arg(short = 'd', long = "description")]
+    description: Option<String>,
     /// Due date
-    #[arg(short = 'd', long = "due", value_name = "DATE")]
+    #[arg(long = "due", value_name = "DATE")]
     due: Option<String>,
     /// Due time HH:MM
     #[arg(long = "time", value_name = "HH:MM")]
@@ -457,7 +457,7 @@ fn rendered(json_mode: bool, value: Value, plain: String) -> Rendered {
 }
 
 pub fn run() {
-    let arguments = normalize_documented_body_values(std::env::args_os().collect());
+    let arguments = normalize_documented_description_values(std::env::args_os().collect());
     let json_requested = requested_json(&arguments);
     let cli = match Cli::try_parse_from(&arguments) {
         Ok(cli) => cli,
@@ -504,9 +504,9 @@ pub fn run() {
 }
 
 /// Clap normally treats a separate leading-hyphen value as another option.
-/// Preserve that unambiguous behavior except for the documented `- ` body
-/// bullet; explicit `--body=...` remains the escape hatch for all other text.
-fn normalize_documented_body_values(arguments: Vec<OsString>) -> Vec<OsString> {
+/// Preserve that unambiguous behavior except for the documented `- ` description
+/// bullet; explicit `--description=...` remains the escape hatch for all other text.
+fn normalize_documented_description_values(arguments: Vec<OsString>) -> Vec<OsString> {
     let mut normalized = Vec::with_capacity(arguments.len());
     let mut arguments = arguments.into_iter().peekable();
     let mut options = true;
@@ -516,15 +516,17 @@ fn normalize_documented_body_values(arguments: Vec<OsString>) -> Vec<OsString> {
             normalized.push(argument);
             continue;
         }
-        let body_option = options && (argument == "--body" || argument == "-b");
-        let documented_bullet = body_option
+        let description_option = options && (argument == "--description" || argument == "-d");
+        let documented_bullet = description_option
             && arguments
                 .peek()
                 .and_then(|value| value.to_str())
                 .is_some_and(|value| value.starts_with("- "));
         if documented_bullet {
-            let value = arguments.next().expect("peeked body value must exist");
-            let mut combined = OsString::from("--body=");
+            let value = arguments
+                .next()
+                .expect("peeked description value must exist");
+            let mut combined = OsString::from("--description=");
             combined.push(value);
             normalized.push(combined);
         } else {
@@ -848,7 +850,7 @@ fn terminal_text(text: &str) -> String {
     safe
 }
 
-fn body_from_text(text: &str) -> Vec<Block> {
+fn description_from_text(text: &str) -> Vec<Block> {
     if text.is_empty() {
         return Vec::new();
     }
@@ -898,9 +900,10 @@ fn strip_number_prefix(line: &str) -> Option<&str> {
     line.get(index..)?.strip_prefix(". ")
 }
 
-fn body_to_text(body: &[Block]) -> String {
+fn description_to_text(description: &[Block]) -> String {
     let mut numbered = 0usize;
-    body.iter()
+    description
+        .iter()
         .map(|block| match block {
             Block::Text { text } => {
                 numbered = 0;
@@ -931,8 +934,9 @@ fn body_to_text(body: &[Block]) -> String {
         .join("\n")
 }
 
-fn collect_subtasks(body: &[Block]) -> Vec<(usize, &str, bool)> {
-    body.iter()
+fn collect_subtasks(description: &[Block]) -> Vec<(usize, &str, bool)> {
+    description
+        .iter()
         .filter_map(|block| match block {
             Block::Todo { text, done } => Some((text.as_str(), *done)),
             _ => None,
@@ -942,18 +946,18 @@ fn collect_subtasks(body: &[Block]) -> Vec<(usize, &str, bool)> {
         .collect()
 }
 
-fn subtask_body_index(body: &[Block], one_based: usize) -> Result<usize, CliError> {
+fn subtask_description_index(description: &[Block], one_based: usize) -> Result<usize, CliError> {
     if one_based == 0 {
         return Err(CliError::validation(
             "subtask index is 1-based (use 1 for the first subtask)",
         ));
     }
     let mut count = 0usize;
-    for (body_index, block) in body.iter().enumerate() {
+    for (description_index, block) in description.iter().enumerate() {
         if matches!(block, Block::Todo { .. }) {
             count += 1;
             if count == one_based {
-                return Ok(body_index);
+                return Ok(description_index);
             }
         }
     }
@@ -962,8 +966,8 @@ fn subtask_body_index(body: &[Block], one_based: usize) -> Result<usize, CliErro
     )))
 }
 
-fn subtasks_json(body: &[Block]) -> Vec<Value> {
-    subtasks_to_json(&collect_subtasks(body))
+fn subtasks_json(description: &[Block]) -> Vec<Value> {
+    subtasks_to_json(&collect_subtasks(description))
 }
 
 fn subtasks_to_json(subtasks: &[(usize, &str, bool)]) -> Vec<Value> {
@@ -981,12 +985,12 @@ fn category_name<'a>(categories: &'a [Category], task: &Task) -> Option<&'a str>
 }
 
 fn task_json(categories: &[Category], task: &Task) -> Value {
-    let subtasks = collect_subtasks(&task.body);
+    let subtasks = collect_subtasks(&task.description);
     let subtasks_json = subtasks_to_json(&subtasks);
     json!({
         "id": task.id,
         "title": task.title,
-        "body": body_to_text(&task.body),
+        "description": description_to_text(&task.description),
         "subtasks": subtasks_json,
         "subtasks_done": subtasks.iter().filter(|(_, _, done)| *done).count(),
         "subtasks_total": subtasks.len(),
@@ -1343,17 +1347,17 @@ fn cmd_add(store: &mut Store, arguments: &AddArgs, json_mode: bool) -> Result<Re
             "title required (positional or --title)",
         ));
     }
-    let mut body = arguments
-        .body
+    let mut description = arguments
+        .description
         .as_deref()
-        .map(body_from_text)
+        .map(description_from_text)
         .unwrap_or_default();
     for subtask in &arguments.subtasks {
         let text = subtask.trim();
         if text.is_empty() {
             return Err(CliError::validation("--subtask text cannot be empty"));
         }
-        body.push(Block::todo(text, false));
+        description.push(Block::todo(text, false));
     }
     let due = if arguments.due.is_none() && arguments.time.is_none() {
         inline_due
@@ -1367,12 +1371,12 @@ fn cmd_add(store: &mut Store, arguments: &AddArgs, json_mode: bool) -> Result<Re
             .as_deref()
             .map(|query| data.resolve_category_id(query))
             .transpose()?;
-        let task = data.create_task(title, body, due, importance, category_id)?;
+        let task = data.create_task(title, description, due, importance, category_id)?;
         Ok(task.id)
     })?;
     let task = snapshot.task(&task_id)?.clone();
     let categories = snapshot.categories;
-    let subtasks = collect_subtasks(&task.body).len();
+    let subtasks = collect_subtasks(&task.description).len();
     let plain = if subtasks == 0 {
         format!(
             "added {}  {}\n",
@@ -1410,7 +1414,7 @@ fn cmd_show(store: &Store, query: &str, json_mode: bool) -> Result<Rendered, Cli
         crate::model::importance_marks(task.importance),
         terminal_text(&task.created),
     );
-    let subtasks = collect_subtasks(&task.body);
+    let subtasks = collect_subtasks(&task.description);
     if subtasks.is_empty() {
         plain.push_str("subtasks:   —\n");
     } else {
@@ -1427,11 +1431,11 @@ fn cmd_show(store: &Store, query: &str, json_mode: bool) -> Result<Rendered, Cli
             ));
         }
     }
-    let notes = body_note_lines(&task.body);
+    let notes = description_note_lines(&task.description);
     if notes.is_empty() {
-        plain.push_str("body:       —\n");
+        plain.push_str("description:       —\n");
     } else {
-        plain.push_str("body:\n");
+        plain.push_str("description:\n");
         for note in notes {
             plain.push_str(&format!("  {}\n", terminal_text(&note)));
         }
@@ -1443,10 +1447,10 @@ fn cmd_show(store: &Store, query: &str, json_mode: bool) -> Result<Rendered, Cli
     ))
 }
 
-fn body_note_lines(body: &[Block]) -> Vec<String> {
+fn description_note_lines(description: &[Block]) -> Vec<String> {
     let mut numbered = 0usize;
     let mut notes = Vec::new();
-    for block in body {
+    for block in description {
         match block {
             Block::Todo { .. } => numbered = 0,
             Block::Text { text } => {
@@ -1594,7 +1598,7 @@ fn cmd_edit(
     json_mode: bool,
 ) -> Result<Rendered, CliError> {
     if arguments.title.is_none()
-        && arguments.body.is_none()
+        && arguments.description.is_none()
         && arguments.due.is_none()
         && arguments.time.is_none()
         && !arguments.clear_due
@@ -1603,7 +1607,7 @@ fn cmd_edit(
         && arguments.importance.is_none()
     {
         return Err(CliError::validation(
-            "nothing to edit; pass --title / --body / --due / --time / --clear-due / --category / --clear-category / --importance",
+            "nothing to edit; pass --title / --description / --due / --time / --clear-due / --category / --clear-category / --importance",
         ));
     }
     if arguments.clear_due && (arguments.due.is_some() || arguments.time.is_some()) {
@@ -1624,7 +1628,7 @@ fn cmd_edit(
         }
         None => (None, String::new()),
     };
-    let body = arguments.body.as_deref().map(body_from_text);
+    let description = arguments.description.as_deref().map(description_from_text);
     let due_argument = arguments.due.clone();
     let time_argument = arguments.time.clone();
     let clear_due = arguments.clear_due;
@@ -1657,7 +1661,7 @@ fn cmd_edit(
             &id,
             TaskPatch {
                 title,
-                body,
+                description,
                 due,
                 importance,
                 category_id,
@@ -1685,11 +1689,11 @@ fn cmd_subtasks_list(store: &Store, query: &str, json_mode: bool) -> Result<Rend
     let data = store.snapshot()?;
     let id = data.resolve_task_id(query)?;
     let task = data.task(&id)?;
-    let subtasks = collect_subtasks(&task.body);
+    let subtasks = collect_subtasks(&task.description);
     let value = json!({
         "task_id": task.id,
         "title": task.title,
-        "subtasks": subtasks_json(&task.body),
+        "subtasks": subtasks_json(&task.description),
         "done": subtasks.iter().filter(|(_, _, done)| *done).count(),
         "total": subtasks.len(),
     });
@@ -1731,16 +1735,16 @@ fn cmd_subtask_add(
     let query = query.to_string();
     let (task, index) = store.update(|data| {
         let id = data.resolve_task_id(&query)?;
-        let mut body = data.task(&id)?.body.clone();
-        body.push(Block::todo(&text, done));
+        let mut description = data.task(&id)?.description.clone();
+        description.push(Block::todo(&text, done));
         let task = data.edit_task(
             &id,
             TaskPatch {
-                body: Some(body),
+                description: Some(description),
                 ..TaskPatch::default()
             },
         )?;
-        Ok((task, collect_subtasks(&data.task(&id)?.body).len()))
+        Ok((task, collect_subtasks(&data.task(&id)?.description).len()))
     })?;
     Ok(rendered(
         json_mode,
@@ -1749,7 +1753,7 @@ fn cmd_subtask_add(
             "index": index,
             "text": text,
             "done": done,
-            "subtasks": subtasks_json(&task.body),
+            "subtasks": subtasks_json(&task.description),
         }),
         format!(
             "added subtask {index} on {}  {}\n",
@@ -1769,10 +1773,10 @@ fn cmd_subtask_set_done(
     let query = query.to_string();
     let (task, text, new_done) = store.update(|data| {
         let id = data.resolve_task_id(&query)?;
-        let mut body = data.task(&id)?.body.clone();
-        let body_index = subtask_body_index(&body, index)
+        let mut description = data.task(&id)?.description.clone();
+        let description_index = subtask_description_index(&description, index)
             .map_err(|error| StoreError::validation(error.message))?;
-        let Block::Todo { text, done: value } = &mut body[body_index] else {
+        let Block::Todo { text, done: value } = &mut description[description_index] else {
             return Err(StoreError::Corrupt(
                 "resolved subtask index does not point to a subtask".into(),
             ));
@@ -1783,7 +1787,7 @@ fn cmd_subtask_set_done(
         let task = data.edit_task(
             &id,
             TaskPatch {
-                body: Some(body),
+                description: Some(description),
                 ..TaskPatch::default()
             },
         )?;
@@ -1796,7 +1800,7 @@ fn cmd_subtask_set_done(
             "index": index,
             "text": text,
             "done": new_done,
-            "subtasks": subtasks_json(&task.body),
+            "subtasks": subtasks_json(&task.description),
         }),
         format!(
             "{} subtask {index} on {}  {}\n",
@@ -1823,13 +1827,13 @@ fn cmd_subtask_edit(
     let query = query.to_string();
     let (task, done) = store.update(|data| {
         let id = data.resolve_task_id(&query)?;
-        let mut body = data.task(&id)?.body.clone();
-        let body_index = subtask_body_index(&body, index)
+        let mut description = data.task(&id)?.description.clone();
+        let description_index = subtask_description_index(&description, index)
             .map_err(|error| StoreError::validation(error.message))?;
         let Block::Todo {
             text: current,
             done,
-        } = &mut body[body_index]
+        } = &mut description[description_index]
         else {
             return Err(StoreError::Corrupt(
                 "resolved subtask index does not point to a subtask".into(),
@@ -1840,7 +1844,7 @@ fn cmd_subtask_edit(
         let task = data.edit_task(
             &id,
             TaskPatch {
-                body: Some(body),
+                description: Some(description),
                 ..TaskPatch::default()
             },
         )?;
@@ -1853,7 +1857,7 @@ fn cmd_subtask_edit(
             "index": index,
             "text": text,
             "done": done,
-            "subtasks": subtasks_json(&task.body),
+            "subtasks": subtasks_json(&task.description),
         }),
         format!(
             "updated subtask {index} on {}  {}\n",
@@ -1872,10 +1876,10 @@ fn cmd_subtask_delete(
     let query = query.to_string();
     let (task, text, done) = store.update(|data| {
         let id = data.resolve_task_id(&query)?;
-        let mut body = data.task(&id)?.body.clone();
-        let body_index = subtask_body_index(&body, index)
+        let mut description = data.task(&id)?.description.clone();
+        let description_index = subtask_description_index(&description, index)
             .map_err(|error| StoreError::validation(error.message))?;
-        let Block::Todo { text, done } = body.remove(body_index) else {
+        let Block::Todo { text, done } = description.remove(description_index) else {
             return Err(StoreError::Corrupt(
                 "resolved subtask index does not point to a subtask".into(),
             ));
@@ -1883,7 +1887,7 @@ fn cmd_subtask_delete(
         let task = data.edit_task(
             &id,
             TaskPatch {
-                body: Some(body),
+                description: Some(description),
                 ..TaskPatch::default()
             },
         )?;
@@ -1894,7 +1898,7 @@ fn cmd_subtask_delete(
         json!({
             "task_id": task.id,
             "deleted": { "index": index, "text": text, "done": done },
-            "subtasks": subtasks_json(&task.body),
+            "subtasks": subtasks_json(&task.description),
         }),
         format!(
             "deleted subtask {index} on {}  {}\n",

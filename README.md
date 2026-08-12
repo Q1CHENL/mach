@@ -28,7 +28,7 @@ Crate name **`mach-tui`**, binary **`mach`**.
 
 `mach` with no args opens the TUI. Subcommands cover add / list / edit /
 done / delete / categories / subtasks and more, with flags for due dates,
-importance, category, body markup, and `--json` for scripts.
+importance, category, description markup, and `--json` for scripts.
 
 ```sh
 mach --help

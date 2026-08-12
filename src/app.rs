@@ -286,7 +286,7 @@ pub struct App {
     pub last_click: Option<(Instant, Focus, usize)>,
     pub should_quit: bool,
     pub areas: Areas,
-    /// Body/preview image store.
+    /// Description/preview image store.
     pub images: ImageStore,
     pub(crate) attachments: Vec<Attachment>,
     /// Type-to-jump buffer (Tasks/Sidebar focus); cleared on timeout.
@@ -298,7 +298,7 @@ pub struct App {
     pub data_gen: u64,
     /// Per-category `(done, total)`, parallel to `categories`.
     cat_progress: Vec<(usize, usize)>,
-    /// Cached body editor for the read-only preview pane.
+    /// Cached description editor for the read-only preview pane.
     pub preview_form: Option<TaskForm>,
     preview_task_id: Option<String>,
     preview_gen: u64,
@@ -1194,7 +1194,7 @@ impl App {
                 .enumerate()
                 .filter(|(_, t)| {
                     !(hide_done && t.done)
-                        && (contains_ignore_case(&t.title, &q) || body_contains(t, &q))
+                        && (contains_ignore_case(&t.title, &q) || description_contains(t, &q))
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -1592,9 +1592,9 @@ impl App {
                 &self.attachments,
             );
             form.set_categories(&self.categories, task.category_id.as_deref());
-            // Decode body pictures off the UI thread so the dialog opens
+            // Decode description pictures off the UI thread so the dialog opens
             // immediately; they fill in on the next frames.
-            self.images.prefetch(form.body.images());
+            self.images.prefetch(form.description.images());
             self.task_edit_base = Some(task);
             self.form = Some(form);
             self.mode = Mode::TaskForm;
@@ -1638,11 +1638,11 @@ impl App {
         } else {
             &draft.due
         };
-        let body = draft.body.clone();
+        let description = draft.description.clone();
         let category_id = draft.category_id.clone();
         let importance = draft.importance;
         let task = match self.update_store(|data| {
-            data.create_task(title, body, due.to_string(), importance, category_id)
+            data.create_task(title, description, due.to_string(), importance, category_id)
         }) {
             Ok(task) => task,
             Err(error) => {
@@ -1678,7 +1678,8 @@ impl App {
         let patch = match expected.as_ref() {
             Some(base) => TaskPatch {
                 title: (title != base.title).then_some(title),
-                body: (draft.body != base.body).then(|| draft.body.clone()),
+                description: (draft.description != base.description)
+                    .then(|| draft.description.clone()),
                 due: (due != base.due).then_some(due),
                 importance: (draft.importance != base.importance).then_some(draft.importance),
                 category_id: (draft.category_id != base.category_id)
@@ -1687,7 +1688,7 @@ impl App {
             },
             None => TaskPatch {
                 title: Some(title),
-                body: Some(draft.body.clone()),
+                description: Some(draft.description.clone()),
                 due: Some(due),
                 importance: Some(draft.importance),
                 category_id: Some(draft.category_id.clone()),
@@ -2211,9 +2212,9 @@ fn contains_ignore_case(haystack: &str, folded_needle: &str) -> bool {
     caseless_key(haystack).contains(folded_needle)
 }
 
-/// Whether any prose or to-do in the body mentions `query`.
-fn body_contains(task: &Task, query: &str) -> bool {
-    task.body.iter().any(|block| match block {
+/// Whether any prose or to-do in the description mentions `query`.
+fn description_contains(task: &Task, query: &str) -> bool {
+    task.description.iter().any(|block| match block {
         crate::model::Block::Text { text }
         | crate::model::Block::Todo { text, .. }
         | crate::model::Block::Bullet { text }

@@ -25,14 +25,14 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::due;
 use crate::model::{
-    Block, Category, MAX_BODY_LINES, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN,
-    MAX_CATEGORY_DESC_LINES, MAX_CATEGORY_NAME_LEN, MAX_IMPORTANCE, MAX_NOTES_LINE_LEN,
+    Block, Category, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN, MAX_CATEGORY_DESC_LINES,
+    MAX_CATEGORY_NAME_LEN, MAX_DESCRIPTION_LINES, MAX_IMPORTANCE, MAX_NOTES_LINE_LEN,
     MAX_TASK_COUNT, MAX_TITLE_LEN, SCHEMA_VERSION, Task, caseless_key, text_byte_limit,
 };
 use crate::settings::{DATE_FORMATS, PREVIEW_POSITIONS, SORTS, Settings, THEMES};
 
 const DATABASE_FILE: &str = "mach.db";
-const DATABASE_SCHEMA_VERSION: i64 = 1;
+const DATABASE_SCHEMA_VERSION: i64 = 2;
 const LEGACY_MIGRATION_KEY: &str = "legacy_json_migrated";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const ID_MAX_BYTES: usize = 128;
@@ -203,7 +203,7 @@ pub(crate) struct StagedAttachment {
 #[derive(Debug, Clone, Default)]
 pub struct TaskPatch {
     pub title: Option<String>,
-    pub body: Option<Vec<Block>>,
+    pub description: Option<Vec<Block>>,
     pub due: Option<String>,
     pub done: Option<bool>,
     pub importance: Option<u8>,
@@ -332,7 +332,7 @@ impl StoreData {
     pub fn create_task(
         &mut self,
         title: impl Into<String>,
-        body: Vec<Block>,
+        description: Vec<Block>,
         due: impl Into<String>,
         importance: u8,
         category_id: Option<String>,
@@ -345,7 +345,7 @@ impl StoreData {
         let title = title.into();
         let due = due.into();
         let mut task = Task::new(&title, importance, category_id, &due);
-        task.body = body;
+        task.description = description;
         self.insert_task(task)
     }
 
@@ -374,8 +374,8 @@ impl StoreData {
             if let Some(title) = patch.title {
                 task.title = title;
             }
-            if let Some(body) = patch.body {
-                task.body = body;
+            if let Some(description) = patch.description {
+                task.description = description;
             }
             if let Some(due) = patch.due {
                 task.due = due;
@@ -414,7 +414,11 @@ impl StoreData {
                 id: expected.id.clone(),
             })?;
         let stale = field_conflicts(patch.title.as_ref(), &current.title, &expected.title)
-            || field_conflicts(patch.body.as_ref(), &current.body, &expected.body)
+            || field_conflicts(
+                patch.description.as_ref(),
+                &current.description,
+                &expected.description,
+            )
             || field_conflicts(patch.due.as_ref(), &current.due, &expected.due)
             || field_conflicts(patch.done.as_ref(), &current.done, &expected.done)
             || field_conflicts(
@@ -995,7 +999,7 @@ impl Store {
             }
             let mut data = before.clone();
             let result = operation(&mut data)?;
-            import_task_attachments(
+            import_task_description_attachments(
                 &mut data,
                 images_root.as_deref(),
                 staged_attachments,
@@ -1092,7 +1096,7 @@ impl Store {
                     settings: settings.unwrap_or_default().normalized(),
                     attachments: Vec::new(),
                 };
-                import_task_attachments(
+                import_task_description_attachments(
                     &mut data,
                     Some(&images_root),
                     &[],
@@ -1221,7 +1225,7 @@ fn configure_in_memory_connection(connection: &Connection) -> Result<(), StoreEr
 
 fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), StoreError> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 0 && version != DATABASE_SCHEMA_VERSION {
+    if !matches!(version, 0 | 1 | DATABASE_SCHEMA_VERSION) {
         return Err(StoreError::UnsupportedDatabaseSchema {
             path: path.to_path_buf(),
             found: version,
@@ -1230,6 +1234,15 @@ fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), Sto
     }
 
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if version == 1 {
+        tx.execute_batch(
+            "ALTER TABLE tasks RENAME COLUMN body_json TO description_json;
+             DROP INDEX IF EXISTS task_attachments_by_attachment;
+             ALTER TABLE task_attachments RENAME TO task_description_attachments;
+             CREATE INDEX task_description_attachments_by_attachment
+                 ON task_description_attachments(attachment_id);",
+        )?;
+    }
     tx.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS metadata (
@@ -1252,7 +1265,7 @@ fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), Sto
             id TEXT PRIMARY KEY,
             position INTEGER NOT NULL UNIQUE CHECK (position >= 0),
             title TEXT NOT NULL CHECK (length(trim(title)) > 0),
-            body_json TEXT NOT NULL,
+            description_json TEXT NOT NULL,
             due TEXT NOT NULL,
             created TEXT NOT NULL,
             done INTEGER NOT NULL CHECK (done IN (0, 1)),
@@ -1266,7 +1279,7 @@ fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), Sto
             byte_len INTEGER NOT NULL CHECK (byte_len > 0),
             storage_name TEXT NOT NULL UNIQUE
         ) STRICT;
-        CREATE TABLE IF NOT EXISTS task_attachments (
+        CREATE TABLE IF NOT EXISTS task_description_attachments (
             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
             block_index INTEGER NOT NULL CHECK (block_index >= 0),
             attachment_id TEXT NOT NULL REFERENCES attachments(id) ON DELETE RESTRICT,
@@ -1275,8 +1288,8 @@ fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), Sto
         CREATE TABLE IF NOT EXISTS attachment_gc (
             storage_name TEXT PRIMARY KEY
         ) STRICT;
-        CREATE INDEX IF NOT EXISTS task_attachments_by_attachment
-            ON task_attachments(attachment_id);
+        CREATE INDEX IF NOT EXISTS task_description_attachments_by_attachment
+            ON task_description_attachments(attachment_id);
         ",
     )?;
     let settings = serde_json::to_string(&Settings::default()).map_err(|source| {
@@ -1286,7 +1299,7 @@ fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), Sto
         "INSERT OR IGNORE INTO app_state(id, revision, settings_json) VALUES (1, 0, ?1)",
         [settings],
     )?;
-    if version == 0 {
+    if version != DATABASE_SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
     }
     tx.commit()?;
@@ -1393,7 +1406,7 @@ fn load_snapshot(connection: &Connection) -> Result<StoreData, StoreError> {
     }
 
     let mut tasks_statement = connection.prepare(
-        "SELECT position, id, title, body_json, due, created, done, importance, category_id
+        "SELECT position, id, title, description_json, due, created, done, importance, category_id
          FROM tasks ORDER BY position",
     )?;
     let rows = tasks_statement.query_map([], |row| {
@@ -1416,19 +1429,29 @@ fn load_snapshot(connection: &Connection) -> Result<StoreData, StoreError> {
                 "task count exceeds {MAX_TASK_COUNT}"
             )));
         }
-        let (stored_position, id, title, body_json, due, created, done, importance, category_id) =
-            row?;
+        let (
+            stored_position,
+            id,
+            title,
+            description_json,
+            due,
+            created,
+            done,
+            importance,
+            category_id,
+        ) = row?;
         validate_stored_position(stored_position, expected_position, "task")?;
-        let body = serde_json::from_str::<Vec<Block>>(&body_json).map_err(|error| {
-            StoreError::Corrupt(format!("task {id:?} has invalid body JSON: {error}"))
-        })?;
+        let description =
+            serde_json::from_str::<Vec<Block>>(&description_json).map_err(|error| {
+                StoreError::Corrupt(format!("task {id:?} has invalid description JSON: {error}"))
+            })?;
         let importance = u8::try_from(importance).map_err(|_| {
             StoreError::Corrupt(format!("task {id:?} has invalid importance {importance}"))
         })?;
         tasks.push(Task {
             id,
             title,
-            body,
+            description,
             due,
             created,
             done: done != 0,
@@ -1458,7 +1481,7 @@ fn validate_task_attachment_rows(
     let expected: HashSet<(String, usize, String)> = tasks
         .iter()
         .flat_map(|task| {
-            task.body
+            task.description
                 .iter()
                 .enumerate()
                 .filter_map(|(block_index, block)| match block {
@@ -1471,7 +1494,7 @@ fn validate_task_attachment_rows(
         .collect();
     let mut statement = connection.prepare(
         "SELECT task_id, block_index, attachment_id
-         FROM task_attachments ORDER BY task_id, block_index",
+         FROM task_description_attachments ORDER BY task_id, block_index",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -1492,7 +1515,7 @@ fn validate_task_attachment_rows(
     }
     if stored != expected {
         return Err(StoreError::Corrupt(
-            "task attachment reference rows do not match task body JSON".into(),
+            "task attachment reference rows do not match task description JSON".into(),
         ));
     }
     Ok(())
@@ -1688,16 +1711,16 @@ fn persist_diff(
         if let Some((_, previous)) = before_tasks.get(task.id.as_str()).copied()
             && previous != task
         {
-            let body_json = encode_task_body(task)?;
+            let description_json = encode_task_description(task)?;
             execute_one(
                 tx,
                 "UPDATE tasks SET
-                    title = ?1, body_json = ?2, due = ?3, created = ?4,
+                    title = ?1, description_json = ?2, due = ?3, created = ?4,
                     done = ?5, importance = ?6, category_id = ?7
                  WHERE id = ?8",
                 params![
                     task.title,
-                    body_json,
+                    description_json,
                     task.due,
                     task.created,
                     i64::from(task.done),
@@ -1714,16 +1737,16 @@ fn persist_diff(
         if !before_tasks.contains_key(task.id.as_str()) {
             let temporary = temporary_position(task_position_base, task_position_offset, "tasks")?;
             task_position_offset += 1;
-            let body_json = encode_task_body(task)?;
+            let description_json = encode_task_description(task)?;
             tx.execute(
                 "INSERT INTO tasks(
-                    id, position, title, body_json, due, created, done, importance, category_id
+                    id, position, title, description_json, due, created, done, importance, category_id
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     task.id,
                     temporary,
                     task.title,
-                    body_json,
+                    description_json,
                     task.due,
                     task.created,
                     i64::from(task.done),
@@ -1735,12 +1758,12 @@ fn persist_diff(
     }
 
     for task in &after.tasks {
-        let body_changed_or_new = before_tasks
+        let description_changed_or_new = before_tasks
             .get(task.id.as_str())
-            .is_none_or(|(_, previous)| previous.body != task.body);
-        if body_changed_or_new {
+            .is_none_or(|(_, previous)| previous.description != task.description);
+        if description_changed_or_new {
             tx.execute(
-                "DELETE FROM task_attachments WHERE task_id = ?1",
+                "DELETE FROM task_description_attachments WHERE task_id = ?1",
                 [&task.id],
             )?;
             insert_task_attachment_rows(tx, task)?;
@@ -1869,10 +1892,10 @@ fn sqlite_attachment_size(byte_len: u64) -> Result<i64, StoreError> {
 
 fn insert_task_attachment_rows(tx: &Transaction<'_>, task: &Task) -> Result<(), StoreError> {
     let mut statement = tx.prepare(
-        "INSERT INTO task_attachments(task_id, block_index, attachment_id)
+        "INSERT INTO task_description_attachments(task_id, block_index, attachment_id)
          VALUES (?1, ?2, ?3)",
     )?;
-    for (block_index, block) in task.body.iter().enumerate() {
+    for (block_index, block) in task.description.iter().enumerate() {
         let Block::Image { attachment_id } = block else {
             continue;
         };
@@ -1885,8 +1908,8 @@ fn insert_task_attachment_rows(tx: &Transaction<'_>, task: &Task) -> Result<(), 
     Ok(())
 }
 
-fn encode_task_body(task: &Task) -> Result<String, StoreError> {
-    serde_json::to_string(&task.body).map_err(|error| {
+fn encode_task_description(task: &Task) -> Result<String, StoreError> {
+    serde_json::to_string(&task.description).map_err(|error| {
         StoreError::Corrupt(format!("could not encode task {:?}: {error}", task.id))
     })
 }
@@ -1919,7 +1942,7 @@ fn persist_app_state(
     Ok(())
 }
 
-fn import_task_attachments(
+fn import_task_description_attachments(
     data: &mut StoreData,
     images_root: Option<&Path>,
     staged_attachments: &[StagedAttachment],
@@ -1945,56 +1968,75 @@ fn import_task_attachments(
     }
 
     for task in &mut data.tasks {
-        for block in &mut task.body {
+        let owner = format!("task {:?}", task.id);
+        for block in &mut task.description {
             let Block::Image { attachment_id } = block else {
                 continue;
             };
-            if known.contains_key(attachment_id) {
-                continue;
-            }
-            let Some(images_root) = images_root else {
-                return Err(StoreError::Validation(
-                    "image attachments require a persistent store".into(),
-                ));
-            };
-            let reference = attachment_id.clone();
-            let (source_path, expected) = if is_attachment_id(&reference) {
-                let staged = staged_by_id.get(reference.as_str()).ok_or_else(|| {
-                    StoreError::Validation(format!(
-                        "task {:?} refers to unknown attachment {reference:?}",
-                        task.id
-                    ))
-                })?;
-                (staged.path.clone(), Some(&staged.metadata))
-            } else {
-                (crate::image::expand_in(&reference, images_root), None)
-            };
-            let imported = import_attachment_from_path(&source_path, images_root)?;
-            if let Some(installed) = imported.installed.clone() {
-                installed_attachments.push(installed);
-            }
-            if expected.is_some_and(|expected| expected != &imported.metadata) {
-                return Err(StoreError::Validation(format!(
-                    "staged attachment {reference:?} does not match its verified metadata"
-                )));
-            }
-            if let Some(existing) = known.get(&imported.metadata.id) {
-                if existing != &imported.metadata {
-                    return Err(StoreError::Corrupt(format!(
-                        "attachment {:?} metadata does not match imported content",
-                        imported.metadata.id
-                    )));
-                }
-            } else {
-                known.insert(imported.metadata.id.clone(), imported.metadata.clone());
-                data.attachments.push(imported.metadata.clone());
-            }
-            *attachment_id = imported.metadata.id;
+            *attachment_id = import_attachment_reference(
+                attachment_id,
+                &owner,
+                images_root,
+                &staged_by_id,
+                &mut known,
+                &mut data.attachments,
+                installed_attachments,
+            )?;
         }
     }
     data.attachments
         .sort_by(|left, right| left.id.cmp(&right.id));
     Ok(())
+}
+
+fn import_attachment_reference(
+    reference: &str,
+    owner: &str,
+    images_root: Option<&Path>,
+    staged_by_id: &HashMap<&str, &StagedAttachment>,
+    known: &mut HashMap<String, Attachment>,
+    attachments: &mut Vec<Attachment>,
+    installed_attachments: &mut Vec<InstalledAttachmentFile>,
+) -> Result<String, StoreError> {
+    if known.contains_key(reference) {
+        return Ok(reference.to_string());
+    }
+    let Some(images_root) = images_root else {
+        return Err(StoreError::Validation(
+            "image attachments require a persistent store".into(),
+        ));
+    };
+    let (source_path, expected) = if is_attachment_id(reference) {
+        let staged = staged_by_id.get(reference).ok_or_else(|| {
+            StoreError::Validation(format!(
+                "{owner} refers to unknown attachment {reference:?}"
+            ))
+        })?;
+        (staged.path.clone(), Some(&staged.metadata))
+    } else {
+        (crate::image::expand_in(reference, images_root), None)
+    };
+    let imported = import_attachment_from_path(&source_path, images_root)?;
+    if let Some(installed) = imported.installed.clone() {
+        installed_attachments.push(installed);
+    }
+    if expected.is_some_and(|expected| expected != &imported.metadata) {
+        return Err(StoreError::Validation(format!(
+            "staged attachment {reference:?} does not match its verified metadata"
+        )));
+    }
+    if let Some(existing) = known.get(&imported.metadata.id) {
+        if existing != &imported.metadata {
+            return Err(StoreError::Corrupt(format!(
+                "attachment {:?} metadata does not match imported content",
+                imported.metadata.id
+            )));
+        }
+    } else {
+        known.insert(imported.metadata.id.clone(), imported.metadata.clone());
+        attachments.push(imported.metadata.clone());
+    }
+    Ok(imported.metadata.id)
 }
 
 #[derive(Debug, Clone)]
@@ -2183,14 +2225,14 @@ fn attachment_format(format: ImageFormat) -> Option<(&'static str, &'static str)
     }
 }
 
-fn is_attachment_id(value: &str) -> bool {
+pub(crate) fn is_attachment_id(value: &str) -> bool {
     value.len() == ATTACHMENT_ID_LEN
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn is_managed_attachment_name(value: &str) -> bool {
+pub(crate) fn is_managed_attachment_name(value: &str) -> bool {
     let Some((id, extension)) = value.rsplit_once('.') else {
         return false;
     };
@@ -2208,10 +2250,11 @@ fn prune_unreferenced_attachments(data: &mut StoreData) {
     let referenced: HashSet<_> = data
         .tasks
         .iter()
-        .flat_map(|task| task.body.iter())
-        .filter_map(|block| match block {
-            Block::Image { attachment_id } => Some(attachment_id.as_str()),
-            _ => None,
+        .flat_map(|task| {
+            task.description.iter().filter_map(|block| match block {
+                Block::Image { attachment_id } => Some(attachment_id.as_str()),
+                _ => None,
+            })
         })
         .collect();
     data.attachments
@@ -2328,8 +2371,8 @@ fn reconcile_attachment_files(
             "SELECT attachments.id, attachments.storage_name
              FROM attachments
              WHERE NOT EXISTS (
-                 SELECT 1 FROM task_attachments
-                 WHERE task_attachments.attachment_id = attachments.id
+                 SELECT 1 FROM task_description_attachments
+                 WHERE task_description_attachments.attachment_id = attachments.id
              )
              ORDER BY attachments.id",
         )?;
@@ -2525,13 +2568,13 @@ fn normalize_and_validate(
                 task.id
             )));
         }
-        if task.body.len() > MAX_BODY_LINES {
+        if task.description.len() > MAX_DESCRIPTION_LINES {
             return Err(StoreError::Validation(format!(
-                "task {:?} body exceeds {MAX_BODY_LINES} blocks",
+                "task {:?} description exceeds {MAX_DESCRIPTION_LINES} blocks",
                 task.id
             )));
         }
-        for block in &task.body {
+        for block in &task.description {
             validate_block(block, &task.id)?;
             if let Block::Image { attachment_id } = block {
                 let known = attachment_ids.contains(attachment_id.as_str());

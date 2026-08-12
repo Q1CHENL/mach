@@ -1,6 +1,6 @@
 //! A one-line editor. Every text field in mach is built from it —
 //! the title, the due date, category names, the command line, the search
-//! box, and each block of a task's body. Cursor and selection indices are
+//! box, and each block of a task's description. Cursor and selection indices are
 //! Unicode grapheme clusters; display geometry is still measured in cells.
 //!
 //! Selection follows macOS: Shift extends, Option jumps by word, and
@@ -42,7 +42,7 @@ pub struct WrappedLine {
     pub end: usize,
 }
 
-/// Soft-wrapped layout for body / description painting.
+/// Soft-wrapped layout for multi-line description painting.
 #[derive(Debug, Clone)]
 pub struct WrappedView {
     pub lines: Vec<WrappedLine>,
@@ -468,7 +468,7 @@ impl TextInput {
         self.move_to(self.chars.len(), true);
     }
 
-    /// Where the caret lands moving one word left; the body editor uses
+    /// Where the caret lands moving one word left; the description editor uses
     /// this to extend a selection across block boundaries.
     pub fn word_left_index(&self) -> usize {
         let mut i = self.cursor;
@@ -593,7 +593,7 @@ impl TextInput {
     }
 
     /// Like [`Self::wrapped`], but uses an explicit grapheme-range selection
-    /// (for body-level multi-line selections).
+    /// (for description-level multi-line selections).
     pub fn wrapped_with_sel(&self, width: usize, sel: Option<(usize, usize)>) -> WrappedView {
         self.wrapped_from_breaks(&self.wrap_breaks(width), sel)
     }
@@ -638,7 +638,7 @@ impl TextInput {
         }
     }
 
-    /// Move the caret and drop this line's own selection: when the body
+    /// Move the caret and drop this line's own selection: when the description
     /// editor drives the caret, the multi-line selection is its to own.
     pub fn place_cursor(&mut self, cursor: usize) {
         self.cursor = cursor.min(self.chars.len());
@@ -647,7 +647,7 @@ impl TextInput {
 
     /// Text to draw in a field `width` columns wide, the cursor's column
     /// within that field, and the selection's column span when it overlaps.
-    /// Single-row fields (title, status) use this; body uses [`Self::wrapped`].
+    /// Single-row fields (title, status) use this; description uses [`Self::wrapped`].
     pub fn visible(&mut self, width: usize) -> View {
         if width == 0 {
             return View {

@@ -335,7 +335,7 @@ fn legacy_image_paths_become_content_addressed_attachments() {
 
     let store = Store::open(dir.path()).expect("migrate legacy image");
     let snapshot = store.snapshot().unwrap();
-    let block = serde_json::to_value(&snapshot.tasks[0].body[0]).unwrap();
+    let block = serde_json::to_value(&snapshot.tasks[0].description[0]).unwrap();
     assert_eq!(block["attachment_id"], digest);
     assert!(block.get("path").is_none(), "legacy paths must not persist");
 
@@ -353,7 +353,7 @@ fn legacy_image_paths_become_content_addressed_attachments() {
     assert_eq!(attachment.3, format!("{digest}.png"));
     let reference: (String, i64, String) = connection
         .query_row(
-            "SELECT task_id, block_index, attachment_id FROM task_attachments",
+            "SELECT task_id, block_index, attachment_id FROM task_description_attachments",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -397,20 +397,39 @@ fn identical_image_sources_share_one_managed_attachment() {
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let first_ref = serde_json::to_value(&snapshot.tasks[0].body[0]).unwrap();
-    let second_ref = serde_json::to_value(&snapshot.tasks[1].body[0]).unwrap();
+    let first_ref = serde_json::to_value(&snapshot.tasks[0].description[0]).unwrap();
+    let second_ref = serde_json::to_value(&snapshot.tasks[1].description[0]).unwrap();
     assert_eq!(first_ref["attachment_id"], second_ref["attachment_id"]);
     let connection = rusqlite::Connection::open(store.database_path()).unwrap();
     let attachments: i64 = connection
         .query_row("SELECT count(*) FROM attachments", [], |row| row.get(0))
         .unwrap();
     let references: i64 = connection
-        .query_row("SELECT count(*) FROM task_attachments", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT count(*) FROM task_description_attachments",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(attachments, 1);
     assert_eq!(references, 2);
+}
+
+#[test]
+fn category_descriptions_treat_image_syntax_as_text_only() {
+    let dir = TempDir::new("category-description-text-only");
+    let source = dir.path().join("category-source.png");
+    write_test_png(&source, [40, 80, 120, 255]);
+    let description = format!("before\n![image]({})\nafter", source.display());
+    let mut store = Store::open(dir.path()).unwrap();
+
+    store
+        .update(|data| data.create_category("Visual notes", description.clone()))
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.categories[0].description, description);
+    assert!(snapshot.attachments().is_empty());
 }
 
 #[test]
@@ -662,7 +681,7 @@ fn failed_attachment_import_does_not_commit_the_task() {
 }
 
 #[test]
-fn task_attachment_rows_must_match_body_json() {
+fn task_attachment_rows_must_match_description_json() {
     let dir = TempDir::new("attachment-reference-coherence");
     let source = dir.path().join("source.png");
     write_test_png(&source, [1, 2, 3, 255]);
@@ -681,7 +700,7 @@ fn task_attachment_rows_must_match_body_json() {
         .unwrap();
     let connection = rusqlite::Connection::open(store.database_path()).unwrap();
     connection
-        .execute("DELETE FROM task_attachments", [])
+        .execute("DELETE FROM task_description_attachments", [])
         .unwrap();
 
     let error = store
@@ -726,6 +745,120 @@ fn unusable_data_directory_is_an_error_instead_of_an_empty_store() {
 }
 
 #[test]
+fn database_v1_description_names_are_migrated_without_losing_tasks() {
+    let dir = TempDir::new("database-v1-description-migration");
+    let source = dir.path().join("v1-source.png");
+    write_test_png(&source, [24, 68, 120, 255]);
+    let mut store = Store::open(dir.path()).expect("initialize current database");
+    let task = store
+        .update(|data| {
+            data.create_task(
+                "keep description",
+                vec![
+                    mach::model::Block::text("legacy details"),
+                    mach::model::Block::image(&source.to_string_lossy()),
+                ],
+                "",
+                0,
+                None,
+            )
+        })
+        .unwrap();
+    let before = store.snapshot().unwrap();
+    let expected_description = before.tasks[0].description.clone();
+    let expected_attachment = before.attachments()[0].clone();
+    let database = store.database_path().to_path_buf();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "ALTER TABLE tasks RENAME COLUMN description_json TO body_json",
+            [],
+        )
+        .unwrap();
+    let has_current_relation: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'task_description_attachments'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if has_current_relation {
+        connection
+            .execute(
+                "ALTER TABLE task_description_attachments RENAME TO task_attachments",
+                [],
+            )
+            .unwrap();
+    }
+    connection
+        .execute_batch(
+            "DROP INDEX IF EXISTS task_description_attachments_by_attachment;
+             CREATE INDEX IF NOT EXISTS task_attachments_by_attachment
+                 ON task_attachments(attachment_id);
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(dir.path()).expect("migrate database v1");
+    let snapshot = store.snapshot().expect("read migrated database");
+    assert_eq!(snapshot.tasks.len(), 1);
+    assert_eq!(snapshot.tasks[0].id, task.id);
+    assert_eq!(snapshot.tasks[0].description, expected_description);
+    assert_eq!(snapshot.attachments(), &[expected_attachment]);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    let columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(tasks)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(columns.iter().any(|column| column == "description_json"));
+    assert!(!columns.iter().any(|column| column == "body_json"));
+    let relations: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type = 'table'
+               AND name IN ('task_description_attachments', 'task_attachments')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(relations, 1);
+    let current_relation: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'task_description_attachments'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(current_relation);
+    let attachment_rows: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM task_description_attachments",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attachment_rows, 1);
+}
+
+#[test]
 fn unknown_database_schema_is_rejected_without_being_downgraded() {
     let dir = TempDir::new("future-schema");
     let database = dir.path().join("mach.db");
@@ -741,7 +874,7 @@ fn unknown_database_schema_is_rejected_without_being_downgraded() {
         error,
         StoreError::UnsupportedDatabaseSchema {
             found: 99,
-            expected: 1,
+            expected: 2,
             ..
         }
     ));

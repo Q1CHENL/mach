@@ -63,9 +63,9 @@ fn paste_text(app: &mut App, text: &str) {
                 }
                 // Selectors are changed with arrows/clicks, not pasted text.
                 Field::Category | Field::Due => {}
-                Field::Body => {
+                Field::Description => {
                     form.before_edit(EditKind::Atomic);
-                    form.body.insert_str(text);
+                    form.description.insert_str(text);
                 }
                 Field::Importance => {}
             }
@@ -127,7 +127,7 @@ fn content_edit_kind(key: KeyEvent) -> Option<EditKind> {
         KeyCode::Char(c) if ctrl || alt => match c {
             // Deletes / kills — always their own step.
             'u' | 'k' | 'w' | 'W' if !shift => Some(EditKind::Atomic),
-            // Ctrl+D toggles a body to-do (handled on body only).
+            // Ctrl+D toggles a description to-do (handled on description only).
             'd' | 'D' if ctrl && !alt && !shift => Some(EditKind::Atomic),
             _ => None,
         },
@@ -142,7 +142,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // Cmd/Ctrl+C on a selection copies it. Copying always wins over
     // quitting, so the two can share the chord.
     if is_copy_chord(key) {
-        if copy_selected_body_image(app) {
+        if copy_selected_description_image(app) {
             return;
         }
         // Command is Copy on macOS. When there is no selection it remains a
@@ -244,18 +244,18 @@ fn is_ctrl_c(key: KeyEvent) -> bool {
 
 /// Copy the current selection (text, picture, or both) from a form field.
 /// Returns true when the key was handled.
-fn copy_selected_body_image(app: &mut App) -> bool {
+fn copy_selected_description_image(app: &mut App) -> bool {
     if app.mode == Mode::TaskForm
         && let Some(form) = &app.form
-        && form.field == Field::Body
-        && let Some(payload) = form.body.selected_payload()
+        && form.field == Field::Description
+        && let Some(payload) = form.description.selected_payload()
     {
         finish_copy(app, payload);
         return true;
     }
     // Other fields: plain text selection only.
     if let Some(text) = selected_text_in_app(app) {
-        finish_copy(app, crate::body::CopyPayload::Text(text));
+        finish_copy(app, crate::description::CopyPayload::Text(text));
         return true;
     }
     if app.mode != Mode::TaskForm {
@@ -264,14 +264,14 @@ fn copy_selected_body_image(app: &mut App) -> bool {
     let Some(form) = &app.form else {
         return false;
     };
-    // Full-size preview: copy that picture even with no body selection.
+    // Full-size preview: copy that picture even with no description selection.
     if form.preview {
         let path = form
-            .body
+            .description
             .selected_image()
-            .or_else(|| form.body.images().into_iter().next());
+            .or_else(|| form.description.images().into_iter().next());
         if let Some(path) = path {
-            finish_copy(app, crate::body::CopyPayload::Image(path));
+            finish_copy(app, crate::description::CopyPayload::Image(path));
             return true;
         }
     }
@@ -284,7 +284,7 @@ fn selected_text_in_app(app: &App) -> Option<String> {
             let form = app.form.as_ref()?;
             match form.field {
                 Field::Title => form.title.selected_text(),
-                Field::Body => form.body.selected_text(),
+                Field::Description => form.description.selected_text(),
                 Field::Category | Field::Due | Field::Importance => None,
             }
         }
@@ -497,52 +497,52 @@ fn edit_line(input: &mut TextInput, key: KeyEvent) -> bool {
 }
 
 /// The same bindings as [`edit_line`], for the multi-line block editors:
-/// a task's body and a category's description. Adds ↑/↓ across blocks.
+/// a task's description and a category's description. Adds ↑/↓ across blocks.
 /// The `/` menu is handled by the caller before this runs.
-fn edit_body(body: &mut crate::body::BodyEditor, key: KeyEvent) {
+fn edit_description(description: &mut crate::description::DescriptionEditor, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let word = word_mod(key);
     match key.code {
-        KeyCode::Char('w') | KeyCode::Char('W') if alt && shift => body.select_word(),
-        KeyCode::Char('b') | KeyCode::Char('B') if alt && shift => body.select_word_left(),
-        KeyCode::Char('f') | KeyCode::Char('F') if alt && shift => body.select_word_right(),
-        KeyCode::Char('b') | KeyCode::Char('B') if alt => body.word_left(),
-        KeyCode::Char('f') | KeyCode::Char('F') if alt => body.word_right(),
+        KeyCode::Char('w') | KeyCode::Char('W') if alt && shift => description.select_word(),
+        KeyCode::Char('b') | KeyCode::Char('B') if alt && shift => description.select_word_left(),
+        KeyCode::Char('f') | KeyCode::Char('F') if alt && shift => description.select_word_right(),
+        KeyCode::Char('b') | KeyCode::Char('B') if alt => description.word_left(),
+        KeyCode::Char('f') | KeyCode::Char('F') if alt => description.word_right(),
         KeyCode::Char(c) if ctrl || alt => match c {
-            'a' if shift => body.select_home(),
-            'e' if shift => body.select_end(),
-            'a' => body.home(),
-            'e' => body.end(),
-            'u' => body.delete_to_start(),
-            'k' => body.delete_to_end(),
-            'w' | 'W' => body.delete_word_left(),
+            'a' if shift => description.select_home(),
+            'e' if shift => description.select_end(),
+            'a' => description.home(),
+            'e' => description.end(),
+            'u' => description.delete_to_start(),
+            'k' => description.delete_to_end(),
+            'w' | 'W' => description.delete_word_left(),
             _ => {}
         },
-        KeyCode::Char(c) => body.insert(c),
-        KeyCode::Backspace if word => body.delete_word_left(),
-        KeyCode::Backspace => body.backspace(),
-        KeyCode::Delete => body.delete(),
-        KeyCode::Left if word && shift => body.select_word_left(),
-        KeyCode::Right if word && shift => body.select_word_right(),
-        KeyCode::Left if shift => body.select_left(),
-        KeyCode::Right if shift => body.select_right(),
-        KeyCode::Left if word => body.word_left(),
-        KeyCode::Right if word => body.word_right(),
-        KeyCode::Left => body.left(),
-        KeyCode::Right => body.right(),
-        KeyCode::Up => body.up(),
-        KeyCode::Down => body.down(),
-        KeyCode::Home if shift => body.select_home(),
-        KeyCode::End if shift => body.select_end(),
-        KeyCode::Home => body.home(),
-        KeyCode::End => body.end(),
+        KeyCode::Char(c) => description.insert(c),
+        KeyCode::Backspace if word => description.delete_word_left(),
+        KeyCode::Backspace => description.backspace(),
+        KeyCode::Delete => description.delete(),
+        KeyCode::Left if word && shift => description.select_word_left(),
+        KeyCode::Right if word && shift => description.select_word_right(),
+        KeyCode::Left if shift => description.select_left(),
+        KeyCode::Right if shift => description.select_right(),
+        KeyCode::Left if word => description.word_left(),
+        KeyCode::Right if word => description.word_right(),
+        KeyCode::Left => description.left(),
+        KeyCode::Right => description.right(),
+        KeyCode::Up => description.up(),
+        KeyCode::Down => description.down(),
+        KeyCode::Home if shift => description.select_home(),
+        KeyCode::End if shift => description.select_end(),
+        KeyCode::Home => description.home(),
+        KeyCode::End => description.end(),
         _ => {}
     }
 }
 
-/// The category dialog: a name and a note (with `/` bullets).
+/// The category dialog: a name and a structured, text-only description.
 fn handle_category_key(app: &mut App, key: KeyEvent) {
     if matches!(key.code, KeyCode::Char('s')) && key.modifiers.contains(KeyModifiers::CONTROL) {
         if app
@@ -585,13 +585,13 @@ fn handle_category_key(app: &mut App, key: KeyEvent) {
             if matches!(key.code, KeyCode::Enter | KeyCode::Tab) {
                 form.before_edit(EditKind::Atomic);
             }
-            body_menu_key(&mut form.description, key)
+            description_menu_key(&mut form.description, key)
         };
         match outcome {
             MenuKey::Ignored => {}
             MenuKey::Handled => return,
-            MenuKey::Copy(payload) => {
-                finish_copy(app, payload);
+            MenuKey::Request(request) => {
+                finish_description_command(app, request);
                 return;
             }
         }
@@ -605,6 +605,23 @@ fn handle_category_key(app: &mut App, key: KeyEvent) {
             if let Some(form) = &mut app.category_form {
                 form.description.close_menu();
                 form.toggle_field();
+            }
+        }
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL) =>
+        {
+            let url = app
+                .category_form
+                .as_ref()
+                .filter(|form| form.on_description)
+                .and_then(|form| form.description.link_url_at_cursor());
+            if let Some(url) = url {
+                match crate::open::open_url(&url) {
+                    Ok(()) => app.info(format!("Opened {url}")),
+                    Err(error) => app.error(error),
+                }
             }
         }
         KeyCode::Enter => {
@@ -631,7 +648,7 @@ fn handle_category_key(app: &mut App, key: KeyEvent) {
                 } else {
                     form.break_coalesce();
                 }
-                edit_body(&mut form.description, key);
+                edit_description(&mut form.description, key);
             } else if let Some(mut kind) = content_edit_kind(key) {
                 if form.name.has_selection() {
                     kind = EditKind::Atomic;
@@ -730,14 +747,17 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
         SlashCommand::WhatsNew => app.mode = Mode::WhatsNew,
         SlashCommand::CopyTitle => match app.selected_task() {
             Some(task) => {
-                finish_copy(app, crate::body::CopyPayload::Text(task.title.clone()));
+                finish_copy(
+                    app,
+                    crate::description::CopyPayload::Text(task.title.clone()),
+                );
             }
             None => app.info("No task selected"),
         },
         SlashCommand::CopyTask => match app.selected_task() {
             Some(task) => {
                 let text = task_clipboard_text(task);
-                finish_copy(app, crate::body::CopyPayload::Text(text));
+                finish_copy(app, crate::description::CopyPayload::Text(text));
             }
             None => app.info("No task selected"),
         },
@@ -786,11 +806,11 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
 // ------------------------------------------------------------ task dialog
 
 /// Tab and the mouse move between fields; Enter saves, except in the
-/// body where it starts a new block.
+/// description where it starts a new block.
 fn handle_form_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-    // Saving resolves the picker, but never guesses what an open body command
+    // Saving resolves the picker, but never guesses what an open description command
     // or full-screen preview was meant to do.
     if matches!(key.code, KeyCode::Char('s')) && ctrl {
         if app.form.as_ref().is_some_and(|form| form.preview) {
@@ -800,9 +820,9 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
         if app
             .form
             .as_ref()
-            .is_some_and(|form| form.body.menu.is_some())
+            .is_some_and(|form| form.description.menu.is_some())
         {
-            app.error("Choose or dismiss the body command before saving");
+            app.error("Choose or dismiss the description command before saving");
             return;
         }
         if let Some(form) = &mut app.form
@@ -865,7 +885,12 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
     }
 
     // Slash menu: Esc closes the menu only (not the whole dialog).
-    if app.form.as_ref().is_some_and(|f| f.body.menu.is_some()) && handle_menu_key(app, key) {
+    if app
+        .form
+        .as_ref()
+        .is_some_and(|f| f.description.menu.is_some())
+        && handle_menu_key(app, key)
+    {
         return;
     }
 
@@ -894,8 +919,8 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
             let url = app
                 .form
                 .as_ref()
-                .filter(|f| f.field == Field::Body)
-                .and_then(|f| f.body.link_url_at_cursor());
+                .filter(|f| f.field == Field::Description)
+                .and_then(|f| f.description.link_url_at_cursor());
             if let Some(url) = url {
                 match crate::open::open_url(&url) {
                     Ok(()) => app.info(format!("Opened {url}")),
@@ -910,14 +935,14 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
                 Field::Due => form.open_due_picker(),
                 // On a picture there is nothing to type, so Enter is
                 // what opens it.
-                Field::Body if form.body.selected_image().is_some() => {
+                Field::Description if form.description.selected_image().is_some() => {
                     if let Some(err) = form.open_image_preview() {
                         app.error(err);
                     }
                 }
-                Field::Body => {
+                Field::Description => {
                     form.before_edit(EditKind::Atomic);
-                    let _ = form.body.newline();
+                    let _ = form.description.newline();
                 }
             }
         }
@@ -926,22 +951,22 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
             match form.field {
                 // Ctrl+D ticks a to-do off; everything else is ordinary
                 // block editing.
-                Field::Body
+                Field::Description
                     if ctrl && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')) =>
                 {
                     form.before_edit(EditKind::Atomic);
-                    form.body.toggle();
+                    form.description.toggle();
                 }
-                Field::Body => {
+                Field::Description => {
                     if let Some(mut kind) = content_edit_kind(key) {
-                        if form.body.has_selection() {
+                        if form.description.has_selection() {
                             kind = EditKind::Atomic;
                         }
                         form.before_edit(kind);
                     } else {
                         form.break_coalesce();
                     }
-                    edit_body(&mut form.body, key);
+                    edit_description(&mut form.description, key);
                 }
                 // Category is a bounded selector. All tasks is deliberately
                 // absent; Backspace/Delete returns the task to Uncategorized.
@@ -1058,22 +1083,26 @@ fn handle_picker_key(app: &mut App, key: KeyEvent) {
 
 /// Returns true when the key belonged to the open slash menu.
 fn handle_menu_key(app: &mut App, key: KeyEvent) -> bool {
-    let Some(form) = app.form.as_mut().filter(|form| form.body.menu.is_some()) else {
+    let Some(form) = app
+        .form
+        .as_mut()
+        .filter(|form| form.description.menu.is_some())
+    else {
         return false;
     };
-    // Split the borrow: menu keys only need the body, copy needs App.
+    // Split the borrow: menu keys only need the description; clipboard work needs App.
     let outcome = {
         // Applying a command (Enter/Tab) mutates structure — checkpoint first.
         if matches!(key.code, KeyCode::Enter | KeyCode::Tab) {
             form.before_edit(EditKind::Atomic);
         }
-        body_menu_key(&mut form.body, key)
+        description_menu_key(&mut form.description, key)
     };
     match outcome {
         MenuKey::Ignored => false,
         MenuKey::Handled => true,
-        MenuKey::Copy(payload) => {
-            finish_copy(app, payload);
+        MenuKey::Request(request) => {
+            finish_description_command(app, request);
             true
         }
     }
@@ -1082,30 +1111,33 @@ fn handle_menu_key(app: &mut App, key: KeyEvent) -> bool {
 enum MenuKey {
     Ignored,
     Handled,
-    Copy(crate::body::CopyPayload),
+    Request(crate::description::CommandRequest),
 }
 
-fn body_menu_key(body: &mut crate::body::BodyEditor, key: KeyEvent) -> MenuKey {
+fn description_menu_key(
+    description: &mut crate::description::DescriptionEditor,
+    key: KeyEvent,
+) -> MenuKey {
     match key.code {
         KeyCode::Up => {
-            body.menu_prev();
+            description.menu_prev();
             MenuKey::Handled
         }
         KeyCode::Down => {
-            body.menu_next();
+            description.menu_next();
             MenuKey::Handled
         }
         KeyCode::Esc => {
-            body.close_menu();
+            description.close_menu();
             MenuKey::Handled
         }
-        KeyCode::Tab | KeyCode::Enter => match body.menu_selected() {
-            Some(command) => match body.apply(command) {
-                Some(payload) => MenuKey::Copy(payload),
+        KeyCode::Tab | KeyCode::Enter => match description.menu_selected() {
+            Some(command) => match description.apply(command) {
+                Some(request) => MenuKey::Request(request),
                 None => MenuKey::Handled,
             },
             None => {
-                body.close_menu();
+                description.close_menu();
                 MenuKey::Handled
             }
         },
@@ -1113,7 +1145,7 @@ fn body_menu_key(body: &mut crate::body::BodyEditor, key: KeyEvent) -> MenuKey {
     }
 }
 
-/// Title, then body as plain text (same export as body `/copy`).
+/// Title, then description as plain text (same export as description `/copy`).
 fn task_clipboard_text(task: &crate::model::Task) -> String {
     use crate::model::Block;
 
@@ -1121,8 +1153,8 @@ fn task_clipboard_text(task: &crate::model::Task) -> String {
     // send stored text back through the editor's path-adoption logic, where
     // filesystem contents could silently reinterpret it as a picture.
     let mut number = 0usize;
-    let body = task
-        .body
+    let description = task
+        .description
         .iter()
         .filter_map(|block| match block {
             Block::Text { text } => {
@@ -1153,16 +1185,169 @@ fn task_clipboard_text(task: &crate::model::Task) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    if body.is_empty() {
+    if description.is_empty() {
         task.title.clone()
     } else {
-        format!("{}\n\n{body}", task.title)
+        format!("{}\n\n{description}", task.title)
     }
 }
 
-fn finish_copy(app: &mut App, payload: crate::body::CopyPayload) {
+fn finish_description_command(app: &mut App, request: crate::description::CommandRequest) {
+    match request {
+        crate::description::CommandRequest::Copy(payload) => finish_copy(app, payload),
+        crate::description::CommandRequest::Paste => paste_from_clipboard(app),
+    }
+}
+
+#[derive(Debug)]
+struct ClipboardContent {
+    image: Option<arboard::ImageData<'static>>,
+    text: Option<String>,
+}
+
+fn resolve_clipboard_content(
+    image: Result<arboard::ImageData<'static>, arboard::Error>,
+    text: Result<String, arboard::Error>,
+) -> Result<Option<ClipboardContent>, String> {
+    let mut errors = Vec::new();
+    let image = match image {
+        Ok(image) => Some(image),
+        Err(arboard::Error::ContentNotAvailable) => None,
+        Err(error) => {
+            errors.push(format!("image ({error})"));
+            None
+        }
+    };
+    let text = match text {
+        Ok(text) if !text.is_empty() => Some(text),
+        Ok(_) | Err(arboard::Error::ContentNotAvailable) => None,
+        Err(error) => {
+            errors.push(format!("text ({error})"));
+            None
+        }
+    };
+    if image.is_some() || text.is_some() {
+        Ok(Some(ClipboardContent { image, text }))
+    } else if errors.is_empty() {
+        Ok(None)
+    } else {
+        Err(format!("could not read clipboard {}", errors.join(" or ")))
+    }
+}
+
+fn read_clipboard_content(
+    clipboard: &mut arboard::Clipboard,
+) -> Result<Option<ClipboardContent>, String> {
+    resolve_clipboard_content(clipboard.get_image(), clipboard.get_text())
+}
+
+fn paste_from_clipboard(app: &mut App) {
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(clipboard) => clipboard,
+        Err(error) => {
+            app.error(format!("Could not paste: {error}"));
+            return;
+        }
+    };
+    let content = match read_clipboard_content(&mut clipboard) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            app.info("Nothing to paste");
+            return;
+        }
+        Err(error) => {
+            app.error(format!("Could not paste: {error}"));
+            return;
+        }
+    };
+
+    paste_clipboard_content(app, content);
+}
+
+fn paste_editor(app: &mut App) -> Option<&mut crate::description::DescriptionEditor> {
+    match app.mode {
+        Mode::TaskForm => app
+            .form
+            .as_mut()
+            .filter(|form| form.field == Field::Description)
+            .map(|form| &mut form.description),
+        Mode::CategoryForm => app
+            .category_form
+            .as_mut()
+            .filter(|form| form.on_description)
+            .map(|form| &mut form.description),
+        _ => None,
+    }
+}
+
+fn paste_clipboard_content(app: &mut App, content: ClipboardContent) {
+    if paste_editor(app).is_none() {
+        debug_assert!(
+            false,
+            "description paste command requires an active description editor"
+        );
+        return;
+    }
+
+    let ClipboardContent { image, text } = content;
+    let category_ignored_image = app.mode == Mode::CategoryForm && image.is_some();
+    let staged_image = if app.mode == Mode::TaskForm {
+        image.map(crate::image::stage_clipboard_image)
+    } else {
+        None
+    };
+    let pasted_text = text.is_some();
+    if let Some(text) = text {
+        // When both representations exist, keep their deterministic visual
+        // order: clipboard text first, then its image.
+        paste_editor(app)
+            .expect("active description editor checked above")
+            .insert_str(&text);
+    }
+
+    let (pasted_image, image_error) = match staged_image {
+        Some(Ok(image)) => {
+            let inserted = match app.mode {
+                Mode::TaskForm => app
+                    .form
+                    .as_mut()
+                    .is_some_and(|form| form.insert_temporary_image(image)),
+                _ => false,
+            };
+            (
+                inserted,
+                (!inserted).then(|| "this field is full".to_string()),
+            )
+        }
+        Some(Err(error)) => (false, Some(error)),
+        None => (false, None),
+    };
+
+    if let Some(error) = image_error {
+        if pasted_text {
+            app.error(format!("Pasted text, but could not paste image: {error}"));
+        } else {
+            app.error(format!("Could not paste image: {error}"));
+        }
+        return;
+    }
+    match (pasted_text, pasted_image) {
+        (true, true) => app.info("Pasted text and image from clipboard"),
+        (true, false) if category_ignored_image => {
+            app.info("Pasted text; category descriptions accept text only")
+        }
+        (true, false) => app.info("Pasted text from clipboard"),
+        (false, true) => app.info("Pasted image from clipboard"),
+        (false, false) if category_ignored_image => {
+            app.info("Category descriptions accept text only")
+        }
+        (false, false) => app.info("Nothing to paste"),
+    }
+}
+
+fn finish_copy(app: &mut App, payload: crate::description::CopyPayload) {
     match payload {
-        crate::body::CopyPayload::Text(text) => {
+        crate::description::CopyPayload::Text(text) => {
             if text.is_empty() {
                 app.info("Nothing to copy");
                 return;
@@ -1173,11 +1358,11 @@ fn finish_copy(app: &mut App, payload: crate::body::CopyPayload) {
                 Err(err) => app.error(format!("Could not copy: {err}")),
             }
         }
-        crate::body::CopyPayload::Image(path) => match copy_image_file(&path) {
+        crate::description::CopyPayload::Image(path) => match copy_image_file(&path) {
             Ok(()) => app.info("Copied image to clipboard"),
             Err(err) => app.error(format!("Could not copy image: {err}")),
         },
-        crate::body::CopyPayload::All(lines) => {
+        crate::description::CopyPayload::All(lines) => {
             if lines.is_empty() {
                 app.info("Nothing to copy");
                 return;
@@ -1241,7 +1426,7 @@ fn osc52_sequence(text: &str) -> Result<String, String> {
     Ok(format!("\x1b]52;c;{encoded}\x07"))
 }
 
-/// Decode a body image file and put its pixels on the system clipboard.
+/// Decode a description image file and put its pixels on the system clipboard.
 fn copy_image_file(path: &std::path::Path) -> Result<(), String> {
     let rgba = crate::image::load_dynamic(path)?.into_rgba8();
     let (width, height) = rgba.dimensions();
@@ -1255,10 +1440,10 @@ fn copy_image_file(path: &std::path::Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Put the whole body on the clipboard as HTML (with embedded images)
+/// Put the whole description on the clipboard as HTML (with embedded images)
 /// plus a plain-text fallback. Notes, browsers, and mail clients can
 /// paste the rich form; terminals get the text.
-fn copy_all(lines: &[crate::body::CopyLine]) -> Result<ClipboardTarget, String> {
+fn copy_all(lines: &[crate::description::CopyLine]) -> Result<ClipboardTarget, String> {
     let (plain, html) = build_clipboard_payload(lines, MAX_RICH_CLIPBOARD_BYTES);
 
     match arboard::Clipboard::new()
@@ -1272,18 +1457,18 @@ fn copy_all(lines: &[crate::body::CopyLine]) -> Result<ClipboardTarget, String> 
 }
 
 fn build_clipboard_payload(
-    lines: &[crate::body::CopyLine],
+    lines: &[crate::description::CopyLine],
     rich_budget: usize,
 ) -> (String, String) {
     build_clipboard_payload_with(lines, rich_budget, image_data_url)
 }
 
 fn build_clipboard_payload_with(
-    lines: &[crate::body::CopyLine],
+    lines: &[crate::description::CopyLine],
     rich_budget: usize,
     mut load_image: impl FnMut(&std::path::Path, usize) -> Result<String, String>,
 ) -> (String, String) {
-    use crate::body::CopyLine;
+    use crate::description::CopyLine;
 
     const IMAGE_PREFIX: &str = r#"<div><img src=""#;
     const IMAGE_SUFFIX: &str = r#"" /></div>"#;
@@ -1513,19 +1698,30 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     MenuClick::Miss => {}
                 }
             }
-            if let (MouseEventKind::Down(MouseButton::Left), Some(form)) =
+            let clicked_link = if let (MouseEventKind::Down(MouseButton::Left), Some(form)) =
                 (m.kind, &mut app.category_form)
             {
                 if contains(form.name_area, m.column, m.row) {
                     form.set_description_focus(false);
                     form.name
                         .set_cursor_from_col((m.column - form.name_area.x) as usize);
+                    None
                 } else if contains(form.description_area, m.column, m.row) {
                     form.set_description_focus(true);
-                    form.description.click(
-                        m.row - form.description_area.y,
-                        (m.column - form.description_area.x) as usize,
-                    );
+                    let row = m.row - form.description_area.y;
+                    let column = (m.column - form.description_area.x) as usize;
+                    let url = form.description.link_url_at_position(row, column);
+                    form.description.click(row, column).then_some(url).flatten()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(url) = clicked_link {
+                match crate::open::open_url(&url) {
+                    Ok(()) => app.info(format!("Opened {url}")),
+                    Err(error) => app.error(error),
                 }
             }
             return;
@@ -1688,7 +1884,10 @@ fn click_on_panels(app: &App, m: MouseEvent) -> bool {
         if form.picker.as_ref().is_some_and(|p| p.contains(x, y)) {
             return false;
         }
-        if form.body_menu_area.is_some_and(|r| contains(r, x, y)) {
+        if form
+            .description_menu_area
+            .is_some_and(|r| contains(r, x, y))
+        {
             return false;
         }
     }
@@ -1696,7 +1895,9 @@ fn click_on_panels(app: &App, m: MouseEvent) -> bool {
         && (contains(form.form_area, x, y)
             || contains(form.name_area, x, y)
             || contains(form.description_area, x, y)
-            || form.body_menu_area.is_some_and(|r| contains(r, x, y)))
+            || form
+                .description_menu_area
+                .is_some_and(|r| contains(r, x, y)))
     {
         return false;
     }
@@ -1724,18 +1925,21 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
         return;
     }
 
-    // Scroll over the open body `/` menu moves the selection.
+    // Scroll over the open description `/` menu moves the selection.
     if matches!(
         m.kind,
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-    ) && app.form.as_ref().is_some_and(|f| f.body.menu.is_some())
+    ) && app
+        .form
+        .as_ref()
+        .is_some_and(|f| f.description.menu.is_some())
     {
         let up = matches!(m.kind, MouseEventKind::ScrollUp);
         if let Some(form) = &mut app.form {
             if up {
-                form.body.menu_prev();
+                form.description.menu_prev();
             } else {
-                form.body.menu_next();
+                form.description.menu_next();
             }
         }
         return;
@@ -1771,15 +1975,19 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
         }
     }
 
-    // Body `/` menu: click a row to run it; click elsewhere closes the
-    // menu only (dialog stays open). Handled before body.click, which
+    // Description `/` menu: click a row to run it; click elsewhere closes the
+    // menu only (dialog stays open). Handled before description.click, which
     // would otherwise dismiss the menu without selecting anything.
-    if app.form.as_ref().is_some_and(|f| f.body.menu.is_some()) {
-        match click_body_slash_menu(app, m.column, m.row) {
+    if app
+        .form
+        .as_ref()
+        .is_some_and(|f| f.description.menu.is_some())
+    {
+        match click_description_slash_menu(app, m.column, m.row) {
             MenuClick::Handled => return,
             MenuClick::Miss => {
                 // Fall through: place the cursor / change field, menu
-                // closes via body.click or set_field.
+                // closes via description.click or set_field.
             }
         }
     }
@@ -1794,7 +2002,7 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
         let Some(field) = form.areas.field_at(m.column, m.row) else {
             // Click outside the dialog fields — do not keep a pending
             // double-click that could open a picture on the next hit.
-            form.last_body_click = None;
+            form.last_description_click = None;
             return;
         };
         // Leaving Due dismisses the calendar so keys go to the new field.
@@ -1806,63 +2014,63 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
         match field {
             Field::Title => {
                 form.title.set_cursor_from_col(col);
-                form.last_body_click = None;
+                form.last_description_click = None;
                 AfterClick::None
             }
             Field::Due => {
                 form.open_due_picker();
-                form.last_body_click = None;
+                form.last_description_click = None;
                 AfterClick::None
             }
             Field::Category => {
                 form.cycle_category(1);
-                form.last_body_click = None;
+                form.last_description_click = None;
                 AfterClick::None
             }
-            Field::Body => {
+            Field::Description => {
                 // Resolve the link against the painted glyphs before click()
                 // moves the cursor; blank row padding is not a hit target.
-                let clicked_link = form.body.link_url_at_position(row as u16, col);
-                let hit = form.body.click(row as u16, col);
+                let clicked_link = form.description.link_url_at_position(row as u16, col);
+                let hit = form.description.click(row as u16, col);
                 if !hit {
-                    form.last_body_click = None;
+                    form.last_description_click = None;
                     AfterClick::None
                 } else if let Some(url) = clicked_link {
-                    form.last_body_click = None;
+                    form.last_description_click = None;
                     AfterClick::OpenUrl(url)
-                } else if form.body.selected_image().is_some() {
+                } else if form.description.selected_image().is_some() {
                     // Pictures are letterboxed — only the drawn box counts.
                     // Gutter clicks must not select the picture or insert a
                     // blank line (←/→ are what create a caret next to it).
-                    let line = form.body.cursor_line();
+                    let line = form.description.cursor_line();
                     if !form.image_hit_at(line, m.column, m.row) {
-                        form.body.abandon_image_selection();
-                        form.last_body_click = None;
+                        form.description.abandon_image_selection();
+                        form.last_description_click = None;
                         AfterClick::None
                     } else {
                         let now = Instant::now();
-                        let again = form.last_body_click.is_some_and(|(at, last)| {
+                        let again = form.last_description_click.is_some_and(|(at, last)| {
                             last == line && now.duration_since(at) < DOUBLE_CLICK
                         });
                         if again {
-                            form.last_body_click = None;
+                            form.last_description_click = None;
                             match form.open_image_preview() {
                                 Some(err) => AfterClick::PreviewErr(err),
                                 None => AfterClick::None,
                             }
                         } else {
-                            form.last_body_click = Some((now, line));
+                            form.last_description_click = Some((now, line));
                             AfterClick::None
                         }
                     }
                 } else {
-                    form.last_body_click = None;
+                    form.last_description_click = None;
                     AfterClick::None
                 }
             }
             Field::Importance => {
                 form.cycle_importance();
-                form.last_body_click = None;
+                form.last_description_click = None;
                 AfterClick::None
             }
         }
@@ -1888,13 +2096,13 @@ enum MenuHit {
     Handled,
     Command {
         index: usize,
-        command: crate::body::Command,
+        command: crate::description::Command,
     },
     Miss,
 }
 
 fn slash_menu_hit(
-    body: &crate::body::BodyEditor,
+    description: &crate::description::DescriptionEditor,
     rect: Option<ratatui::layout::Rect>,
     x: u16,
     y: u16,
@@ -1907,7 +2115,7 @@ fn slash_menu_hit(
     }
 
     // Rows sit inside the border: top border at rect.y, first command at y+1.
-    let commands = body.menu_commands();
+    let commands = description.menu_commands();
     if commands.is_empty() || y <= rect.y || y >= rect.bottom().saturating_sub(1) {
         return MenuHit::Handled;
     }
@@ -1918,10 +2126,10 @@ fn slash_menu_hit(
     }
 }
 
-/// Hit-test the open body `/` dropdown. Clicking a command row runs it.
-fn click_body_slash_menu(app: &mut App, x: u16, y: u16) -> MenuClick {
+/// Hit-test the open description `/` dropdown. Clicking a command row runs it.
+fn click_description_slash_menu(app: &mut App, x: u16, y: u16) -> MenuClick {
     let hit = match app.form.as_ref() {
-        Some(form) => slash_menu_hit(&form.body, form.body_menu_area, x, y),
+        Some(form) => slash_menu_hit(&form.description, form.description_menu_area, x, y),
         None => MenuHit::Miss,
     };
     let (index, command) = match hit {
@@ -1932,20 +2140,20 @@ fn click_body_slash_menu(app: &mut App, x: u16, y: u16) -> MenuClick {
     let Some(form) = app.form.as_mut() else {
         return MenuClick::Miss;
     };
-    if let Some(menu) = &mut form.body.menu {
+    if let Some(menu) = &mut form.description.menu {
         menu.index = index;
     }
     form.before_edit(EditKind::Atomic);
-    let payload = form.body.apply(command);
-    if let Some(payload) = payload {
-        finish_copy(app, payload);
+    let request = form.description.apply(command);
+    if let Some(request) = request {
+        finish_description_command(app, request);
     }
     MenuClick::Handled
 }
 
 fn click_category_slash_menu(app: &mut App, x: u16, y: u16) -> MenuClick {
     let hit = match app.category_form.as_ref() {
-        Some(form) => slash_menu_hit(&form.description, form.body_menu_area, x, y),
+        Some(form) => slash_menu_hit(&form.description, form.description_menu_area, x, y),
         None => MenuHit::Miss,
     };
     let (index, command) = match hit {
@@ -1960,9 +2168,9 @@ fn click_category_slash_menu(app: &mut App, x: u16, y: u16) -> MenuClick {
         menu.index = index;
     }
     form.before_edit(EditKind::Atomic);
-    let payload = form.description.apply(command);
-    if let Some(payload) = payload {
-        finish_copy(app, payload);
+    let request = form.description.apply(command);
+    if let Some(request) = request {
+        finish_description_command(app, request);
     }
     MenuClick::Handled
 }
@@ -1984,20 +2192,115 @@ fn contains(area: ratatui::layout::Rect, x: u16, y: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::path::PathBuf;
 
-    use crate::body::CopyLine;
+    use crate::description::CopyLine;
 
     use super::{
-        MAX_OSC52_ENCODED_BYTES, MAX_OSC52_RAW_BYTES, build_clipboard_payload_with, osc52_sequence,
-        task_clipboard_text,
+        ClipboardContent, MAX_OSC52_ENCODED_BYTES, MAX_OSC52_RAW_BYTES,
+        build_clipboard_payload_with, osc52_sequence, paste_clipboard_content,
+        resolve_clipboard_content, task_clipboard_text,
     };
+
+    #[test]
+    fn clipboard_keeps_image_and_text_when_both_are_available() {
+        let content = resolve_clipboard_content(
+            Ok(arboard::ImageData {
+                width: 1,
+                height: 1,
+                bytes: Cow::Owned(vec![1, 2, 3, 255]),
+            }),
+            Ok("image alt text".into()),
+        )
+        .expect("read clipboard")
+        .expect("clipboard content");
+
+        assert!(content.image.is_some());
+        assert_eq!(content.text.as_deref(), Some("image alt text"));
+    }
+
+    #[test]
+    fn clipboard_text_is_used_when_no_image_format_is_available() {
+        let content = resolve_clipboard_content(
+            Err(arboard::Error::ContentNotAvailable),
+            Ok("clipboard text".into()),
+        )
+        .expect("read clipboard")
+        .expect("clipboard content");
+
+        assert!(content.image.is_none());
+        assert_eq!(content.text.as_deref(), Some("clipboard text"));
+    }
+
+    fn mixed_clipboard_content() -> ClipboardContent {
+        ClipboardContent {
+            image: Some(arboard::ImageData {
+                width: 1,
+                height: 1,
+                bytes: Cow::Owned(vec![10, 20, 30, 255]),
+            }),
+            text: Some("clipboard text".into()),
+        }
+    }
+
+    fn assert_text_then_image(blocks: &[crate::model::Block]) -> PathBuf {
+        assert!(matches!(
+            blocks.first(),
+            Some(crate::model::Block::Text { text }) if text == "clipboard text"
+        ));
+        let Some(crate::model::Block::Image { attachment_id }) = blocks.get(1) else {
+            panic!("clipboard image must follow its text representation");
+        };
+        PathBuf::from(attachment_id)
+    }
+
+    #[test]
+    fn mixed_clipboard_content_is_inserted_into_a_task_description() {
+        let logical_path = std::env::temp_dir().join(format!(
+            "mach-mixed-task-clipboard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = crate::store::Store::open_in_memory_with_paths(logical_path).unwrap();
+        let mut app = crate::app::App::with_store("test", store).unwrap();
+        app.open_new_task();
+        app.form.as_mut().unwrap().field = crate::form::Field::Description;
+
+        paste_clipboard_content(&mut app, mixed_clipboard_content());
+
+        let path = assert_text_then_image(&app.form.as_ref().unwrap().description.value());
+        assert!(path.is_file());
+        drop(app);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn category_description_uses_only_text_from_mixed_clipboard_content() {
+        let logical_path = std::env::temp_dir().join(format!(
+            "mach-mixed-category-clipboard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = crate::store::Store::open_in_memory_with_paths(logical_path).unwrap();
+        let mut app = crate::app::App::with_store("test", store).unwrap();
+        app.open_new_category();
+        app.category_form
+            .as_mut()
+            .unwrap()
+            .set_description_focus(true);
+
+        paste_clipboard_content(&mut app, mixed_clipboard_content());
+
+        assert_eq!(
+            app.category_form.as_ref().unwrap().description.value(),
+            vec![crate::model::Block::text("clipboard text")]
+        );
+    }
 
     #[test]
     fn task_copy_preserves_stored_text_that_names_an_existing_image() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/screenshot.png");
         let mut task = crate::model::Task::new("Keep the path", 0, None, "");
-        task.body = vec![crate::model::Block::text(path)];
+        task.description = vec![crate::model::Block::text(path)];
 
         assert_eq!(
             task_clipboard_text(&task),

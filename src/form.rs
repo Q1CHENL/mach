@@ -5,10 +5,10 @@ use std::time::Instant;
 
 use ratatui::layout::Rect;
 
-use crate::body::BodyEditor;
+use crate::description::DescriptionEditor;
 use crate::due;
 use crate::duepicker::DuePicker;
-use crate::image::{GifLoad, GifPlayback};
+use crate::image::{GifLoad, GifPlayback, TemporaryImage};
 use crate::model::{Block, Category, MAX_TITLE_LEN, Task};
 use crate::text_input::TextInput;
 use crate::undo::{EditKind, History};
@@ -19,28 +19,28 @@ pub enum Field {
     Category,
     Due,
     Importance,
-    Body,
+    Description,
 }
 
 impl Field {
-    /// Tab order follows the layout: title, metadata, then body.
+    /// Tab order follows the layout: title, metadata, then description.
     pub fn next(self) -> Self {
         match self {
             Self::Title => Self::Category,
             Self::Category => Self::Due,
             Self::Due => Self::Importance,
-            Self::Importance => Self::Body,
-            Self::Body => Self::Title,
+            Self::Importance => Self::Description,
+            Self::Description => Self::Title,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::Title => Self::Body,
+            Self::Title => Self::Description,
             Self::Category => Self::Title,
             Self::Due => Self::Category,
             Self::Importance => Self::Due,
-            Self::Body => Self::Importance,
+            Self::Description => Self::Importance,
         }
     }
 }
@@ -49,15 +49,14 @@ impl Field {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CategorySnap {
     name: TextInput,
-    description: BodyEditor,
+    description: DescriptionEditor,
     on_description: bool,
 }
 
-/// The category dialog: a name and a note about what it is for, both
-/// plain text.
+/// The category dialog: a name and a text-only description of what it is for.
 pub struct CategoryForm {
     pub name: TextInput,
-    pub description: BodyEditor,
+    pub description: DescriptionEditor,
     pub on_description: bool,
     pub error: Option<String>,
     /// The category being edited; `None` when creating one.
@@ -67,7 +66,7 @@ pub struct CategoryForm {
     pub name_area: Rect,
     pub description_area: Rect,
     /// Screen rect of the open description `/` dropdown.
-    pub body_menu_area: Option<Rect>,
+    pub description_menu_area: Option<Rect>,
     history: History<CategorySnap>,
     initial_name: String,
     initial_description: String,
@@ -77,14 +76,14 @@ impl CategoryForm {
     pub fn new() -> Self {
         Self {
             name: TextInput::new("", crate::model::MAX_CATEGORY_NAME_LEN),
-            description: BodyEditor::plain(""),
+            description: DescriptionEditor::plain(""),
             on_description: false,
             error: None,
             editing: None,
             form_area: Rect::ZERO,
             name_area: Rect::ZERO,
             description_area: Rect::ZERO,
-            body_menu_area: None,
+            description_menu_area: None,
             history: History::new(),
             initial_name: String::new(),
             initial_description: String::new(),
@@ -94,7 +93,7 @@ impl CategoryForm {
     pub fn edit(category: &crate::model::Category) -> Self {
         Self {
             name: TextInput::new(&category.name, crate::model::MAX_CATEGORY_NAME_LEN),
-            description: BodyEditor::plain(&category.description),
+            description: DescriptionEditor::plain(&category.description),
             editing: Some(category.id.clone()),
             initial_name: category.name.clone(),
             initial_description: category.description.clone(),
@@ -219,7 +218,7 @@ pub struct FieldAreas {
     pub category: Rect,
     pub due: Rect,
     pub importance: Rect,
-    pub body: Rect,
+    pub description: Rect,
 }
 
 impl FieldAreas {
@@ -233,8 +232,8 @@ impl FieldAreas {
             Some(Field::Due)
         } else if self.importance.contains(pos) {
             Some(Field::Importance)
-        } else if self.body.contains(pos) {
-            Some(Field::Body)
+        } else if self.description.contains(pos) {
+            Some(Field::Description)
         } else {
             None
         }
@@ -246,7 +245,7 @@ impl FieldAreas {
             Field::Category => self.category,
             Field::Due => self.due,
             Field::Importance => self.importance,
-            Field::Body => self.body,
+            Field::Description => self.description,
         }
     }
 }
@@ -259,7 +258,7 @@ pub struct TaskDraft {
     pub category_id: Option<String>,
     pub due: String,
     pub importance: u8,
-    pub body: Vec<Block>,
+    pub description: Vec<Block>,
 }
 
 impl TaskDraft {
@@ -278,7 +277,7 @@ struct TaskSnap {
     category_id: Option<String>,
     due: TextInput,
     importance: u8,
-    body: BodyEditor,
+    description: DescriptionEditor,
     field: Field,
 }
 
@@ -303,7 +302,7 @@ pub struct TaskForm {
     category_choices: Vec<CategoryChoice>,
     pub due: TextInput,
     pub importance: u8,
-    pub body: BodyEditor,
+    pub description: DescriptionEditor,
     pub field: Field,
     pub error: Option<String>,
     /// The task being edited; `None` when creating a new one.
@@ -320,22 +319,24 @@ pub struct TaskForm {
     pub gif_pending: Option<GifLoad>,
     /// The calendar, while a due date is being picked.
     pub picker: Option<DuePicker>,
-    /// Last body click (line index), for double-click to open a picture.
-    pub last_body_click: Option<(Instant, usize)>,
+    /// Last description click (line index), for double-click to open a picture.
+    pub last_description_click: Option<(Instant, usize)>,
     /// Whether the `/` menu was open last frame — used to re-emit images
-    /// after the menu is dismissed (see `ui::draw_body`).
+    /// after the menu is dismissed (see `ui::draw_description`).
     pub menu_was_open: bool,
-    /// Body scroll after last paint — scroll changes need the same protocol
+    /// Description scroll after last paint — scroll changes need the same protocol
     /// drop as menu close so pictures that shrink/move do not ghost.
-    pub body_scroll: usize,
-    /// Screen rect of the open body `/` dropdown (for mouse hit-testing).
-    pub body_menu_area: Option<Rect>,
-    /// Where each body picture was drawn last frame: `(line index, screen rect)`.
+    pub description_scroll: usize,
+    /// Screen rect of the open description `/` dropdown (for mouse hit-testing).
+    pub description_menu_area: Option<Rect>,
+    /// Where each description picture was drawn last frame: `(line index, screen rect)`.
     /// Clicks only select a picture when they land inside this rect — not the
     /// full-width letterbox gutter.
     pub image_hits: Vec<(usize, Rect)>,
+    pub(crate) image_layout: Vec<(std::path::PathBuf, u16, u16)>,
     history: History<TaskSnap>,
     initial: TaskDraft,
+    temporary_images: Vec<TemporaryImage>,
 }
 
 impl TaskForm {
@@ -347,17 +348,21 @@ impl TaskForm {
         image_root: std::path::PathBuf,
         attachments: &[crate::store::Attachment],
     ) -> Self {
-        Self::with_body(BodyEditor::new_with_images(&[], image_root, attachments))
+        Self::with_description(DescriptionEditor::new_with_images(
+            &[],
+            image_root,
+            attachments,
+        ))
     }
 
-    fn with_body(body: BodyEditor) -> Self {
+    fn with_description(description: DescriptionEditor) -> Self {
         Self {
             title: TextInput::new("", MAX_TITLE_LEN),
             category_id: None,
             category_choices: vec![CategoryChoice::uncategorized()],
             due: TextInput::new("", 32),
             importance: 0,
-            body,
+            description,
             field: Field::Title,
             error: None,
             editing: None,
@@ -367,13 +372,15 @@ impl TaskForm {
             gif: None,
             gif_pending: None,
             picker: None,
-            last_body_click: None,
+            last_description_click: None,
             menu_was_open: false,
-            body_scroll: 0,
-            body_menu_area: None,
+            description_scroll: 0,
+            description_menu_area: None,
             image_hits: Vec::new(),
+            image_layout: Vec::new(),
             history: History::new(),
             initial: TaskDraft::default(),
+            temporary_images: Vec::new(),
         }
     }
 
@@ -386,9 +393,10 @@ impl TaskForm {
         image_root: std::path::PathBuf,
         attachments: &[crate::store::Attachment],
     ) -> Self {
-        let body = BodyEditor::new_with_images(&task.body, image_root, attachments);
-        let initial_body = body.value();
-        let mut form = Self::with_body(body);
+        let description =
+            DescriptionEditor::new_with_images(&task.description, image_root, attachments);
+        let initial_description = description.value();
+        let mut form = Self::with_description(description);
         form.title = TextInput::new(&task.title, MAX_TITLE_LEN);
         form.category_id = task.category_id.clone();
         form.due = TextInput::new(&task.due, 32);
@@ -399,12 +407,12 @@ impl TaskForm {
             category_id: task.category_id.clone(),
             due: task.due.clone(),
             importance: task.importance,
-            body: initial_body,
+            description: initial_description,
         };
         form
     }
 
-    /// Whether `(x, y)` sits on the drawn picture for body line `line`.
+    /// Whether `(x, y)` sits on the drawn picture for description line `line`.
     pub fn image_hit_at(&self, line: usize, x: u16, y: u16) -> bool {
         use ratatui::layout::Position;
         self.image_hits
@@ -413,11 +421,11 @@ impl TaskForm {
     }
 
     pub fn set_image_root(&mut self, image_root: std::path::PathBuf) {
-        self.body.set_image_root(image_root);
+        self.description.set_image_root(image_root);
     }
 
     pub fn set_attachments(&mut self, attachments: &[crate::store::Attachment]) {
-        self.body.set_attachments(attachments);
+        self.description.set_attachments(attachments);
     }
 
     /// Install the real categories available to this form and select the
@@ -491,8 +499,8 @@ impl TaskForm {
     /// Open the full-size image viewer. GIF frames decode asynchronously;
     /// the still-image cache can paint a placeholder in the meantime.
     pub fn open_image_preview(&mut self) -> Option<String> {
-        // Only the image under the cursor — never fall back to "first in body".
-        let Some(path) = self.body.selected_image() else {
+        // Only the image under the cursor — never fall back to "first in description".
+        let Some(path) = self.description.selected_image() else {
             self.preview = false;
             return Some("No image to preview".into());
         };
@@ -587,7 +595,7 @@ impl TaskForm {
             category_id: self.category_id.clone(),
             due: self.due.value(),
             importance: self.importance,
-            body: self.body.value(),
+            description: self.description.value(),
         }
     }
 
@@ -605,7 +613,7 @@ impl TaskForm {
             category_id: self.category_id.clone(),
             due: self.due.clone(),
             importance: self.importance,
-            body: self.body.clone(),
+            description: self.description.clone(),
             field: self.field,
         }
     }
@@ -615,14 +623,14 @@ impl TaskForm {
         self.category_id = s.category_id;
         self.due = s.due;
         self.importance = s.importance;
-        self.body = s.body;
+        self.description = s.description;
         self.field = s.field;
         self.error = None;
         // Overlays are not part of content history.
         self.picker = None;
         self.preview = false;
         self.gif_pending = None;
-        self.body.close_menu();
+        self.description.close_menu();
     }
 
     /// Snapshot before a content edit (call before mutating).
@@ -632,7 +640,7 @@ impl TaskForm {
             category_id,
             due,
             importance,
-            body,
+            description,
             field,
             history,
             ..
@@ -642,7 +650,7 @@ impl TaskForm {
             category_id: category_id.clone(),
             due: due.clone(),
             importance: *importance,
-            body: body.clone(),
+            description: description.clone(),
             field: *field,
         });
     }
@@ -664,6 +672,15 @@ impl TaskForm {
             return false;
         };
         self.restore(next);
+        true
+    }
+
+    pub(crate) fn insert_temporary_image(&mut self, image: TemporaryImage) -> bool {
+        let reference = image.path().to_string_lossy().into_owned();
+        if !self.description.insert_block(Block::image(&reference)) {
+            return false;
+        }
+        self.temporary_images.push(image);
         true
     }
 
@@ -711,14 +728,14 @@ impl TaskForm {
     pub fn focus_next(&mut self) {
         self.history.break_coalesce();
         self.picker = None;
-        self.body.close_menu();
+        self.description.close_menu();
         self.field = self.field.next();
     }
 
     pub fn focus_prev(&mut self) {
         self.history.break_coalesce();
         self.picker = None;
-        self.body.close_menu();
+        self.description.close_menu();
         self.field = self.field.prev();
     }
 
@@ -729,8 +746,8 @@ impl TaskForm {
         if field != Field::Due {
             self.picker = None;
         }
-        if field != Field::Body {
-            self.body.close_menu();
+        if field != Field::Description {
+            self.description.close_menu();
         }
         self.field = field;
     }
@@ -778,7 +795,7 @@ impl TaskForm {
                 due_text
             },
             importance: self.importance,
-            body: self.body.value(),
+            description: self.description.value(),
         })
     }
 }
@@ -830,14 +847,14 @@ mod tests {
     }
 
     #[test]
-    fn undo_restores_title_and_body() {
+    fn undo_restores_title_and_description() {
         let mut form = TaskForm::new();
         form.before_edit(EditKind::Typing);
         form.title = TextInput::new("hello", MAX_TITLE_LEN);
         form.before_edit(EditKind::Atomic);
-        form.body.insert_str("note");
+        form.description.insert_str("note");
         assert!(form.undo());
-        assert!(form.body.is_empty() || form.body.plain_value().is_empty());
+        assert!(form.description.is_empty() || form.description.plain_value().is_empty());
         assert_eq!(form.title.value(), "hello");
         assert!(form.undo());
         assert_eq!(form.title.value(), "");
@@ -894,7 +911,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mach-async-{}.gif", std::process::id()));
         std::fs::write(&path, b"not a real gif").unwrap();
         let mut task = Task::new("gif", 0, None, "");
-        task.body = vec![Block::Image {
+        task.description = vec![Block::Image {
             attachment_id: path.display().to_string(),
         }];
         let mut form = TaskForm::edit(&task);

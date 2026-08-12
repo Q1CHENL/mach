@@ -254,11 +254,44 @@ fn empty_repeatable_subtasks_are_rejected_instead_of_succeeding_silently() {
 }
 
 #[test]
-fn documented_hyphen_leading_body_value_is_accepted_normally() {
-    let dir = TempDir::new("hyphen-leading-body");
+fn task_description_is_the_only_public_cli_and_json_name() {
+    let dir = TempDir::new("task-description-name");
     let output = mach(
         dir.path(),
-        &["--json", "add", "bullet body", "--body", "- first"],
+        &["--json", "add", "named cleanly", "--description", "details"],
+    );
+
+    assert!(
+        output.status.success(),
+        "--description was rejected: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let task: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(task["description"], "details");
+    assert!(task.get("body").is_none());
+
+    let old_name = mach(
+        dir.path(),
+        &["--json", "add", "old name", "--body", "details"],
+    );
+    assert!(!old_name.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&old_name.stdout).unwrap();
+    assert_eq!(error["kind"], "usage");
+}
+
+#[test]
+fn documented_hyphen_leading_description_value_is_accepted_normally() {
+    let dir = TempDir::new("hyphen-leading-description");
+    let output = mach(
+        dir.path(),
+        &[
+            "--json",
+            "add",
+            "bullet description",
+            "--description",
+            "- first",
+        ],
     );
 
     assert!(
@@ -268,20 +301,20 @@ fn documented_hyphen_leading_body_value_is_accepted_normally() {
         String::from_utf8_lossy(&output.stderr)
     );
     let task: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(task["body"], "- first");
+    assert_eq!(task["description"], "- first");
 }
 
 #[test]
-fn missing_body_value_does_not_consume_the_next_flag_or_mutate() {
-    let dir = TempDir::new("missing-body-before-flag");
+fn missing_description_value_does_not_consume_the_next_flag_or_mutate() {
+    let dir = TempDir::new("missing-description-before-flag");
     let added = mach(
         dir.path(),
         &[
             "--json",
             "add",
             "keep me",
-            "--body",
-            "original body",
+            "--description",
+            "original description",
             "--due",
             "2026-08-20",
         ],
@@ -290,7 +323,10 @@ fn missing_body_value_does_not_consume_the_next_flag_or_mutate() {
     let task: serde_json::Value = serde_json::from_slice(&added.stdout).unwrap();
     let id = task["id"].as_str().unwrap();
 
-    let edited = mach(dir.path(), &["--json", "edit", id, "--body", "--clear-due"]);
+    let edited = mach(
+        dir.path(),
+        &["--json", "edit", id, "--description", "--clear-due"],
+    );
 
     assert!(!edited.status.success());
     let error: serde_json::Value = serde_json::from_slice(&edited.stdout).unwrap();
@@ -298,26 +334,31 @@ fn missing_body_value_does_not_consume_the_next_flag_or_mutate() {
     let shown = mach(dir.path(), &["--json", "show", id]);
     assert!(shown.status.success());
     let unchanged: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
-    assert_eq!(unchanged["body"], "original body");
+    assert_eq!(unchanged["description"], "original description");
     assert_eq!(unchanged["due"], "2026-08-20");
 }
 
 #[test]
-fn explicit_equals_preserves_option_shaped_body_text() {
-    let dir = TempDir::new("option-shaped-body");
+fn explicit_equals_preserves_option_shaped_description_text() {
+    let dir = TempDir::new("option-shaped-description");
     let output = mach(
         dir.path(),
-        &["--json", "add", "literal option", "--body=--clear-due"],
+        &[
+            "--json",
+            "add",
+            "literal option",
+            "--description=--clear-due",
+        ],
     );
 
     assert!(
         output.status.success(),
-        "explicit body value was rejected: stdout={} stderr={}",
+        "explicit description value was rejected: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let task: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(task["body"], "--clear-due");
+    assert_eq!(task["description"], "--clear-due");
 }
 
 #[test]
@@ -397,7 +438,7 @@ fn task_category_and_subtask_workflow_keeps_one_json_contract() {
             "2099-12-31",
             "--time",
             "09:30",
-            "--body",
+            "--description",
             "note\n[ ] first\n- bullet\n1. numbered\nhttps://example.com\n[image:foo.png]",
             "--subtask",
             "second",
@@ -414,7 +455,7 @@ fn task_category_and_subtask_workflow_keeps_one_json_contract() {
     assert_eq!(task["due"], "2099-12-31 09:30");
     assert_eq!(task["subtasks_total"], 2);
     assert!(
-        task["body"]
+        task["description"]
             .as_str()
             .unwrap()
             .contains(&format!("[image:{attachment_id}]"))
@@ -583,7 +624,7 @@ fn archive_round_trip_preserves_tasks_categories_and_images() {
     let output = TempDir::new("archive-output");
     let archive = output.path().join("tasks.mach");
     let screenshot = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/screenshot.png");
-    let body = format!(
+    let description = format!(
         "notes\n[ ] open step\n- bullet\n1. numbered\nhttps://example.com\n[image:{}]",
         screenshot.display()
     );
@@ -618,8 +659,8 @@ fn archive_round_trip_preserves_tasks_categories_and_images() {
             "portable task",
             "--category",
             "Work",
-            "--body",
-            &body,
+            "--description",
+            &description,
             "--due",
             "2026-08-10",
             "--importance",
@@ -757,9 +798,12 @@ fn failed_archive_database_merge_does_not_install_image_files() {
     let output = TempDir::new("archive-rollback-output");
     let archive = output.path().join("tasks.mach");
     let screenshot = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/screenshot.png");
-    let body = format!("[image:{}]", screenshot.display());
+    let description = format!("[image:{}]", screenshot.display());
 
-    let added = mach(source.path(), &["--json", "add", "image", "--body", &body]);
+    let added = mach(
+        source.path(),
+        &["--json", "add", "image", "--description", &description],
+    );
     assert!(added.status.success());
     assert!(
         mach(

@@ -96,7 +96,7 @@ fn sample_app() -> App {
         Some("c-work".into()),
         "2030-01-02 09:00",
     );
-    flagged.body = vec![
+    flagged.description = vec![
         Block::text("with a note"),
         Block::todo("step one", true),
         Block::todo("step two", false),
@@ -171,14 +171,17 @@ fn help_marks_both_section_headings() {
     );
     assert!(is_bold(&buffer, "TASK PREVIEW"), "second heading not bold");
     // An ordinary row is plain, so the checks above mean something.
-    assert!(!is_bold(&buffer, "/quit"), "body row should not be bold");
+    assert!(
+        !is_bold(&buffer, "/quit"),
+        "description row should not be bold"
+    );
 }
 
 #[test]
-fn draws_the_task_dialog_with_a_body() {
+fn draws_the_task_dialog_with_a_description() {
     let mut app = sample_app();
     app.open_edit_task();
-    // Tall enough that the docked preview shows the full body stack.
+    // Tall enough that the docked preview shows the full description stack.
     let screen = render(&mut app, 100, 48);
     assert!(screen.contains("Edit task"), "{screen}");
     assert!(
@@ -186,7 +189,7 @@ fn draws_the_task_dialog_with_a_body() {
         "{screen}"
     );
     assert!(screen.contains("ship the release"), "{screen}");
-    // Body blocks keep their markers (docked under the task list).
+    // Description blocks keep their markers (docked under the task list).
     assert!(screen.contains("[✓] step one"), "{screen}");
     assert!(screen.contains("• a point"), "{screen}");
     assert!(screen.contains("1. first"), "{screen}");
@@ -402,7 +405,7 @@ fn hidden_geometry_is_cleared_on_an_undersized_frame() {
 #[test]
 fn a_clipped_read_only_preview_says_that_more_content_exists() {
     let mut app = sample_app();
-    app.tasks[0].body = (0..40)
+    app.tasks[0].description = (0..40)
         .map(|index| Block::text(&format!("preview line {index}")))
         .collect();
     app.invalidate_preview();

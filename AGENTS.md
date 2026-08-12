@@ -45,8 +45,8 @@ rewrite real user data as part of development.
 - `src/model.rs`: task/category data model, limits, and legacy JSON schema.
 - `src/input.rs`: keyboard and mouse control paths.
 - `src/ui.rs`: layout, drawing, clipping, overlays, and mouse hit regions.
-- `src/form.rs`, `src/body.rs`, `src/text_input.rs`, `src/undo.rs`: editing,
-  structured body content, Unicode input, and undo/redo.
+- `src/form.rs`, `src/description.rs`, `src/text_input.rs`, `src/undo.rs`:
+  editing, structured description content, Unicode input, and undo/redo.
 - `src/due.rs`, `src/duepicker.rs`: due-date parsing, display, and selection.
 - `src/fuzzy.rs`, `src/open.rs`: type-to-jump matching and safe platform URL
   opening.

@@ -3,8 +3,8 @@
 pub mod app;
 mod archive;
 pub mod banner;
-pub mod body;
 pub mod cli;
+pub mod description;
 pub mod due;
 pub mod duepicker;
 pub mod form;
