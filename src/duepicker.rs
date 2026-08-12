@@ -48,8 +48,8 @@ pub struct DuePicker {
     pub hour: u8,
     pub minute: u8,
     pub focus: PickerFocus,
-    /// Digits typed into the focused hour/minute field (0–2).
-    entry: Vec<u8>,
+    /// First digit typed into the focused hour/minute field.
+    entry: Option<u8>,
     original: String,
     date_changed: bool,
     time_changed: bool,
@@ -63,9 +63,9 @@ impl DuePicker {
         let current = current.trim();
         let now = Local::now();
         let day = parse_day(current).unwrap_or_else(|| now.date_naive());
-        let (hour, minute) = match crate::due::sort_key(current) {
+        let (hour, minute) = match crate::due::sort_key_at(current, now.date_naive()) {
             // Only trust the clock when the stored value actually has one.
-            Some((_, _, _, h, m)) if current.contains(':') => (h as u8 % 24, m as u8 % 60),
+            Some((_, _, _, h, m)) if current.contains(':') => (h as u8, m as u8),
             _ => (now.hour() as u8, now.minute() as u8),
         };
         Self {
@@ -73,7 +73,7 @@ impl DuePicker {
             hour,
             minute,
             focus: PickerFocus::Calendar,
-            entry: Vec::new(),
+            entry: None,
             original: current.to_string(),
             date_changed: false,
             time_changed: false,
@@ -83,8 +83,7 @@ impl DuePicker {
 
     /// True when `(x, y)` is inside the picker frame.
     pub fn contains(&self, x: u16, y: u16) -> bool {
-        let r = self.layout.frame;
-        !r.is_empty() && r.contains(ratatui::layout::Position { x, y })
+        hit(self.layout.frame, x, y)
     }
 
     /// Apply a left-click. Returns true when the click was handled.
@@ -182,20 +181,20 @@ impl DuePicker {
 
     fn set_focus(&mut self, focus: PickerFocus) {
         if focus != self.focus {
-            self.entry.clear();
+            self.entry = None;
         }
         self.focus = focus;
     }
 
     pub fn move_days(&mut self, days: i64) {
-        self.entry.clear();
+        self.entry = None;
         if let Some(day) = self.day.checked_add_signed(chrono::Duration::days(days)) {
             self.set_day(day);
         }
     }
 
     pub fn move_months(&mut self, months: i32) {
-        self.entry.clear();
+        self.entry = None;
         let (mut year, mut month) = (self.day.year(), self.day.month() as i32 + months);
         while month < 1 {
             month += 12;
@@ -219,19 +218,19 @@ impl DuePicker {
 
     /// Set the clock to the current time of day.
     pub fn now_time(&mut self) {
-        self.entry.clear();
+        self.entry = None;
         let now = Local::now();
         self.set_time(now.hour() as u8, now.minute() as u8);
     }
 
     pub fn bump_hour(&mut self, delta: i32) {
-        self.entry.clear();
+        self.entry = None;
         let h = (self.hour as i32 + delta).rem_euclid(24) as u8;
         self.set_time(h, self.minute);
     }
 
     pub fn bump_minute(&mut self, delta: i32) {
-        self.entry.clear();
+        self.entry = None;
         let total = self.hour as i32 * 60 + self.minute as i32 + delta;
         let total = total.rem_euclid(24 * 60);
         self.set_time((total / 60) as u8, (total % 60) as u8);
@@ -255,35 +254,33 @@ impl DuePicker {
     }
 
     fn push_hour_digit(&mut self, d: u8) {
-        if self.entry.is_empty() {
-            self.entry.push(d);
+        let Some(first) = self.entry.take() else {
+            self.entry = Some(d);
             self.set_time(d, self.minute);
             // 3–9 can only be single-digit hours → commit and move on.
             if d >= 3 {
-                self.entry.clear();
+                self.entry = None;
                 self.set_focus(PickerFocus::Minute);
             }
             return;
-        }
-        let h = self.entry[0] * 10 + d;
+        };
+        let h = first * 10 + d;
         self.set_time(if h < 24 { h } else { d }, self.minute);
-        self.entry.clear();
         self.set_focus(PickerFocus::Minute);
     }
 
     fn push_minute_digit(&mut self, d: u8) {
-        if self.entry.is_empty() {
-            self.entry.push(d);
+        let Some(first) = self.entry.take() else {
+            self.entry = Some(d);
             self.set_time(self.hour, d);
             // 6–9 can only be single-digit minutes.
             if d >= 6 {
-                self.entry.clear();
+                self.entry = None;
             }
             return;
-        }
-        let m = self.entry[0] * 10 + d;
+        };
+        let m = first * 10 + d;
         self.set_time(self.hour, if m < 60 { m } else { d });
-        self.entry.clear();
     }
 
     fn set_day(&mut self, day: NaiveDate) {

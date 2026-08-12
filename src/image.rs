@@ -7,7 +7,7 @@
 //!
 //! Animated GIFs play in the full-size preview (double-click / Enter).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, OnceLock};
@@ -15,12 +15,69 @@ use std::time::{Duration, Instant};
 
 use image::codecs::gif::GifDecoder;
 use image::imageops::FilterType;
-use image::{AnimationDecoder, DynamicImage, ImageDecoder, Limits};
+use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, Limits};
 use ratatui_image::FontSize;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManagedAttachmentFormat {
+    pub extension: &'static str,
+    pub media_type: &'static str,
+}
+
+const MANAGED_ATTACHMENT_FORMATS: [(ImageFormat, ManagedAttachmentFormat); 4] = [
+    (
+        ImageFormat::Png,
+        ManagedAttachmentFormat {
+            extension: "png",
+            media_type: "image/png",
+        },
+    ),
+    (
+        ImageFormat::Jpeg,
+        ManagedAttachmentFormat {
+            extension: "jpg",
+            media_type: "image/jpeg",
+        },
+    ),
+    (
+        ImageFormat::Gif,
+        ManagedAttachmentFormat {
+            extension: "gif",
+            media_type: "image/gif",
+        },
+    ),
+    (
+        ImageFormat::WebP,
+        ManagedAttachmentFormat {
+            extension: "webp",
+            media_type: "image/webp",
+        },
+    ),
+];
+
+pub(crate) fn managed_attachment_format(format: ImageFormat) -> Option<ManagedAttachmentFormat> {
+    MANAGED_ATTACHMENT_FORMATS
+        .iter()
+        .find_map(|(candidate, metadata)| (*candidate == format).then_some(*metadata))
+}
+
+pub(crate) fn managed_attachment_format_for_media_type(
+    media_type: &str,
+) -> Option<ManagedAttachmentFormat> {
+    MANAGED_ATTACHMENT_FORMATS
+        .iter()
+        .find_map(|(_, metadata)| (metadata.media_type == media_type).then_some(*metadata))
+}
+
+pub(crate) fn is_managed_attachment_extension(extension: &str) -> bool {
+    MANAGED_ATTACHMENT_FORMATS
+        .iter()
+        .any(|(_, metadata)| metadata.extension == extension)
+}
 
 /// Max long edge for stills in description / preview.
 const MAX_STILL_EDGE: u32 = 1920;
@@ -507,6 +564,7 @@ pub struct ImageStore {
     pending: HashMap<PathBuf, Receiver<Result<Arc<DynamicImage>, String>>>,
     /// FIFO work waiting for one of the bounded decode slots.
     queued: VecDeque<PathBuf>,
+    queued_paths: HashSet<PathBuf>,
     /// Encoded GIF frames for the open preview (one encode per frame index).
     gif_protocols: Vec<Option<StatefulProtocol>>,
 }
@@ -523,6 +581,7 @@ impl Default for ImageStore {
             lru: VecDeque::new(),
             pending: HashMap::new(),
             queued: VecDeque::new(),
+            queued_paths: HashSet::new(),
             gif_protocols: Vec::new(),
         }
     }
@@ -549,6 +608,7 @@ impl ImageStore {
             self.lru.clear();
             self.pending.clear();
             self.queued.clear();
+            self.queued_paths.clear();
             self.release(true);
         }
     }
@@ -611,39 +671,28 @@ impl ImageStore {
                 .cache_bytes
                 .saturating_sub(cached.image.as_bytes().len());
         }
-        match result {
+        let cached = match result {
             Ok(image) => {
                 let bytes = image.as_bytes().len();
                 if bytes > self.cache_budget {
-                    self.cache.insert(
-                        path.clone(),
-                        Err(format!(
-                            "decoded image is {bytes} bytes; cache limit is {} bytes",
-                            self.cache_budget
-                        )),
-                    );
-                    self.touch_lru(&path);
-                    self.evict_if_needed();
-                    return;
-                }
-                self.cache_bytes = self.cache_bytes.saturating_add(bytes);
-                self.cache.insert(
-                    path.clone(),
+                    Err(format!(
+                        "decoded image is {bytes} bytes; cache limit is {} bytes",
+                        self.cache_budget
+                    ))
+                } else {
+                    self.cache_bytes = self.cache_bytes.saturating_add(bytes);
                     Ok(CachedImage {
                         image,
                         protocol: None,
                         preview_protocol: None,
-                    }),
-                );
-                self.touch_lru(&path);
-                self.evict_if_needed();
+                    })
+                }
             }
-            Err(err) => {
-                self.cache.insert(path.clone(), Err(err));
-                self.touch_lru(&path);
-                self.evict_if_needed();
-            }
-        }
+            Err(error) => Err(error),
+        };
+        self.cache.insert(path.clone(), cached);
+        self.touch_lru(&path);
+        self.evict_if_needed();
     }
 
     /// Start decoding `paths` on worker threads. Safe to call repeatedly;
@@ -651,13 +700,12 @@ impl ImageStore {
     /// immediately while this runs.
     pub fn prefetch(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         for path in paths {
-            if self.cache.contains_key(&path)
-                || self.pending.contains_key(&path)
-                || self.queued.contains(&path)
-            {
+            if self.cache.contains_key(&path) || self.pending.contains_key(&path) {
                 continue;
             }
-            self.queued.push_back(path);
+            if self.queued_paths.insert(path.clone()) {
+                self.queued.push_back(path);
+            }
         }
         self.start_queued();
     }
@@ -667,6 +715,7 @@ impl ImageStore {
             let Some(path) = self.queued.pop_front() else {
                 break;
             };
+            self.queued_paths.remove(&path);
             let (tx, rx) = mpsc::channel();
             let path_bg = path.clone();
             match std::thread::Builder::new()
@@ -770,14 +819,15 @@ impl ImageStore {
 
     fn protocol_for(&mut self, path: &Path, preview: bool) -> ImageReady<'_> {
         // `poll_pending` is the event loop's job once per tick.
-        if !self.cache.contains_key(path) {
-            if !self.pending.contains_key(path) {
-                self.prefetch(std::iter::once(path.to_path_buf()));
+        match self.cache.get(path) {
+            None => {
+                if !self.pending.contains_key(path) {
+                    self.prefetch(std::iter::once(path.to_path_buf()));
+                }
+                return ImageReady::Loading;
             }
-            return ImageReady::Loading;
-        }
-        if let Some(Err(error)) = self.cache.get(path) {
-            return ImageReady::Failed(error.clone());
+            Some(Err(error)) => return ImageReady::Failed(error.clone()),
+            Some(Ok(_)) => {}
         }
         self.touch_lru(path);
 
@@ -813,14 +863,14 @@ impl ImageStore {
         if self.gif_protocols.len() != n {
             self.gif_protocols = (0..n).map(|_| None).collect();
         }
-        if self.gif_protocols[idx].is_none() {
-            let picker = self.picker.as_mut().ok_or("no image support")?;
-            let image = gif.frame_arc(idx);
-            self.gif_protocols[idx] = Some(picker.new_resize_protocol((*image).clone()));
+        match &mut self.gif_protocols[idx] {
+            Some(protocol) => Ok(protocol),
+            slot @ None => {
+                let picker = self.picker.as_mut().ok_or("no image support")?;
+                let image = gif.frame_arc(idx);
+                Ok(slot.insert(picker.new_resize_protocol((*image).clone())))
+            }
         }
-        self.gif_protocols[idx]
-            .as_mut()
-            .ok_or_else(|| "no preview".into())
     }
 
     pub fn clear_preview(&mut self) {

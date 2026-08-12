@@ -27,8 +27,7 @@ pub enum EditKind {
 pub struct History<T> {
     undo: VecDeque<T>,
     redo: VecDeque<T>,
-    last_kind: Option<EditKind>,
-    last_at: Option<Instant>,
+    last_edit: Option<(EditKind, Instant)>,
 }
 
 impl<T> Default for History<T> {
@@ -36,8 +35,7 @@ impl<T> Default for History<T> {
         Self {
             undo: VecDeque::new(),
             redo: VecDeque::new(),
-            last_kind: None,
-            last_at: None,
+            last_edit: None,
         }
     }
 }
@@ -50,14 +48,17 @@ impl<T> History<T> {
     /// True when the next typing edit should extend the current undo step.
     pub fn will_coalesce(&self, kind: EditKind) -> bool {
         kind == EditKind::Typing
-            && self.last_kind == Some(EditKind::Typing)
-            && self.last_at.is_some_and(|t| t.elapsed() < COALESCE_WINDOW)
+            && self.last_edit.is_some_and(|(last_kind, at)| {
+                last_kind == EditKind::Typing && at.elapsed() < COALESCE_WINDOW
+            })
             && !self.undo.is_empty()
     }
 
     /// Refresh the coalesce timer without pushing a snapshot.
     pub fn touch_coalesce(&mut self) {
-        self.last_at = Some(Instant::now());
+        if let Some((_, at)) = &mut self.last_edit {
+            *at = Instant::now();
+        }
     }
 
     /// Push a pre-edit snapshot. Do not call when [`Self::will_coalesce`] is true.
@@ -67,8 +68,7 @@ impl<T> History<T> {
             self.undo.pop_front();
         }
         self.redo.clear();
-        self.last_kind = Some(kind);
-        self.last_at = Some(Instant::now());
+        self.last_edit = Some((kind, Instant::now()));
     }
 
     /// Call before mutating. Builds `current` only when a new step is needed.
@@ -82,8 +82,7 @@ impl<T> History<T> {
 
     /// End the current typing run (e.g. after navigation or focus change).
     pub fn break_coalesce(&mut self) {
-        self.last_kind = None;
-        self.last_at = None;
+        self.last_edit = None;
     }
 
     /// Pop undo; push `current` onto redo. Returns the state to restore.

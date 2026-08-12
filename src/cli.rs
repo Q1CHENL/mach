@@ -4,11 +4,12 @@
 //! mutations execute one fresh read-modify-write transaction. JSON mode emits
 //! exactly one document on stdout, including usage and runtime errors.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use chrono::{NaiveTime, Utc};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
@@ -448,11 +449,15 @@ impl Rendered {
     }
 }
 
-fn rendered(json_mode: bool, value: Value, plain: String) -> Rendered {
+fn rendered(
+    json_mode: bool,
+    json: impl FnOnce() -> Value,
+    plain: impl FnOnce() -> String,
+) -> Rendered {
     if json_mode {
-        Rendered::Json(value)
+        Rendered::Json(json())
     } else {
-        Rendered::Plain(plain)
+        Rendered::Plain(plain())
     }
 }
 
@@ -645,7 +650,7 @@ fn dispatch(store: &mut Store, command: Command, json_mode: bool) -> Result<Rend
         Command::Move { id, before, after } => {
             cmd_move(store, &id, before.as_deref(), after.as_deref(), json_mode)
         }
-        Command::Purge { done, category } => cmd_purge(store, done, category.as_deref(), json_mode),
+        Command::Purge { done: _, category } => cmd_purge(store, category.as_deref(), json_mode),
         Command::Edit(arguments) => cmd_edit(store, &arguments, json_mode),
         Command::Subtasks { task, action } => match action {
             None | Some(SubAction::List) => cmd_subtasks_list(store, &task, json_mode),
@@ -697,20 +702,29 @@ fn cmd_export(
     json_mode: bool,
 ) -> Result<Rendered, CliError> {
     let summary = crate::archive::export(store, path)?;
-    let value = json!({
-        "ok": true,
-        "archive": summary.path.display().to_string(),
-        "tasks": summary.tasks,
-        "categories": summary.categories,
-        "images": summary.images,
-    });
-    let contents =
-        crate::archive::content_count_text(summary.tasks, summary.categories, summary.images);
-    let plain = format!(
-        "exported {contents} to {}\n",
-        terminal_text(&summary.path.display().to_string())
-    );
-    Ok(rendered(json_mode, value, plain))
+    Ok(rendered(
+        json_mode,
+        || {
+            json!({
+                "ok": true,
+                "archive": summary.path.display().to_string(),
+                "tasks": summary.tasks,
+                "categories": summary.categories,
+                "images": summary.images,
+            })
+        },
+        || {
+            let contents = crate::archive::content_count_text(
+                summary.tasks,
+                summary.categories,
+                summary.images,
+            );
+            format!(
+                "exported {contents} to {}\n",
+                terminal_text(&summary.path.display().to_string())
+            )
+        },
+    ))
 }
 
 fn cmd_import(
@@ -718,34 +732,39 @@ fn cmd_import(
     path: &std::path::Path,
     json_mode: bool,
 ) -> Result<Rendered, CliError> {
-    let outcome = crate::archive::import(store, path)?;
-    let summary = outcome.summary;
-    let value = json!({
-        "ok": true,
-        "archive": summary.path.display().to_string(),
-        "tasks_added": summary.tasks_added,
-        "tasks_unchanged": summary.tasks_unchanged,
-        "categories_added": summary.categories_added,
-        "categories_unchanged": summary.categories_unchanged,
-        "images_added": summary.images_added,
-        "images_unchanged": summary.images_unchanged,
-    });
-    let added = crate::archive::content_count_text(
-        summary.tasks_added,
-        summary.categories_added,
-        summary.images_added,
-    );
-    let unchanged = crate::archive::content_count_text(
-        summary.tasks_unchanged,
-        summary.categories_unchanged,
-        summary.images_unchanged,
-    );
-    let plain = if summary.tasks_added + summary.categories_added + summary.images_added == 0 {
-        format!("nothing imported; {unchanged} already present\n")
-    } else {
-        format!("imported {added}; {unchanged} already present\n")
-    };
-    Ok(rendered(json_mode, value, plain))
+    let summary = crate::archive::import(store, path)?;
+    Ok(rendered(
+        json_mode,
+        || {
+            json!({
+                "ok": true,
+                "archive": summary.path.display().to_string(),
+                "tasks_added": summary.tasks_added,
+                "tasks_unchanged": summary.tasks_unchanged,
+                "categories_added": summary.categories_added,
+                "categories_unchanged": summary.categories_unchanged,
+                "images_added": summary.images_added,
+                "images_unchanged": summary.images_unchanged,
+            })
+        },
+        || {
+            let added = crate::archive::content_count_text(
+                summary.tasks_added,
+                summary.categories_added,
+                summary.images_added,
+            );
+            let unchanged = crate::archive::content_count_text(
+                summary.tasks_unchanged,
+                summary.categories_unchanged,
+                summary.images_unchanged,
+            );
+            if summary.changed() {
+                format!("imported {added}; {unchanged} already present\n")
+            } else {
+                format!("nothing imported; {unchanged} already present\n")
+            }
+        },
+    ))
 }
 
 fn cmd_update(do_install: bool, json_mode: bool) -> Result<Rendered, CliError> {
@@ -755,7 +774,7 @@ fn cmd_update(do_install: bool, json_mode: bool) -> Result<Rendered, CliError> {
         .as_mut()
         .and_then(|store| store.claim_manual(now).ok());
     let checked = match crate::update::check_with_etag(None) {
-        Ok(crate::update::CheckResponse::Modified { info, etag }) => (info, etag),
+        Ok(crate::update::CheckResponse::Modified { value: info, etag }) => (info, etag),
         Ok(crate::update::CheckResponse::NotModified) => {
             if let (Some(store), Some(lease)) = (update_state.as_mut(), lease.as_ref()) {
                 let _ = store.finish_failure(lease, Utc::now().timestamp(), None);
@@ -786,46 +805,53 @@ fn cmd_update(do_install: bool, json_mode: bool) -> Result<Rendered, CliError> {
         crate::update::InstallDisposition::AlreadyCurrent => "already_current",
     });
 
-    let value = json!({
-        "ok": true,
-        "current": info.current,
-        "latest": info.latest,
-        "newer": info.newer,
-        "prerelease": info.prerelease,
-        "url": info.release_url,
-        "installed": install_disposition == Some("installed"),
-        "install_disposition": install_disposition,
-        "destination": install
-            .as_ref()
-            .map(|result| result.destination.display().to_string()),
-        "tag": install.as_ref().map(|result| result.tag.as_str()).unwrap_or(&info.tag),
-    });
-    let mut plain = format!("{}\n", terminal_text(&info.summary()));
-    if info.newer && install.is_none() {
-        plain.push('\n');
-        for line in info.install_hint().lines() {
-            plain.push_str(&terminal_text(line));
-            plain.push('\n');
-        }
-    }
-    if do_install && install.is_none() {
-        plain.push_str("Already up to date.\n");
-    } else if let Some(result) = install {
-        let message = match result.disposition {
-            crate::update::InstallDisposition::Installed => format!(
-                "Installed {} to {}. Restart mach to use the new build.\n",
-                terminal_text(&result.tag),
-                terminal_text(&result.destination.display().to_string())
-            ),
-            crate::update::InstallDisposition::AlreadyCurrent => format!(
-                "Already installed {} at {}. Restart mach to use the new build.\n",
-                terminal_text(&result.tag),
-                terminal_text(&result.destination.display().to_string())
-            ),
-        };
-        plain.push_str(&message);
-    }
-    Ok(rendered(json_mode, value, plain))
+    Ok(rendered(
+        json_mode,
+        || {
+            json!({
+                "ok": true,
+                "current": info.current,
+                "latest": info.latest,
+                "newer": info.newer,
+                "prerelease": info.prerelease,
+                "url": info.release_url,
+                "installed": install_disposition == Some("installed"),
+                "install_disposition": install_disposition,
+                "destination": install
+                    .as_ref()
+                    .map(|result| result.destination.display().to_string()),
+                "tag": install.as_ref().map(|result| result.tag.as_str()).unwrap_or(&info.tag),
+            })
+        },
+        || {
+            let mut plain = format!("{}\n", terminal_text(&info.summary()));
+            if info.newer && install.is_none() {
+                plain.push('\n');
+                for line in info.install_hint().lines() {
+                    plain.push_str(&terminal_text(line));
+                    plain.push('\n');
+                }
+            }
+            if do_install && install.is_none() {
+                plain.push_str("Already up to date.\n");
+            } else if let Some(result) = &install {
+                let message = match result.disposition {
+                    crate::update::InstallDisposition::Installed => format!(
+                        "Installed {} to {}. Restart mach to use the new build.\n",
+                        terminal_text(&result.tag),
+                        terminal_text(&result.destination.display().to_string())
+                    ),
+                    crate::update::InstallDisposition::AlreadyCurrent => format!(
+                        "Already installed {} at {}. Restart mach to use the new build.\n",
+                        terminal_text(&result.tag),
+                        terminal_text(&result.destination.display().to_string())
+                    ),
+                };
+                plain.push_str(&message);
+            }
+            plain
+        },
+    ))
 }
 
 // ---------------------------------------------------------------- helpers
@@ -985,6 +1011,10 @@ fn category_name<'a>(categories: &'a [Category], task: &Task) -> Option<&'a str>
 }
 
 fn task_json(categories: &[Category], task: &Task) -> Value {
+    task_json_with_category(task, category_name(categories, task))
+}
+
+fn task_json_with_category(task: &Task, category_name: Option<&str>) -> Value {
     let subtasks = collect_subtasks(&task.description);
     let subtasks_json = subtasks_to_json(&subtasks);
     json!({
@@ -999,7 +1029,7 @@ fn task_json(categories: &[Category], task: &Task) -> Value {
         "importance": task.importance,
         "category": {
             "id": task.category_id,
-            "name": category_name(categories, task),
+            "name": category_name,
         },
         "created": task.created,
     })
@@ -1015,7 +1045,7 @@ fn category_json(category: &Category) -> Value {
 
 fn validate_time(raw: &str) -> Result<String, CliError> {
     let value = raw.trim();
-    if value.len() == 5 && NaiveTime::parse_from_str(value, "%H:%M").is_ok() {
+    if crate::due::parse_time(value).is_some() {
         Ok(value.to_string())
     } else {
         Err(CliError::validation(format!(
@@ -1105,8 +1135,8 @@ fn due_for_edit(
 }
 
 fn task_line(
-    categories: &[Category],
     task: &Task,
+    category_name: Option<&str>,
     show_category: bool,
     date_format: &str,
 ) -> String {
@@ -1124,10 +1154,7 @@ fn task_line(
         String::new()
     };
     let category = if show_category {
-        format!(
-            "  [{}]",
-            terminal_text(category_name(categories, task).unwrap_or("—"))
-        )
+        format!("  [{}]", terminal_text(category_name.unwrap_or("—")))
     } else {
         String::new()
     };
@@ -1172,92 +1199,113 @@ fn cmd_list(
             }
         })
         .collect();
-    let value = Value::Array(
-        tasks
-            .iter()
-            .map(|task| task_json(&data.categories, task))
-            .collect(),
-    );
-    let mut plain = String::new();
-    if tasks.is_empty() {
-        plain.push_str("(no tasks)\n");
-    } else {
-        for task in &tasks {
-            plain.push_str(&task_line(
-                &data.categories,
-                task,
-                show_category,
-                &data.settings.date_format,
-            ));
-        }
-        let done = tasks.iter().filter(|task| task.done).count();
-        plain.push_str(&format!("— {} task(s), {done} done\n", tasks.len()));
-    }
-    Ok(rendered(json_mode, value, plain))
+    let category_names: HashMap<_, _> = data
+        .categories
+        .iter()
+        .map(|category| (category.id.as_str(), category.name.as_str()))
+        .collect();
+    let name_for = |task: &Task| {
+        task.category_id
+            .as_deref()
+            .and_then(|id| category_names.get(id).copied())
+    };
+    Ok(rendered(
+        json_mode,
+        || {
+            Value::Array(
+                tasks
+                    .iter()
+                    .map(|task| task_json_with_category(task, name_for(task)))
+                    .collect(),
+            )
+        },
+        || {
+            let mut plain = String::new();
+            if tasks.is_empty() {
+                plain.push_str("(no tasks)\n");
+            } else {
+                for task in &tasks {
+                    plain.push_str(&task_line(
+                        task,
+                        name_for(task),
+                        show_category,
+                        &data.settings.date_format,
+                    ));
+                }
+                let done = tasks.iter().filter(|task| task.done).count();
+                plain.push_str(&format!("— {} task(s), {done} done\n", tasks.len()));
+            }
+            plain
+        },
+    ))
 }
 
 fn cmd_categories_list(store: &Store, json_mode: bool) -> Result<Rendered, CliError> {
     let data = store.snapshot()?;
-    let stats: Vec<_> = data
+    let category_indices: HashMap<_, _> = data
         .categories
         .iter()
-        .map(|category| {
-            let (done, total) = data
-                .tasks
-                .iter()
-                .filter(|task| task.category_id.as_deref() == Some(category.id.as_str()))
-                .fold((0, 0), |(done, total), task| {
-                    (done + usize::from(task.done), total + 1)
-                });
-            (category, done, total)
-        })
+        .enumerate()
+        .map(|(index, category)| (category.id.as_str(), index))
         .collect();
-    let categories: Vec<_> = stats
-        .iter()
-        .map(|(category, done, total)| {
-            json!({
-                "id": category.id,
-                "name": category.name,
-                "description": category.description,
-                "total": total,
-                "done": done,
-            })
-        })
-        .collect();
-    let (uncategorized_done, uncategorized_total) = data
-        .tasks
-        .iter()
-        .filter(|task| task.category_id.is_none())
-        .fold((0, 0), |(done, total), task| {
-            (done + usize::from(task.done), total + 1)
-        });
-    let value = json!({
-        "categories": categories,
-        "uncategorized": {
-            "total": uncategorized_total,
-            "done": uncategorized_done,
-        },
-    });
-    let mut plain = String::new();
-    if data.categories.is_empty() {
-        plain.push_str("(no categories)\n");
-    } else {
-        for (category, done, total) in &stats {
-            plain.push_str(&format!(
-                "{}  {}/{}\n",
-                terminal_text(&category.name),
-                done,
-                total
-            ));
+    let mut counts = vec![(0usize, 0usize); data.categories.len()];
+    let mut uncategorized = (0usize, 0usize);
+    for task in &data.tasks {
+        let count = match task.category_id.as_deref() {
+            Some(id) => category_indices.get(id).map(|index| &mut counts[*index]),
+            None => Some(&mut uncategorized),
+        };
+        if let Some((done, total)) = count {
+            *done += usize::from(task.done);
+            *total += 1;
         }
     }
-    if uncategorized_total > 0 {
-        plain.push_str(&format!(
-            "— uncategorized  {}/{}\n",
-            uncategorized_done, uncategorized_total
-        ));
-    }
-    Ok(rendered(json_mode, value, plain))
+    Ok(rendered(
+        json_mode,
+        || {
+            let categories: Vec<_> = data
+                .categories
+                .iter()
+                .zip(&counts)
+                .map(|(category, (done, total))| {
+                    json!({
+                        "id": category.id,
+                        "name": category.name,
+                        "description": category.description,
+                        "total": total,
+                        "done": done,
+                    })
+                })
+                .collect();
+            json!({
+                "categories": categories,
+                "uncategorized": {
+                    "total": uncategorized.1,
+                    "done": uncategorized.0,
+                },
+            })
+        },
+        || {
+            let mut plain = String::new();
+            if data.categories.is_empty() {
+                plain.push_str("(no categories)\n");
+            } else {
+                for (category, (done, total)) in data.categories.iter().zip(&counts) {
+                    plain.push_str(&format!(
+                        "{}  {done}/{total}\n",
+                        terminal_text(&category.name),
+                    ));
+                }
+            }
+            if uncategorized.1 > 0 {
+                plain.push_str(&format!(
+                    "— uncategorized  {}/{}\n",
+                    uncategorized.0, uncategorized.1
+                ));
+            }
+            plain
+        },
+    ))
 }
 
 fn cmd_category_add(
@@ -1271,8 +1319,8 @@ fn cmd_category_add(
     let category = store.update(|data| data.create_category(name, description))?;
     Ok(rendered(
         json_mode,
-        category_json(&category),
-        format!("created category {}\n", terminal_text(&category.name)),
+        || category_json(&category),
+        || format!("created category {}\n", terminal_text(&category.name)),
     ))
 }
 
@@ -1302,15 +1350,14 @@ fn cmd_category_edit(
             description.map(str::to_string)
         },
     };
-    let query = query.to_string();
     let category = store.update(|data| {
-        let id = data.resolve_category_id(&query)?;
+        let id = data.resolve_category_id(query)?;
         data.edit_category(&id, patch)
     })?;
     Ok(rendered(
         json_mode,
-        category_json(&category),
-        format!("updated category {}\n", terminal_text(&category.name)),
+        || category_json(&category),
+        || format!("updated category {}\n", terminal_text(&category.name)),
     ))
 }
 
@@ -1319,18 +1366,19 @@ fn cmd_category_delete(
     query: &str,
     json_mode: bool,
 ) -> Result<Rendered, CliError> {
-    let query = query.to_string();
     let category = store.update(|data| {
-        let id = data.resolve_category_id(&query)?;
+        let id = data.resolve_category_id(query)?;
         data.delete_category(&id)
     })?;
     Ok(rendered(
         json_mode,
-        json!({ "deleted": category.name, "id": category.id }),
-        format!(
-            "deleted category {} (tasks uncategorized)\n",
-            terminal_text(&category.name)
-        ),
+        || json!({ "deleted": category.name, "id": category.id }),
+        || {
+            format!(
+                "deleted category {} (tasks uncategorized)\n",
+                terminal_text(&category.name)
+            )
+        },
     ))
 }
 
@@ -1364,11 +1412,10 @@ fn cmd_add(store: &mut Store, arguments: &AddArgs, json_mode: bool) -> Result<Re
     } else {
         due_for_add(arguments.due.as_deref(), arguments.time.as_deref())?
     };
-    let category_query = arguments.category.clone();
+    let category_query = arguments.category.as_deref();
     let importance = arguments.importance;
-    let (task_id, snapshot) = store.update_with_snapshot(|data| {
+    let (task_id, snapshot) = store.update_with_snapshot(move |data| {
         let category_id = category_query
-            .as_deref()
             .map(|query| data.resolve_category_id(query))
             .transpose()?;
         let task = data.create_task(title, description, due, importance, category_id)?;
@@ -1376,74 +1423,81 @@ fn cmd_add(store: &mut Store, arguments: &AddArgs, json_mode: bool) -> Result<Re
     })?;
     let task = snapshot.task(&task_id)?.clone();
     let categories = snapshot.categories;
-    let subtasks = collect_subtasks(&task.description).len();
-    let plain = if subtasks == 0 {
-        format!(
-            "added {}  {}\n",
-            terminal_text(&short_id(&task.id)),
-            terminal_text(&task.title)
-        )
-    } else {
-        format!(
-            "added {}  {}  ({} subtask{})\n",
-            terminal_text(&short_id(&task.id)),
-            terminal_text(&task.title),
-            subtasks,
-            if subtasks == 1 { "" } else { "s" }
-        )
-    };
-    Ok(rendered(json_mode, task_json(&categories, &task), plain))
+    Ok(rendered(
+        json_mode,
+        || task_json(&categories, &task),
+        || {
+            let subtasks = collect_subtasks(&task.description).len();
+            if subtasks == 0 {
+                format!(
+                    "added {}  {}\n",
+                    terminal_text(&short_id(&task.id)),
+                    terminal_text(&task.title)
+                )
+            } else {
+                format!(
+                    "added {}  {}  ({} subtask{})\n",
+                    terminal_text(&short_id(&task.id)),
+                    terminal_text(&task.title),
+                    subtasks,
+                    if subtasks == 1 { "" } else { "s" }
+                )
+            }
+        },
+    ))
 }
 
 fn cmd_show(store: &Store, query: &str, json_mode: bool) -> Result<Rendered, CliError> {
     let data = store.snapshot()?;
     let id = data.resolve_task_id(query)?;
     let task = data.task(&id)?;
-    let mut plain = format!(
-        "id:         {}\ntitle:      {}\ndone:       {}\ncategory:   {}\ndue:        {}\nimportance: {} ({})\ncreated:    {}\n",
-        terminal_text(&task.id),
-        terminal_text(&task.title),
-        task.done,
-        terminal_text(category_name(&data.categories, task).unwrap_or("—")),
-        if task.due.is_empty() {
-            "—".into()
-        } else {
-            terminal_text(&task.due)
-        },
-        task.importance,
-        crate::model::importance_marks(task.importance),
-        terminal_text(&task.created),
-    );
-    let subtasks = collect_subtasks(&task.description);
-    if subtasks.is_empty() {
-        plain.push_str("subtasks:   —\n");
-    } else {
-        plain.push_str(&format!(
-            "subtasks:   {}/{}\n",
-            subtasks.iter().filter(|(_, _, done)| *done).count(),
-            subtasks.len()
-        ));
-        for (index, text, done) in &subtasks {
-            plain.push_str(&format!(
-                "  {index}. {} {}\n",
-                if *done { "[✓]" } else { "[ ]" },
-                terminal_text(text)
-            ));
-        }
-    }
-    let notes = description_note_lines(&task.description);
-    if notes.is_empty() {
-        plain.push_str("description:       —\n");
-    } else {
-        plain.push_str("description:\n");
-        for note in notes {
-            plain.push_str(&format!("  {}\n", terminal_text(&note)));
-        }
-    }
     Ok(rendered(
         json_mode,
-        task_json(&data.categories, task),
-        plain,
+        || task_json(&data.categories, task),
+        || {
+            let mut plain = format!(
+                "id:         {}\ntitle:      {}\ndone:       {}\ncategory:   {}\ndue:        {}\nimportance: {} ({})\ncreated:    {}\n",
+                terminal_text(&task.id),
+                terminal_text(&task.title),
+                task.done,
+                terminal_text(category_name(&data.categories, task).unwrap_or("—")),
+                if task.due.is_empty() {
+                    "—".into()
+                } else {
+                    terminal_text(&task.due)
+                },
+                task.importance,
+                crate::model::importance_marks(task.importance),
+                terminal_text(&task.created),
+            );
+            let subtasks = collect_subtasks(&task.description);
+            if subtasks.is_empty() {
+                plain.push_str("subtasks:   —\n");
+            } else {
+                plain.push_str(&format!(
+                    "subtasks:   {}/{}\n",
+                    subtasks.iter().filter(|(_, _, done)| *done).count(),
+                    subtasks.len()
+                ));
+                for (index, text, done) in &subtasks {
+                    plain.push_str(&format!(
+                        "  {index}. {} {}\n",
+                        if *done { "[✓]" } else { "[ ]" },
+                        terminal_text(text)
+                    ));
+                }
+            }
+            let notes = description_note_lines(&task.description);
+            if notes.is_empty() {
+                plain.push_str("description:       —\n");
+            } else {
+                plain.push_str("description:\n");
+                for note in notes {
+                    plain.push_str(&format!("  {}\n", terminal_text(&note)));
+                }
+            }
+            plain
+        },
     ))
 }
 
@@ -1486,39 +1540,41 @@ fn cmd_set_done(
     done: bool,
     json_mode: bool,
 ) -> Result<Rendered, CliError> {
-    let query = query.to_string();
     let (task, snapshot) = store.update_with_snapshot(|data| {
-        let id = data.resolve_task_id(&query)?;
+        let id = data.resolve_task_id(query)?;
         data.set_task_done(&id, done)
     })?;
     let categories = snapshot.categories;
     Ok(rendered(
         json_mode,
-        task_json(&categories, &task),
-        format!(
-            "{} {}  {}\n",
-            if done { "done" } else { "undone" },
-            terminal_text(&short_id(&task.id)),
-            terminal_text(&task.title)
-        ),
+        || task_json(&categories, &task),
+        || {
+            format!(
+                "{} {}  {}\n",
+                if done { "done" } else { "undone" },
+                terminal_text(&short_id(&task.id)),
+                terminal_text(&task.title)
+            )
+        },
     ))
 }
 
 fn cmd_delete(store: &mut Store, query: &str, json_mode: bool) -> Result<Rendered, CliError> {
-    let query = query.to_string();
     let (task, snapshot) = store.update_with_snapshot(|data| {
-        let id = data.resolve_task_id(&query)?;
+        let id = data.resolve_task_id(query)?;
         data.delete_task(&id)
     })?;
     let categories = snapshot.categories;
     Ok(rendered(
         json_mode,
-        task_json(&categories, &task),
-        format!(
-            "deleted {}  {}\n",
-            terminal_text(&short_id(&task.id)),
-            terminal_text(&task.title)
-        ),
+        || task_json(&categories, &task),
+        || {
+            format!(
+                "deleted {}  {}\n",
+                terminal_text(&short_id(&task.id)),
+                terminal_text(&task.title)
+            )
+        },
     ))
 }
 
@@ -1538,58 +1594,59 @@ fn cmd_move(
             ));
         }
     };
-    let query = query.to_string();
-    let target_query = target_query.to_string();
     let ((task, target), snapshot) = store.update_with_snapshot(|data| {
-        let id = data.resolve_task_id(&query)?;
-        let target_id = data.resolve_task_id(&target_query)?;
+        let id = data.resolve_task_id(query)?;
+        let target_id = data.resolve_task_id(target_query)?;
         let target = data.task(&target_id)?.clone();
         let task = data.move_task_relative(&id, &target_id, position)?;
         Ok((task, target))
     })?;
     let categories = snapshot.categories;
-    let value = json!({
-        "moved": task_json(&categories, &task),
-        "relation": relation,
-        "target": { "id": target.id, "title": target.title },
-    });
-    let plain = format!(
-        "moved {} {relation} {}\n",
-        terminal_text(&short_id(&task.id)),
-        terminal_text(&short_id(&target.id))
-    );
-    Ok(rendered(json_mode, value, plain))
+    Ok(rendered(
+        json_mode,
+        || {
+            json!({
+                "moved": task_json(&categories, &task),
+                "relation": relation,
+                "target": { "id": target.id, "title": target.title },
+            })
+        },
+        || {
+            format!(
+                "moved {} {relation} {}\n",
+                terminal_text(&short_id(&task.id)),
+                terminal_text(&short_id(&target.id))
+            )
+        },
+    ))
 }
 
 fn cmd_purge(
     store: &mut Store,
-    confirmed_done: bool,
     category: Option<&str>,
     json_mode: bool,
 ) -> Result<Rendered, CliError> {
-    if !confirmed_done {
-        return Err(CliError::validation(
-            "refusing to purge without the explicit --done flag",
-        ));
-    }
-    let category = category.map(str::to_string);
     let (removed, snapshot) = store.update_with_snapshot(|data| {
-        let scope = match category.as_deref() {
+        let scope = match category {
             Some(query) => PurgeScope::Category(data.resolve_category_id(query)?),
             None => PurgeScope::All,
         };
         data.purge_completed(&scope)
     })?;
     let categories = snapshot.categories;
-    let value = json!({
-        "purged": removed
-            .iter()
-            .map(|task| task_json(&categories, task))
-            .collect::<Vec<_>>(),
-        "count": removed.len(),
-    });
-    let plain = format!("purged {} completed task(s)\n", removed.len());
-    Ok(rendered(json_mode, value, plain))
+    Ok(rendered(
+        json_mode,
+        || {
+            json!({
+                "purged": removed
+                    .iter()
+                    .map(|task| task_json(&categories, task))
+                    .collect::<Vec<_>>(),
+                "count": removed.len(),
+            })
+        },
+        || format!("purged {} completed task(s)\n", removed.len()),
+    ))
 }
 
 fn cmd_edit(
@@ -1620,7 +1677,7 @@ fn cmd_edit(
             "--clear-category cannot be combined with --category",
         ));
     }
-    let query = arguments.id.clone();
+    let query = arguments.id.as_str();
     let (title, inline_due) = match arguments.title.as_deref() {
         Some(title) => {
             let (title, inline_due) = split_inline_title(title)?;
@@ -1629,31 +1686,26 @@ fn cmd_edit(
         None => (None, String::new()),
     };
     let description = arguments.description.as_deref().map(description_from_text);
-    let due_argument = arguments.due.clone();
-    let time_argument = arguments.time.clone();
+    let due_argument = arguments.due.as_deref();
+    let time_argument = arguments.time.as_deref();
     let clear_due = arguments.clear_due;
-    let category_query = arguments.category.clone();
+    let category_query = arguments.category.as_deref();
     let clear_category = arguments.clear_cat;
     let importance = arguments.importance;
     let (task_id, snapshot) = store.update_with_snapshot(|data| {
-        let id = data.resolve_task_id(&query)?;
+        let id = data.resolve_task_id(query)?;
         let due = if clear_due {
             Some(String::new())
         } else if due_argument.is_none() && time_argument.is_none() && !inline_due.is_empty() {
             Some(inline_due)
         } else {
-            due_for_edit(
-                &data.task(&id)?.due,
-                due_argument.as_deref(),
-                time_argument.as_deref(),
-            )
-            .map_err(|error| StoreError::validation(error.message))?
+            due_for_edit(&data.task(&id)?.due, due_argument, time_argument)
+                .map_err(|error| StoreError::validation(error.message))?
         };
         let category_id = if clear_category {
             Some(None)
         } else {
             category_query
-                .as_deref()
                 .map(|query| data.resolve_category_id(query).map(Some))
                 .transpose()?
         };
@@ -1674,12 +1726,14 @@ fn cmd_edit(
     let categories = snapshot.categories;
     Ok(rendered(
         json_mode,
-        task_json(&categories, &task),
-        format!(
-            "updated {}  {}\n",
-            terminal_text(&short_id(&task.id)),
-            terminal_text(&task.title)
-        ),
+        || task_json(&categories, &task),
+        || {
+            format!(
+                "updated {}  {}\n",
+                terminal_text(&short_id(&task.id)),
+                terminal_text(&task.title)
+            )
+        },
     ))
 }
 
@@ -1690,33 +1744,37 @@ fn cmd_subtasks_list(store: &Store, query: &str, json_mode: bool) -> Result<Rend
     let id = data.resolve_task_id(query)?;
     let task = data.task(&id)?;
     let subtasks = collect_subtasks(&task.description);
-    let value = json!({
-        "task_id": task.id,
-        "title": task.title,
-        "subtasks": subtasks_json(&task.description),
-        "done": subtasks.iter().filter(|(_, _, done)| *done).count(),
-        "total": subtasks.len(),
-    });
-    let mut plain = format!(
-        "{}  {}",
-        terminal_text(&short_id(&task.id)),
-        terminal_text(&task.title)
-    );
-    if subtasks.is_empty() {
-        plain.push_str("  (no subtasks)\n");
-    } else {
-        plain.push('\n');
-        for (index, text, done) in &subtasks {
-            let check = if *done { "[✓]" } else { "[ ]" };
-            plain.push_str(&format!("  {index}. {check} {}\n", terminal_text(text)));
-        }
-        plain.push_str(&format!(
-            "— {}/{} done\n",
-            subtasks.iter().filter(|(_, _, done)| *done).count(),
-            subtasks.len()
-        ));
-    }
-    Ok(rendered(json_mode, value, plain))
+    let done_count = subtasks.iter().filter(|(_, _, done)| *done).count();
+    Ok(rendered(
+        json_mode,
+        || {
+            json!({
+                "task_id": task.id,
+                "title": task.title,
+                "subtasks": subtasks_to_json(&subtasks),
+                "done": done_count,
+                "total": subtasks.len(),
+            })
+        },
+        || {
+            let mut plain = format!(
+                "{}  {}",
+                terminal_text(&short_id(&task.id)),
+                terminal_text(&task.title)
+            );
+            if subtasks.is_empty() {
+                plain.push_str("  (no subtasks)\n");
+            } else {
+                plain.push('\n');
+                for (index, text, done) in &subtasks {
+                    let check = if *done { "[✓]" } else { "[ ]" };
+                    plain.push_str(&format!("  {index}. {check} {}\n", terminal_text(text)));
+                }
+                plain.push_str(&format!("— {done_count}/{} done\n", subtasks.len()));
+            }
+            plain
+        },
+    ))
 }
 
 fn cmd_subtask_add(
@@ -1732,9 +1790,8 @@ fn cmd_subtask_add(
             "subtask text required (positional or --text)",
         ));
     }
-    let query = query.to_string();
     let (task, index) = store.update(|data| {
-        let id = data.resolve_task_id(&query)?;
+        let id = data.resolve_task_id(query)?;
         let mut description = data.task(&id)?.description.clone();
         description.push(Block::todo(&text, done));
         let task = data.edit_task(
@@ -1744,23 +1801,80 @@ fn cmd_subtask_add(
                 ..TaskPatch::default()
             },
         )?;
-        Ok((task, collect_subtasks(&data.task(&id)?.description).len()))
+        let index = collect_subtasks(&task.description).len();
+        Ok((task, index))
     })?;
     Ok(rendered(
         json_mode,
-        json!({
-            "task_id": task.id,
-            "index": index,
-            "text": text,
-            "done": done,
-            "subtasks": subtasks_json(&task.description),
-        }),
-        format!(
-            "added subtask {index} on {}  {}\n",
-            terminal_text(&short_id(&task.id)),
-            terminal_text(&text)
-        ),
+        || {
+            json!({
+                "task_id": task.id,
+                "index": index,
+                "text": text,
+                "done": done,
+                "subtasks": subtasks_json(&task.description),
+            })
+        },
+        || {
+            format!(
+                "added subtask {index} on {}  {}\n",
+                terminal_text(&short_id(&task.id)),
+                terminal_text(&text)
+            )
+        },
     ))
+}
+
+enum SubtaskMutation<'a> {
+    SetDone(Option<bool>),
+    Edit(&'a str),
+    Delete,
+}
+
+fn mutate_subtask(
+    store: &mut Store,
+    query: &str,
+    index: usize,
+    mutation: SubtaskMutation<'_>,
+) -> Result<(Task, String, bool), CliError> {
+    store
+        .update(|data| {
+            let id = data.resolve_task_id(query)?;
+            let mut description = data.task(&id)?.description.clone();
+            let description_index = subtask_description_index(&description, index)
+                .map_err(|error| StoreError::validation(error.message))?;
+            let (text, done) = match mutation {
+                SubtaskMutation::SetDone(requested) => {
+                    let Block::Todo { text, done } = &mut description[description_index] else {
+                        unreachable!("subtask index resolved to a non-subtask block")
+                    };
+                    *done = requested.unwrap_or(!*done);
+                    (text.clone(), *done)
+                }
+                SubtaskMutation::Edit(replacement) => {
+                    let Block::Todo { text, done } = &mut description[description_index] else {
+                        unreachable!("subtask index resolved to a non-subtask block")
+                    };
+                    *text = replacement.to_string();
+                    (text.clone(), *done)
+                }
+                SubtaskMutation::Delete => {
+                    let Block::Todo { text, done } = description.remove(description_index) else {
+                        unreachable!("subtask index resolved to a non-subtask block")
+                    };
+                    (text, done)
+                }
+            };
+            let task = data.edit_task(
+                &id,
+                TaskPatch {
+                    description: Some(description),
+                    ..TaskPatch::default()
+                },
+            )?;
+            Ok((task, text, done))
+        })
+        .map_err(Into::into)
 }
 
 fn cmd_subtask_set_done(
@@ -1770,44 +1884,27 @@ fn cmd_subtask_set_done(
     done: Option<bool>,
     json_mode: bool,
 ) -> Result<Rendered, CliError> {
-    let query = query.to_string();
-    let (task, text, new_done) = store.update(|data| {
-        let id = data.resolve_task_id(&query)?;
-        let mut description = data.task(&id)?.description.clone();
-        let description_index = subtask_description_index(&description, index)
-            .map_err(|error| StoreError::validation(error.message))?;
-        let Block::Todo { text, done: value } = &mut description[description_index] else {
-            return Err(StoreError::Corrupt(
-                "resolved subtask index does not point to a subtask".into(),
-            ));
-        };
-        let new_done = done.unwrap_or(!*value);
-        *value = new_done;
-        let text = text.clone();
-        let task = data.edit_task(
-            &id,
-            TaskPatch {
-                description: Some(description),
-                ..TaskPatch::default()
-            },
-        )?;
-        Ok((task, text, new_done))
-    })?;
+    let (task, text, new_done) =
+        mutate_subtask(store, query, index, SubtaskMutation::SetDone(done))?;
     Ok(rendered(
         json_mode,
-        json!({
-            "task_id": task.id,
-            "index": index,
-            "text": text,
-            "done": new_done,
-            "subtasks": subtasks_json(&task.description),
-        }),
-        format!(
-            "{} subtask {index} on {}  {}\n",
-            if new_done { "done" } else { "undone" },
-            terminal_text(&short_id(&task.id)),
-            terminal_text(&text)
-        ),
+        || {
+            json!({
+                "task_id": task.id,
+                "index": index,
+                "text": text,
+                "done": new_done,
+                "subtasks": subtasks_json(&task.description),
+            })
+        },
+        || {
+            format!(
+                "{} subtask {index} on {}  {}\n",
+                if new_done { "done" } else { "undone" },
+                terminal_text(&short_id(&task.id)),
+                terminal_text(&text)
+            )
+        },
     ))
 }
 
@@ -1824,46 +1921,25 @@ fn cmd_subtask_edit(
             "subtask text required (positional or --text)",
         ));
     }
-    let query = query.to_string();
-    let (task, done) = store.update(|data| {
-        let id = data.resolve_task_id(&query)?;
-        let mut description = data.task(&id)?.description.clone();
-        let description_index = subtask_description_index(&description, index)
-            .map_err(|error| StoreError::validation(error.message))?;
-        let Block::Todo {
-            text: current,
-            done,
-        } = &mut description[description_index]
-        else {
-            return Err(StoreError::Corrupt(
-                "resolved subtask index does not point to a subtask".into(),
-            ));
-        };
-        *current = text.clone();
-        let done = *done;
-        let task = data.edit_task(
-            &id,
-            TaskPatch {
-                description: Some(description),
-                ..TaskPatch::default()
-            },
-        )?;
-        Ok((task, done))
-    })?;
+    let (task, _, done) = mutate_subtask(store, query, index, SubtaskMutation::Edit(&text))?;
     Ok(rendered(
         json_mode,
-        json!({
-            "task_id": task.id,
-            "index": index,
-            "text": text,
-            "done": done,
-            "subtasks": subtasks_json(&task.description),
-        }),
-        format!(
-            "updated subtask {index} on {}  {}\n",
-            terminal_text(&short_id(&task.id)),
-            terminal_text(&text)
-        ),
+        || {
+            json!({
+                "task_id": task.id,
+                "index": index,
+                "text": text,
+                "done": done,
+                "subtasks": subtasks_json(&task.description),
+            })
+        },
+        || {
+            format!(
+                "updated subtask {index} on {}  {}\n",
+                terminal_text(&short_id(&task.id)),
+                terminal_text(&text)
+            )
+        },
     ))
 }
 
@@ -1873,37 +1949,22 @@ fn cmd_subtask_delete(
     index: usize,
     json_mode: bool,
 ) -> Result<Rendered, CliError> {
-    let query = query.to_string();
-    let (task, text, done) = store.update(|data| {
-        let id = data.resolve_task_id(&query)?;
-        let mut description = data.task(&id)?.description.clone();
-        let description_index = subtask_description_index(&description, index)
-            .map_err(|error| StoreError::validation(error.message))?;
-        let Block::Todo { text, done } = description.remove(description_index) else {
-            return Err(StoreError::Corrupt(
-                "resolved subtask index does not point to a subtask".into(),
-            ));
-        };
-        let task = data.edit_task(
-            &id,
-            TaskPatch {
-                description: Some(description),
-                ..TaskPatch::default()
-            },
-        )?;
-        Ok((task, text, done))
-    })?;
+    let (task, text, done) = mutate_subtask(store, query, index, SubtaskMutation::Delete)?;
     Ok(rendered(
         json_mode,
-        json!({
-            "task_id": task.id,
-            "deleted": { "index": index, "text": text, "done": done },
-            "subtasks": subtasks_json(&task.description),
-        }),
-        format!(
-            "deleted subtask {index} on {}  {}\n",
-            terminal_text(&short_id(&task.id)),
-            terminal_text(&text)
-        ),
+        || {
+            json!({
+                "task_id": task.id,
+                "deleted": { "index": index, "text": text, "done": done },
+                "subtasks": subtasks_json(&task.description),
+            })
+        },
+        || {
+            format!(
+                "deleted subtask {index} on {}  {}\n",
+                terminal_text(&short_id(&task.id)),
+                terminal_text(&text)
+            )
+        },
     ))
 }

@@ -1,5 +1,6 @@
 //! Application state and every operation the UI can trigger.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -15,7 +16,7 @@ use crate::form::{CategoryForm, TaskDraft, TaskForm};
 use crate::image::ImageStore;
 use crate::model::{
     ALL_CATEGORY, Category, MAX_CATEGORY_COUNT, MAX_CATEGORY_NAME_LEN, MAX_TASK_COUNT,
-    MAX_TITLE_LEN, Task, caseless_key,
+    MAX_TITLE_LEN, Task, caseless_key, category_name_key,
 };
 use crate::settings::{LaunchState, Settings};
 use crate::store::{
@@ -184,6 +185,20 @@ impl ArchiveJobKind {
 enum ArchiveOutcome {
     Export(crate::archive::ExportSummary),
     Import(crate::archive::ImportSummary),
+}
+
+enum ArchiveRequest {
+    Export,
+    Import(PathBuf),
+}
+
+impl ArchiveRequest {
+    const fn kind(&self) -> ArchiveJobKind {
+        match self {
+            Self::Export => ArchiveJobKind::Export,
+            Self::Import(_) => ArchiveJobKind::Import,
+        }
+    }
 }
 
 enum ArchiveEvent {
@@ -546,19 +561,20 @@ impl App {
     }
 
     pub(crate) fn start_export_archive(&mut self) {
-        self.start_archive_worker(ArchiveJobKind::Export, None);
+        self.start_archive_worker(ArchiveRequest::Export);
     }
 
     pub(crate) fn start_import_archive(&mut self, path: PathBuf) {
-        self.start_archive_worker(ArchiveJobKind::Import, Some(path));
+        self.start_archive_worker(ArchiveRequest::Import(path));
     }
 
-    fn start_archive_worker(&mut self, kind: ArchiveJobKind, import_path: Option<PathBuf>) {
+    fn start_archive_worker(&mut self, request: ArchiveRequest) {
         if let Some(active) = self.archive_job.as_ref() {
             self.info(format!("An {} is already running", active.kind.name()));
             return;
         }
 
+        let kind = request.kind();
         let data_dir = self.store.data_dir().to_path_buf();
         let control = Arc::new(crate::archive::ArchiveControl::new());
         let worker_control = Arc::clone(&control);
@@ -572,8 +588,8 @@ impl App {
             .spawn(move || {
                 let result = (|| -> Result<ArchiveOutcome, crate::archive::ArchiveError> {
                     let mut store = Store::open(data_dir)?;
-                    match kind {
-                        ArchiveJobKind::Export => crate::archive::export_with_progress(
+                    match request {
+                        ArchiveRequest::Export => crate::archive::export_with_progress(
                             &store,
                             None,
                             &worker_control,
@@ -582,18 +598,15 @@ impl App {
                             },
                         )
                         .map(ArchiveOutcome::Export),
-                        ArchiveJobKind::Import => {
-                            let path = import_path.expect("import worker requires a path");
-                            crate::archive::import_with_progress(
-                                &mut store,
-                                &path,
-                                &worker_control,
-                                |progress| {
-                                    let _ = tx.send(ArchiveEvent::Progress(progress));
-                                },
-                            )
-                            .map(|outcome| ArchiveOutcome::Import(outcome.summary))
-                        }
+                        ArchiveRequest::Import(path) => crate::archive::import_with_progress(
+                            &mut store,
+                            &path,
+                            &worker_control,
+                            |progress| {
+                                let _ = tx.send(ArchiveEvent::Progress(progress));
+                            },
+                        )
+                        .map(ArchiveOutcome::Import),
                     }
                 })();
                 let _ = tx.send(ArchiveEvent::Finished(result));
@@ -621,7 +634,7 @@ impl App {
         loop {
             let event = self.archive_job.as_ref().map(|job| job.rx.try_recv());
             match event {
-                None => return changed,
+                None | Some(Err(TryRecvError::Empty)) => return changed,
                 Some(Ok(ArchiveEvent::Progress(progress))) => {
                     if let Some(job) = self.archive_job.as_mut()
                         && job.progress != progress
@@ -643,7 +656,6 @@ impl App {
                     }
                     return changed;
                 }
-                Some(Err(TryRecvError::Empty)) => return changed,
                 Some(Err(TryRecvError::Disconnected)) => {
                     let job = self
                         .archive_job
@@ -692,12 +704,11 @@ impl App {
                     summary.categories_unchanged,
                     summary.images_unchanged,
                 );
-                let message =
-                    if summary.tasks_added + summary.categories_added + summary.images_added == 0 {
-                        format!("Nothing imported; {unchanged} already present")
-                    } else {
-                        format!("Imported {added}; {unchanged} already present")
-                    };
+                let message = if !summary.changed() {
+                    format!("Nothing imported; {unchanged} already present")
+                } else {
+                    format!("Imported {added}; {unchanged} already present")
+                };
                 self.archive_result(message);
             }
             Err(crate::archive::ArchiveError::Cancelled) => {
@@ -881,7 +892,7 @@ impl App {
                                 .map(UpdateOutcome::Automatic)
                         }
                         UpdateJobKind::Install => {
-                            let CheckResponse::Modified { info, etag } =
+                            let CheckResponse::Modified { value: info, etag } =
                                 crate::update::check_with_etag(None)?
                             else {
                                 return Err(CheckFailure {
@@ -935,7 +946,7 @@ impl App {
                 .as_ref()
                 .map(|job| (job.kind, job.rx.try_recv()));
             match event {
-                None => return changed,
+                None | Some((_, Err(TryRecvError::Empty))) => return changed,
                 Some((_, Ok(UpdateEvent::DownloadProgress(progress)))) => {
                     let activity = UpdateActivity::Downloading(progress);
                     if self.update_activity != Some(activity) {
@@ -948,7 +959,6 @@ impl App {
                     changed |= self.update_activity.take().is_some();
                     return self.finish_update(kind, lease.as_ref(), *result) || changed;
                 }
-                Some((_, Err(TryRecvError::Empty))) => return changed,
                 Some((kind, Err(TryRecvError::Disconnected))) => {
                     let lease = self.update_job.take().and_then(|job| job.lease);
                     changed |= self.update_activity.take().is_some();
@@ -972,7 +982,7 @@ impl App {
     ) -> bool {
         let now = Utc::now().timestamp();
         match result {
-            Ok(UpdateOutcome::Automatic(CheckResponse::Modified { info, etag })) => {
+            Ok(UpdateOutcome::Automatic(CheckResponse::Modified { value: info, etag })) => {
                 let (committed, changed) =
                     self.finish_update_state_modified(lease, now, etag.as_deref(), &info.latest);
                 if !committed {
@@ -1126,21 +1136,19 @@ impl App {
 
     /// Rebuild [`Self::preview_form`] if the selection or `data_gen` changed.
     pub fn ensure_preview(&mut self) {
-        let Some((id, generation)) = self.selected_task().map(|t| (t.id.clone(), self.data_gen))
-        else {
+        let Some(task) = self.selected_task() else {
             self.invalidate_preview();
             return;
         };
+        let id = task.id.clone();
+        let generation = self.data_gen;
         if self.preview_task_id.as_deref() == Some(id.as_str())
             && self.preview_gen == generation
             && self.preview_form.is_some()
         {
             return;
         }
-        let Some(task) = self.selected_task().cloned() else {
-            self.invalidate_preview();
-            return;
-        };
+        let task = task.clone();
         let mut form =
             TaskForm::edit_with_images(&task, self.images.root().to_path_buf(), &self.attachments);
         form.set_categories(&self.categories, task.category_id.as_deref());
@@ -1232,13 +1240,22 @@ impl App {
         if !multi {
             return (0..self.view.len()).map(TaskListRow::Task).collect();
         }
+        let category_names: HashMap<_, _> = self
+            .categories
+            .iter()
+            .map(|category| (category.id.as_str(), category.name.as_str()))
+            .collect();
         let mut rows = Vec::with_capacity(self.view.len() + self.categories.len());
         let mut prev: Option<Option<&str>> = None;
         for (vi, &ti) in self.view.iter().enumerate() {
             let key = self.tasks[ti].category_id.as_deref();
             if prev != Some(key) {
                 let title = match key {
-                    Some(id) => self.category_name(id).unwrap_or("Unknown").to_string(),
+                    Some(id) => category_names
+                        .get(id)
+                        .copied()
+                        .unwrap_or("Unknown")
+                        .to_string(),
                     None => "Uncategorized".to_string(),
                 };
                 rows.push(TaskListRow::Separator { title });
@@ -1266,7 +1283,6 @@ impl App {
 
     /// Sidebar order of real categories, each group sorted; uncategorized last.
     fn stack_by_category(&self, candidates: &[usize]) -> Vec<usize> {
-        use std::collections::HashMap;
         let mut buckets: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
         for &i in candidates {
             buckets
@@ -1293,10 +1309,13 @@ impl App {
         match self.settings.sort.as_str() {
             "important" => view.sort_by_key(|i| std::cmp::Reverse(self.tasks[*i].importance)),
             "done" => view.sort_by_key(|i| self.tasks[*i].done),
-            "due" => view.sort_by_cached_key(|i| {
-                let due = &self.tasks[*i].due;
-                (due.is_empty(), due::sort_key(due))
-            }),
+            "due" => {
+                let today = chrono::Local::now().date_naive();
+                view.sort_by_cached_key(|i| {
+                    let due = &self.tasks[*i].due;
+                    (due.is_empty(), due::sort_key_at(due, today))
+                });
+            }
             _ => {} // manual — keep the store's explicit task order
         }
     }
@@ -1471,13 +1490,19 @@ impl App {
         let mut all_done = 0usize;
         let mut all_total = 0usize;
         let mut per: Vec<(usize, usize)> = self.categories.iter().map(|_| (0, 0)).collect();
+        let category_indices: HashMap<_, _> = self
+            .categories
+            .iter()
+            .enumerate()
+            .map(|(index, category)| (category.id.as_str(), index))
+            .collect();
         for t in &self.tasks {
             all_total += 1;
             if t.done {
                 all_done += 1;
             }
             if let Some(cid) = t.category_id.as_deref()
-                && let Some(idx) = self.categories.iter().position(|c| c.id == cid)
+                && let Some(&idx) = category_indices.get(cid)
             {
                 per[idx].1 += 1;
                 if t.done {
@@ -1517,8 +1542,7 @@ impl App {
         if let Some(&i) = self.view.get(pos) {
             let id = self.tasks[i].id.clone();
             match self.update_store(|data| {
-                let importance =
-                    (data.task(&id)?.importance + 1) % (crate::model::MAX_IMPORTANCE + 1);
+                let importance = crate::model::next_importance(data.task(&id)?.importance);
                 data.set_task_importance(&id, importance)
             }) {
                 Ok(_) => self.select_task_by_id(&id),
@@ -1629,21 +1653,16 @@ impl App {
     /// Creates a task in the chosen category and selects it. A `[date]`
     /// left in the title is moved into `due` when `due` is empty.
     pub fn create_task(&mut self, draft: &TaskDraft) -> Option<String> {
-        let (inline_due, title) = due::parse(draft.title.trim());
+        let (title, due) = draft.resolved_title_and_due();
         if title.is_empty() || self.tasks.len() >= MAX_TASK_COUNT {
             return None;
         }
-        let due = if draft.due.is_empty() {
-            &inline_due
-        } else {
-            &draft.due
-        };
         let description = draft.description.clone();
         let category_id = draft.category_id.clone();
         let importance = draft.importance;
-        let task = match self.update_store(|data| {
-            data.create_task(title, description, due.to_string(), importance, category_id)
-        }) {
+        let task = match self
+            .update_store(|data| data.create_task(title, description, due, importance, category_id))
+        {
             Ok(task) => task,
             Err(error) => {
                 let message = error.to_string();
@@ -1663,18 +1682,12 @@ impl App {
     }
 
     pub fn update_task(&mut self, id: &str, draft: &TaskDraft) -> bool {
-        let (inline_due, title) = due::parse(draft.title.trim());
+        let (title, due) = draft.resolved_title_and_due();
         if title.is_empty() {
             return false;
         }
-        let due = if draft.due.is_empty() {
-            &inline_due
-        } else {
-            &draft.due
-        };
         let expected = self.task_edit_base.clone();
         let id = id.to_string();
-        let due = due.to_string();
         let patch = match expected.as_ref() {
             Some(base) => TaskPatch {
                 title: (title != base.title).then_some(title),
@@ -1830,7 +1843,7 @@ impl App {
         let Some((name, description)) = form.submit_with(|name, editing| {
             let duplicate = existing.iter().any(|(id, existing_name)| {
                 Some(id.as_str()) != editing
-                    && caseless_key(existing_name.trim()) == caseless_key(name.trim())
+                    && category_name_key(existing_name) == category_name_key(name)
             });
             if duplicate {
                 Err("A category with that name already exists".to_string())
@@ -1973,6 +1986,10 @@ impl App {
         (0, 0)
     }
 
+    pub(crate) fn category_progress_at(&self, index: usize) -> (usize, usize) {
+        self.cat_progress.get(index).copied().unwrap_or((0, 0))
+    }
+
     // -------------------------------------------------------------- slash / search
 
     /// Open the `/` command palette.
@@ -1980,14 +1997,11 @@ impl App {
         if self.searching {
             self.end_search();
         }
-        if let Some(version) = self
-            .update_notice
-            .as_ref()
-            .and_then(|notice| notice.available_version.clone())
+        if let Some(notice) = self.update_notice.take()
+            && let Some(version) = notice.available_version
         {
             self.dismissed_update_version = Some(version);
         }
-        self.update_notice = None;
         self.mode = Mode::Slash;
         self.input = TextInput::new("", MAX_SLASH_INPUT_LEN);
         self.slash_index = 0;
@@ -2293,7 +2307,7 @@ mod tests {
 
     fn automatic_outcome(newer: bool) -> UpdateOutcome {
         UpdateOutcome::Automatic(CheckResponse::Modified {
-            info: update_result(newer),
+            value: update_result(newer),
             etag: None,
         })
     }

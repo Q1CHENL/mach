@@ -268,6 +268,16 @@ impl TaskDraft {
             ..Self::default()
         }
     }
+
+    pub(crate) fn resolved_title_and_due(&self) -> (String, String) {
+        let (inline_due, title) = due::parse(self.title.trim());
+        let due = if self.due.is_empty() {
+            inline_due
+        } else {
+            self.due.clone()
+        };
+        (title, due)
+    }
 }
 
 /// Editable content of the task dialog (for undo). UI chrome is excluded.
@@ -518,15 +528,14 @@ impl TaskForm {
                 self.gif = None;
                 self.gif_pending = Some(GifLoad::start(path));
             }
-            None
         } else {
             // Different still — drop any previous GIF cache.
             if !matches!(&self.gif, Some((p, _)) if p == &path) {
                 self.gif = None;
             }
             self.gif_pending = None;
-            None
         }
+        None
     }
 
     pub fn close_image_preview(&mut self) {
@@ -550,14 +559,15 @@ impl TaskForm {
             let path = self
                 .gif_pending
                 .take()
-                .map(|pending| pending.path().to_path_buf());
-            match (path, result) {
-                (Some(path), Ok(gif)) => self.gif = Some((path, gif)),
-                (_, Err(error)) => {
+                .expect("a polled GIF load is still pending")
+                .path()
+                .to_path_buf();
+            match result {
+                Ok(gif) => self.gif = Some((path, gif)),
+                Err(error) => {
                     self.gif = None;
                     self.error = Some(error);
                 }
-                (None, Ok(_)) => {}
             }
             return true;
         }
@@ -693,17 +703,16 @@ impl TaskForm {
 
     /// Writes the picked day back into the field.
     pub fn take_due_picker(&mut self) {
-        if self.picker.is_some() {
-            self.before_edit(EditKind::Atomic);
-            if let Some(picker) = self.picker.take() {
-                self.due = TextInput::new(&picker.value(), 32);
-            }
-        }
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        self.before_edit(EditKind::Atomic);
+        self.due = TextInput::new(&picker.value(), 32);
     }
 
     /// Steps importance up, wrapping back to none after three.
     pub fn cycle_importance(&mut self) {
-        let next = (self.importance + 1) % (crate::model::MAX_IMPORTANCE + 1);
+        let next = crate::model::next_importance(self.importance);
         self.set_importance(next);
     }
 

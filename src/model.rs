@@ -198,6 +198,15 @@ pub fn importance_marks(importance: u8) -> String {
     "⚑".repeat(importance.min(MAX_IMPORTANCE) as usize)
 }
 
+pub const fn next_importance(importance: u8) -> u8 {
+    (importance + 1) % (MAX_IMPORTANCE + 1)
+}
+
+/// Unicode-normalized, case-folded identity for category names.
+pub fn category_name_key(value: &str) -> String {
+    caseless_key(value.trim())
+}
+
 pub fn todo_progress(task: &Task) -> Option<(usize, usize)> {
     let mut done = 0usize;
     let mut total = 0usize;

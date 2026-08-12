@@ -29,15 +29,18 @@ fn patterns() -> &'static [Regex] {
 /// Split a description into `(due, remaining_text)`.
 pub fn parse(description: &str) -> (String, String) {
     for re in patterns() {
-        if let Some(m) = re.find(description) {
-            let due = re
-                .captures(description)
-                .and_then(|c| c.get(1))
-                .map(|g| g.as_str().to_string())
-                .unwrap_or_default();
+        if let Some(captures) = re.captures(description) {
+            let matched = captures
+                .get(0)
+                .expect("due-date pattern always has a full match");
+            let due = captures
+                .get(1)
+                .expect("due-date pattern always captures the value")
+                .as_str()
+                .to_string();
             let mut rest = String::with_capacity(description.len());
-            rest.push_str(&description[..m.start()]);
-            rest.push_str(&description[m.end()..]);
+            rest.push_str(&description[..matched.start()]);
+            rest.push_str(&description[matched.end()..]);
             return (due, rest.trim().to_string());
         }
     }
@@ -186,7 +189,7 @@ fn month_day_in_migration_year(month: u32, day: u32, now: NaiveDateTime) -> Opti
     NaiveDate::from_ymd_opt(now.year(), month, day)
 }
 
-fn parse_time(value: &str) -> Option<NaiveTime> {
+pub(crate) fn parse_time(value: &str) -> Option<NaiveTime> {
     if value.len() != 5 || value.as_bytes().get(2) != Some(&b':') {
         return None;
     }
@@ -283,7 +286,7 @@ pub fn display_compact(due: &str, date_format: &str) -> String {
     display_compact_at(due, date_format, Local::now().date_naive())
 }
 
-fn display_compact_at(due: &str, date_format: &str, today: NaiveDate) -> String {
+pub(crate) fn display_compact_at(due: &str, date_format: &str, today: NaiveDate) -> String {
     if due.is_empty() {
         return String::new();
     }
@@ -343,10 +346,13 @@ fn format_compact_date(
 /// without turning malformed text into a real date. `None` is "no due date"
 /// or an invalid value, both of which sort last.
 pub fn sort_key(due: &str) -> Option<(i32, u32, u32, u32, u32)> {
+    sort_key_at(due, Local::now().date_naive())
+}
+
+pub(crate) fn sort_key_at(due: &str, today: NaiveDate) -> Option<(i32, u32, u32, u32, u32)> {
     if due.is_empty() {
         return None;
     }
-    let today = Local::now().date_naive();
     let (date_part, time_part) = match due.split_once(' ') {
         Some((date, time)) => (date, Some(time)),
         None if due.contains(':') => ("", Some(due)),

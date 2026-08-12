@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{Local, NaiveDateTime};
-use image::ImageFormat;
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Deserialize;
@@ -27,14 +26,14 @@ use crate::due;
 use crate::model::{
     Block, Category, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN, MAX_CATEGORY_DESC_LINES,
     MAX_CATEGORY_NAME_LEN, MAX_DESCRIPTION_LINES, MAX_IMPORTANCE, MAX_NOTES_LINE_LEN,
-    MAX_TASK_COUNT, MAX_TITLE_LEN, SCHEMA_VERSION, Task, caseless_key, text_byte_limit,
+    MAX_TASK_COUNT, MAX_TITLE_LEN, SCHEMA_VERSION, Task, category_name_key, text_byte_limit,
 };
 use crate::settings::{DATE_FORMATS, PREVIEW_POSITIONS, SORTS, Settings, THEMES};
 
 const DATABASE_FILE: &str = "mach.db";
 const DATABASE_SCHEMA_VERSION: i64 = 2;
 const LEGACY_MIGRATION_KEY: &str = "legacy_json_migrated";
-const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const ID_MAX_BYTES: usize = 128;
 pub(crate) const DUE_MAX_BYTES: usize = 128;
 pub(crate) const CREATED_MAX_BYTES: usize = 64;
@@ -310,9 +309,13 @@ impl StoreData {
     }
 
     pub fn task(&self, id: &str) -> Result<&Task, StoreError> {
+        self.task_index(id).map(|index| &self.tasks[index])
+    }
+
+    fn task_index(&self, id: &str) -> Result<usize, StoreError> {
         self.tasks
             .iter()
-            .find(|task| task.id == id)
+            .position(|task| task.id == id)
             .ok_or_else(|| StoreError::NotFound {
                 entity: "task",
                 query: id.to_string(),
@@ -320,9 +323,13 @@ impl StoreData {
     }
 
     pub fn category(&self, id: &str) -> Result<&Category, StoreError> {
+        self.category_index(id).map(|index| &self.categories[index])
+    }
+
+    fn category_index(&self, id: &str) -> Result<usize, StoreError> {
         self.categories
             .iter()
-            .find(|category| category.id == id)
+            .position(|category| category.id == id)
             .ok_or_else(|| StoreError::NotFound {
                 entity: "category",
                 query: id.to_string(),
@@ -360,14 +367,7 @@ impl StoreData {
     }
 
     pub fn edit_task(&mut self, id: &str, patch: TaskPatch) -> Result<Task, StoreError> {
-        let index = self
-            .tasks
-            .iter()
-            .position(|task| task.id == id)
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "task",
-                query: id.to_string(),
-            })?;
+        let index = self.task_index(id)?;
         let before = self.tasks[index].clone();
         {
             let task = &mut self.tasks[index];
@@ -441,14 +441,7 @@ impl StoreData {
     }
 
     pub fn delete_task(&mut self, id: &str) -> Result<Task, StoreError> {
-        let index = self
-            .tasks
-            .iter()
-            .position(|task| task.id == id)
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "task",
-                query: id.to_string(),
-            })?;
+        let index = self.task_index(id)?;
         Ok(self.tasks.remove(index))
     }
 
@@ -492,14 +485,7 @@ impl StoreData {
     }
 
     pub fn move_task(&mut self, id: &str, target: usize) -> Result<(), StoreError> {
-        let index = self
-            .tasks
-            .iter()
-            .position(|task| task.id == id)
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "task",
-                query: id.to_string(),
-            })?;
+        let index = self.task_index(id)?;
         if target >= self.tasks.len() {
             return Err(StoreError::validation(format!(
                 "task target index {target} is out of range"
@@ -521,42 +507,20 @@ impl StoreData {
         target_id: &str,
         position: RelativePosition,
     ) -> Result<Task, StoreError> {
-        let id = id.to_string();
-        let target_id = target_id.to_string();
         if id == target_id {
             return Err(StoreError::validation(
                 "cannot move a task relative to itself",
             ));
         }
-        let index = self
-            .tasks
-            .iter()
-            .position(|task| task.id == id)
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "task",
-                query: id.clone(),
-            })?;
-        let target_index = self
-            .tasks
-            .iter()
-            .position(|task| task.id == target_id)
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "task",
-                query: target_id.clone(),
-            })?;
+        let index = self.task_index(id)?;
+        let target_index = self.task_index(target_id)?;
         if self.tasks[index].category_id != self.tasks[target_index].category_id {
             return Err(StoreError::validation(
                 "tasks can only be reordered within the same category",
             ));
         }
         let task = self.tasks.remove(index);
-        let target_after_removal = self
-            .tasks
-            .iter()
-            .position(|candidate| candidate.id == target_id)
-            .ok_or_else(|| {
-                StoreError::Corrupt(format!("task {target_id:?} disappeared during reorder"))
-            })?;
+        let target_after_removal = target_index - usize::from(index < target_index);
         let insertion = match position {
             RelativePosition::Before => target_after_removal,
             RelativePosition::After => target_after_removal + 1,
@@ -569,36 +533,32 @@ impl StoreData {
         if let PurgeScope::Category(id) = scope {
             self.category(id)?;
         }
-        let mut removed = Vec::new();
-        self.tasks.retain(|task| {
+        Ok(self.remove_tasks(|task| {
             let in_scope = match scope {
                 PurgeScope::All => true,
                 PurgeScope::Category(id) => task.category_id.as_deref() == Some(id),
                 PurgeScope::Uncategorized => task.category_id.is_none(),
             };
-            if task.done && in_scope {
-                removed.push(task.clone());
-                false
-            } else {
-                true
-            }
-        });
-        Ok(removed)
+            task.done && in_scope
+        }))
     }
 
     /// Purge only the completed tasks captured by a confirmation prompt.
     pub fn purge_completed_ids(&mut self, ids: &[String]) -> Result<Vec<Task>, StoreError> {
         let ids: HashSet<_> = ids.iter().map(String::as_str).collect();
+        Ok(self.remove_tasks(|task| task.done && ids.contains(task.id.as_str())))
+    }
+
+    fn remove_tasks(&mut self, mut should_remove: impl FnMut(&Task) -> bool) -> Vec<Task> {
         let mut removed = Vec::new();
         self.tasks.retain(|task| {
-            if task.done && ids.contains(task.id.as_str()) {
+            let remove = should_remove(task);
+            if remove {
                 removed.push(task.clone());
-                false
-            } else {
-                true
             }
+            !remove
         });
-        Ok(removed)
+        removed
     }
 
     pub fn create_category(
@@ -627,14 +587,7 @@ impl StoreData {
         id: &str,
         patch: CategoryPatch,
     ) -> Result<Category, StoreError> {
-        let index = self
-            .categories
-            .iter()
-            .position(|category| category.id == id)
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "category",
-                query: id.to_string(),
-            })?;
+        let index = self.category_index(id)?;
         let before = self.categories[index].clone();
         {
             let category = &mut self.categories[index];
@@ -682,14 +635,7 @@ impl StoreData {
 
     /// Delete a category while preserving its tasks as uncategorized.
     pub fn delete_category(&mut self, id: &str) -> Result<Category, StoreError> {
-        let index = self
-            .categories
-            .iter()
-            .position(|category| category.id == id)
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "category",
-                query: id.to_string(),
-            })?;
+        let index = self.category_index(id)?;
         let category = self.categories.remove(index);
         for task in &mut self.tasks {
             if task.category_id.as_deref() == Some(id) {
@@ -700,14 +646,7 @@ impl StoreData {
     }
 
     pub fn move_category(&mut self, id: &str, target: usize) -> Result<(), StoreError> {
-        let index = self
-            .categories
-            .iter()
-            .position(|category| category.id == id)
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "category",
-                query: id.to_string(),
-            })?;
+        let index = self.category_index(id)?;
         if target >= self.categories.len() {
             return Err(StoreError::validation(format!(
                 "category target index {target} is out of range"
@@ -729,32 +668,10 @@ impl StoreData {
                 "cannot move a category relative to itself",
             ));
         }
-        let index = self
-            .categories
-            .iter()
-            .position(|category| category.id == id)
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "category",
-                query: id.to_string(),
-            })?;
-        if !self
-            .categories
-            .iter()
-            .any(|category| category.id == target_id)
-        {
-            return Err(StoreError::NotFound {
-                entity: "category",
-                query: target_id.to_string(),
-            });
-        }
+        let index = self.category_index(id)?;
+        let target_index = self.category_index(target_id)?;
         let category = self.categories.remove(index);
-        let target_after_removal = self
-            .categories
-            .iter()
-            .position(|candidate| candidate.id == target_id)
-            .ok_or_else(|| {
-                StoreError::Corrupt(format!("category {target_id:?} disappeared during reorder"))
-            })?;
+        let target_after_removal = target_index - usize::from(index < target_index);
         let insertion = match position {
             RelativePosition::Before => target_after_removal,
             RelativePosition::After => target_after_removal + 1,
@@ -764,12 +681,7 @@ impl StoreData {
     }
 
     pub fn replace_settings(&mut self, settings: Settings) -> Result<Settings, StoreError> {
-        let before = std::mem::replace(&mut self.settings, settings);
-        if let Err(error) = validate_settings(&self.settings) {
-            self.settings = before;
-            return Err(error);
-        }
-        Ok(self.settings.clone())
+        self.update_settings(move |current| *current = settings)
     }
 
     pub fn update_settings(
@@ -846,11 +758,11 @@ impl Store {
         prepare_private_database_file(&paths.database)?;
         let mut connection = Connection::open(&paths.database)?;
         set_private_file(&paths.database)?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         configure_resource_limits(&connection)?;
         initialize_schema(&mut connection, &paths.database)?;
         configure_connection(&connection)?;
-        quick_check(&connection)?;
+        sqlite_quick_check(&connection, "")?;
         let mut store = Self {
             connection,
             paths,
@@ -868,11 +780,11 @@ impl Store {
     pub fn open_in_memory_with_paths(data_dir: impl AsRef<Path>) -> Result<Self, StoreError> {
         let paths = Paths::new(expand_user(data_dir.as_ref().to_path_buf())?);
         let mut connection = Connection::open_in_memory()?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         configure_resource_limits(&connection)?;
         initialize_schema(&mut connection, Path::new(":memory:"))?;
         configure_in_memory_connection(&connection)?;
-        quick_check(&connection)?;
+        sqlite_quick_check(&connection, "")?;
         connection.execute(
             "INSERT INTO metadata(key, value) VALUES (?1, '1')",
             [LEGACY_MIGRATION_KEY],
@@ -1166,10 +1078,7 @@ fn resolve_data_dir_from(
     configured: Option<PathBuf>,
     home: Option<PathBuf>,
 ) -> Result<PathBuf, StoreError> {
-    if let Some(dir) = explicit {
-        return expand_user_with_home(dir, home.as_deref());
-    }
-    if let Some(dir) = configured {
+    if let Some(dir) = explicit.or(configured) {
         return expand_user_with_home(dir, home.as_deref());
     }
     home.map(|home| home.join(".mach")).ok_or_else(|| {
@@ -1306,11 +1215,14 @@ fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), Sto
     Ok(())
 }
 
-fn quick_check(connection: &Connection) -> Result<(), StoreError> {
+pub(crate) fn sqlite_quick_check(
+    connection: &Connection,
+    error_prefix: &str,
+) -> Result<(), StoreError> {
     let result: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
     if result != "ok" {
         return Err(StoreError::Corrupt(format!(
-            "SQLite quick check failed: {result}"
+            "{error_prefix}SQLite quick check failed: {result}"
         )));
     }
     Ok(())
@@ -1711,26 +1623,47 @@ fn persist_diff(
         if let Some((_, previous)) = before_tasks.get(task.id.as_str()).copied()
             && previous != task
         {
-            let description_json = encode_task_description(task)?;
-            execute_one(
-                tx,
-                "UPDATE tasks SET
-                    title = ?1, description_json = ?2, due = ?3, created = ?4,
-                    done = ?5, importance = ?6, category_id = ?7
-                 WHERE id = ?8",
-                params![
-                    task.title,
-                    description_json,
-                    task.due,
-                    task.created,
-                    i64::from(task.done),
-                    i64::from(task.importance),
-                    task.category_id,
-                    task.id,
-                ],
-                "task",
-                &task.id,
-            )?;
+            if previous.description == task.description {
+                execute_one(
+                    tx,
+                    "UPDATE tasks SET
+                        title = ?1, due = ?2, created = ?3, done = ?4,
+                        importance = ?5, category_id = ?6
+                     WHERE id = ?7",
+                    params![
+                        task.title,
+                        task.due,
+                        task.created,
+                        i64::from(task.done),
+                        i64::from(task.importance),
+                        task.category_id,
+                        task.id,
+                    ],
+                    "task",
+                    &task.id,
+                )?;
+            } else {
+                let description_json = encode_task_description(task)?;
+                execute_one(
+                    tx,
+                    "UPDATE tasks SET
+                        title = ?1, description_json = ?2, due = ?3, created = ?4,
+                        done = ?5, importance = ?6, category_id = ?7
+                     WHERE id = ?8",
+                    params![
+                        task.title,
+                        description_json,
+                        task.due,
+                        task.created,
+                        i64::from(task.done),
+                        i64::from(task.importance),
+                        task.category_id,
+                        task.id,
+                    ],
+                    "task",
+                    &task.id,
+                )?;
+            }
         }
     }
     for task in &after.tasks {
@@ -1948,11 +1881,11 @@ fn import_task_description_attachments(
     staged_attachments: &[StagedAttachment],
     installed_attachments: &mut Vec<InstalledAttachmentFile>,
 ) -> Result<(), StoreError> {
-    let mut known: HashMap<String, Attachment> = data
+    let mut known: HashMap<String, usize> = data
         .attachments
         .iter()
-        .cloned()
-        .map(|attachment| (attachment.id.clone(), attachment))
+        .enumerate()
+        .map(|(index, attachment)| (attachment.id.clone(), index))
         .collect();
     let mut staged_by_id = HashMap::with_capacity(staged_attachments.len());
     for staged in staged_attachments {
@@ -1968,14 +1901,18 @@ fn import_task_description_attachments(
     }
 
     for task in &mut data.tasks {
-        let owner = format!("task {:?}", task.id);
+        let mut owner = None;
         for block in &mut task.description {
             let Block::Image { attachment_id } = block else {
                 continue;
             };
+            if known.contains_key(attachment_id) {
+                continue;
+            }
+            let owner = owner.get_or_insert_with(|| format!("task {:?}", task.id));
             *attachment_id = import_attachment_reference(
                 attachment_id,
-                &owner,
+                owner,
                 images_root,
                 &staged_by_id,
                 &mut known,
@@ -1994,13 +1931,10 @@ fn import_attachment_reference(
     owner: &str,
     images_root: Option<&Path>,
     staged_by_id: &HashMap<&str, &StagedAttachment>,
-    known: &mut HashMap<String, Attachment>,
+    known: &mut HashMap<String, usize>,
     attachments: &mut Vec<Attachment>,
     installed_attachments: &mut Vec<InstalledAttachmentFile>,
 ) -> Result<String, StoreError> {
-    if known.contains_key(reference) {
-        return Ok(reference.to_string());
-    }
     let Some(images_root) = images_root else {
         return Err(StoreError::Validation(
             "image attachments require a persistent store".into(),
@@ -2016,27 +1950,31 @@ fn import_attachment_reference(
     } else {
         (crate::image::expand_in(reference, images_root), None)
     };
-    let imported = import_attachment_from_path(&source_path, images_root)?;
-    if let Some(installed) = imported.installed.clone() {
+    let ImportedAttachmentFile {
+        metadata,
+        installed,
+    } = import_attachment_from_path(&source_path, images_root)?;
+    if let Some(installed) = installed {
         installed_attachments.push(installed);
     }
-    if expected.is_some_and(|expected| expected != &imported.metadata) {
+    if expected.is_some_and(|expected| expected != &metadata) {
         return Err(StoreError::Validation(format!(
             "staged attachment {reference:?} does not match its verified metadata"
         )));
     }
-    if let Some(existing) = known.get(&imported.metadata.id) {
-        if existing != &imported.metadata {
+    if let Some(&index) = known.get(&metadata.id) {
+        if attachments[index] != metadata {
             return Err(StoreError::Corrupt(format!(
                 "attachment {:?} metadata does not match imported content",
-                imported.metadata.id
+                metadata.id
             )));
         }
-    } else {
-        known.insert(imported.metadata.id.clone(), imported.metadata.clone());
-        attachments.push(imported.metadata.clone());
+        return Ok(metadata.id);
     }
-    Ok(imported.metadata.id)
+    let id = metadata.id.clone();
+    known.insert(id.clone(), attachments.len());
+    attachments.push(metadata);
+    Ok(id)
 }
 
 #[derive(Debug, Clone)]
@@ -2115,7 +2053,7 @@ fn import_attachment_from_path(
                 source_path.display()
             ))
         })?;
-        let (extension, media_type) = attachment_format(format).ok_or_else(|| {
+        let format = crate::image::managed_attachment_format(format).ok_or_else(|| {
             StoreError::Validation(format!(
                 "image attachment {} is not a supported PNG, JPEG, GIF, or WebP image",
                 source_path.display()
@@ -2127,7 +2065,7 @@ fn import_attachment_from_path(
         crate::image::load_dynamic(&temp_path).map_err(StoreError::Validation)?;
 
         let id = format!("{:x}", hasher.finalize());
-        let storage_name = format!("{id}.{extension}");
+        let storage_name = format!("{id}.{}", format.extension);
         let destination = images_root.join(&storage_name);
         if destination.exists() {
             let (stored_hash, stored_len) = hash_attachment_file(&destination)?;
@@ -2153,7 +2091,7 @@ fn import_attachment_from_path(
         Ok(Attachment {
             id: id.clone(),
             sha256: id,
-            media_type: media_type.into(),
+            media_type: format.media_type.into(),
             byte_len,
             storage_name,
         })
@@ -2215,16 +2153,6 @@ fn hash_attachment_file(path: &Path) -> Result<(String, u64), StoreError> {
     Ok((format!("{:x}", hasher.finalize()), byte_len))
 }
 
-fn attachment_format(format: ImageFormat) -> Option<(&'static str, &'static str)> {
-    match format {
-        ImageFormat::Png => Some(("png", "image/png")),
-        ImageFormat::Jpeg => Some(("jpg", "image/jpeg")),
-        ImageFormat::Gif => Some(("gif", "image/gif")),
-        ImageFormat::WebP => Some(("webp", "image/webp")),
-        _ => None,
-    }
-}
-
 pub(crate) fn is_attachment_id(value: &str) -> bool {
     value.len() == ATTACHMENT_ID_LEN
         && value
@@ -2236,7 +2164,7 @@ pub(crate) fn is_managed_attachment_name(value: &str) -> bool {
     let Some((id, extension)) = value.rsplit_once('.') else {
         return false;
     };
-    is_attachment_id(id) && matches!(extension, "png" | "jpg" | "gif" | "webp")
+    is_attachment_id(id) && crate::image::is_managed_attachment_extension(extension)
 }
 
 fn is_managed_attachment_temp_name(value: &str) -> bool {
@@ -2608,9 +2536,8 @@ fn normalize_and_validate(
         validate_single_line(&task.due, "task due")?;
         validate_byte_limit(&task.due, DUE_MAX_BYTES, "task due")?;
         let normalized_due = match due_mode {
-            DueMode::NewWrite => due::normalize_for_write_at(&task.due, now),
+            DueMode::NewWrite | DueMode::Stored => due::normalize_for_write_at(&task.due, now),
             DueMode::LegacyMigration => due::normalize_legacy_at(&task.due, now),
-            DueMode::Stored => due::normalize_for_write_at(&task.due, now),
         }
         .map_err(|error| StoreError::Validation(format!("task {:?} has {error}", task.id)))?;
         if matches!(due_mode, DueMode::Stored) && normalized_due != task.due {
@@ -2673,19 +2600,14 @@ fn validate_attachments(attachments: &[Attachment]) -> Result<HashSet<&str>, Sto
                 attachment.id, attachment.byte_len
             )));
         }
-        let extension = match attachment.media_type.as_str() {
-            "image/png" => "png",
-            "image/jpeg" => "jpg",
-            "image/gif" => "gif",
-            "image/webp" => "webp",
-            other => {
-                return Err(StoreError::Validation(format!(
-                    "attachment {:?} has unsupported media type {other:?}",
-                    attachment.id
-                )));
-            }
-        };
-        let expected_storage_name = format!("{}.{}", attachment.id, extension);
+        let format = crate::image::managed_attachment_format_for_media_type(&attachment.media_type)
+            .ok_or_else(|| {
+                StoreError::Validation(format!(
+                    "attachment {:?} has unsupported media type {:?}",
+                    attachment.id, attachment.media_type
+                ))
+            })?;
+        let expected_storage_name = format!("{}.{}", attachment.id, format.extension);
         if attachment.storage_name != expected_storage_name {
             return Err(StoreError::Validation(format!(
                 "attachment {:?} has invalid storage name {:?}",
@@ -2755,13 +2677,6 @@ fn validate_byte_limit(value: &str, max_bytes: usize, label: &str) -> Result<(),
         )));
     }
     Ok(())
-}
-
-/// Unicode compatibility normalization followed by full default case folding
-/// defines category identity. A final normalization makes the key stable when
-/// folding introduces decomposed characters.
-fn category_name_key(value: &str) -> String {
-    caseless_key(value.trim())
 }
 
 fn category_name_has_prefix(name: &str, folded_query: &str) -> bool {

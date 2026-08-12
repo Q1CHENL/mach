@@ -34,18 +34,21 @@ pub fn normalize_url(raw: &str) -> Option<String> {
     if url.chars().any(char::is_control) {
         return None;
     }
-    let lower = url.to_ascii_lowercase();
-    if lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("mailto:")
-        || lower.starts_with("file:")
-    {
+    if has_supported_scheme(url) {
         return Some(url.to_string());
     }
     if has_explicit_scheme(url) {
         return None;
     }
     Some(format!("https://{url}"))
+}
+
+pub(crate) fn has_supported_scheme(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("file:")
 }
 
 fn has_explicit_scheme(url: &str) -> bool {

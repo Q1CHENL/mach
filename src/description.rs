@@ -246,16 +246,8 @@ fn link_url_from_line(s: &str) -> String {
     s.to_string()
 }
 
-fn has_explicit_supported_link_scheme(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    value.starts_with("http://")
-        || value.starts_with("https://")
-        || value.starts_with("mailto:")
-        || value.starts_with("file:")
-}
-
 fn plain_link_value(url: &str) -> String {
-    if has_explicit_supported_link_scheme(url) {
+    if crate::open::has_supported_scheme(url) {
         url.to_string()
     } else {
         format!("[link]({url})")
@@ -265,8 +257,7 @@ fn plain_link_value(url: &str) -> String {
 /// Display width of `n. ` (e.g. `1. ` → 3, `10. ` → 4).
 fn number_indent(n: usize) -> usize {
     let n = n.max(1);
-    let digits = ((n as f64).log10().floor() as usize) + 1;
-    digits + 2
+    n.ilog10() as usize + 3
 }
 
 /// 1-based index within a run of consecutive numbered lines.
@@ -325,7 +316,7 @@ fn plain_line_to_block(line: &str) -> Block {
         return Block::number(rest);
     }
     let link = link_url_from_line(line);
-    if link != line || has_explicit_supported_link_scheme(&link) {
+    if link != line || crate::open::has_supported_scheme(&link) {
         return Block::link(&link);
     }
     Block::text(line)
@@ -808,15 +799,7 @@ impl DescriptionEditor {
             }
         }
         // End line: start through bc. Picture at the caret is included whole.
-        if self.is_image_line(bl) {
-            if let Line::Image { path } = &self.lines[bl] {
-                out.push(CopyLine::Image(resolve_image_reference(
-                    path,
-                    &self.image_root,
-                    &self.attachments,
-                )));
-            }
-        } else if let Some(line) = self.copy_line_slice(bl, None, Some(bc)) {
+        if let Some(line) = self.copy_line_slice(bl, None, Some(bc)) {
             out.push(line);
         }
         out
@@ -945,12 +928,7 @@ impl DescriptionEditor {
                 }
                 let len = self.line_max_len;
                 self.lines[al] = self.line_with_text(al, &merged, len);
-                // Remove lines al+1 ..= bl
-                for _ in al..bl {
-                    if al + 1 < self.lines.len() {
-                        self.lines.remove(al + 1);
-                    }
-                }
+                self.lines.drain(al + 1..=bl);
                 self.cursor = al;
                 if let Some(input) = self.lines[al].input() {
                     input.place_cursor(ac.min(input.len()));
@@ -1163,11 +1141,10 @@ impl DescriptionEditor {
         // being typed out, it is complete the moment it arrives.
         self.adopt_pasted_paths();
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
-            let next_is_text = matches!(self.lines.get(self.cursor + 1), Some(Line::Text(_)));
-            if !next_is_text && self.can_add_lines(1) {
-                self.lines.insert(self.cursor + 1, self.empty_line());
-            }
             if matches!(self.lines.get(self.cursor + 1), Some(Line::Text(_))) {
+                self.cursor += 1;
+            } else if self.can_add_lines(1) {
+                self.lines.insert(self.cursor + 1, self.empty_line());
                 self.cursor += 1;
             }
         }
@@ -1838,17 +1815,18 @@ impl DescriptionEditor {
 
     /// Full description in order for `/copyall` — text lines and pictures.
     pub fn lines_for_copy_all(&self) -> Vec<CopyLine> {
+        let numbers = number_runs(&self.lines);
         self.lines
             .iter()
-            .enumerate()
-            .filter_map(|(i, line)| match line {
+            .zip(numbers)
+            .filter_map(|(line, number)| match line {
                 Line::Text(text) => {
                     let s = text.value();
                     (!s.trim().is_empty()).then_some(CopyLine::Text(s))
                 }
                 Line::Bullet(text) => Some(CopyLine::Text(format!("- {}", text.value()))),
                 Line::Number(text) => {
-                    let n = number_at(&self.lines, i);
+                    let n = number.expect("numbered lines have a run index");
                     Some(CopyLine::Text(format!("{n}. {}", text.value())))
                 }
                 Line::Todo { text, done } => {
@@ -1870,25 +1848,17 @@ impl DescriptionEditor {
 
     /// Picture nearest the cursor: search upward first, then downward.
     pub fn image_for_copy(&self) -> Option<PathBuf> {
-        for i in (0..=self.cursor).rev() {
-            if let Line::Image { path } = &self.lines[i] {
-                return Some(resolve_image_reference(
+        (0..=self.cursor)
+            .rev()
+            .chain(self.cursor + 1..self.lines.len())
+            .find_map(|i| match &self.lines[i] {
+                Line::Image { path } => Some(resolve_image_reference(
                     path,
                     &self.image_root,
                     &self.attachments,
-                ));
-            }
-        }
-        for i in (self.cursor + 1)..self.lines.len() {
-            if let Line::Image { path } = &self.lines[i] {
-                return Some(resolve_image_reference(
-                    path,
-                    &self.image_root,
-                    &self.attachments,
-                ));
-            }
-        }
-        None
+                )),
+                _ => None,
+            })
     }
 
     /// Removes the typed `/command` and applies it. Returns work that needs
@@ -2006,13 +1976,11 @@ impl DescriptionEditor {
         };
         let value = text.value();
         let reference = crate::image::reference_path(&value);
-        if !crate::image::looks_like_image(&value)
-            && !reference.is_some_and(|reference| self.attachments.contains(reference))
-        {
+        let managed = reference.filter(|reference| self.attachments.contains(reference));
+        if !crate::image::looks_like_image(&value) && managed.is_none() {
             return;
         }
-        if let Some(reference) = reference.filter(|reference| self.attachments.contains(reference))
-        {
+        if let Some(reference) = managed {
             self.lines[i] = Line::Image {
                 path: reference.to_string(),
             };

@@ -19,7 +19,6 @@ fn score_folded(query: &[char], text: &str) -> Option<i32> {
     let mut qi = 0;
     let mut total = 0i32;
     let mut prev_match: Option<usize> = None;
-    let mut first = true;
     let mut prev_char: Option<char> = None;
     let mut t_len = 0usize;
 
@@ -40,10 +39,8 @@ fn score_folded(query: &[char], text: &str) -> Option<i32> {
                 } else {
                     points -= (ti - p - 1).min(5) as i32;
                 }
-            }
-            if first {
+            } else {
                 total += 4i32.saturating_sub((ti as i32).min(4));
-                first = false;
             }
             total += points;
             prev_match = Some(ti);

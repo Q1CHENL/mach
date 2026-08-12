@@ -6,20 +6,17 @@
 //! concurrent processes without treating an in-flight attempt as a success.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use rusqlite::{Connection, TransactionBehavior, params};
-use semver::Version;
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 use crate::store::{
-    StoreError, configure_connection, configure_resource_limits, ensure_private_directory,
-    prepare_private_database_file, set_private_file,
+    SQLITE_BUSY_TIMEOUT, StoreError, configure_connection, configure_resource_limits,
+    ensure_private_directory, prepare_private_database_file, set_private_file, sqlite_quick_check,
 };
 
 const DATABASE_FILE: &str = "update.db";
 const UPDATE_STATE_DIR_ENV: &str = "MACH_UPDATE_STATE_DIR";
 const DATABASE_SCHEMA_VERSION: i64 = 1;
-const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const SUCCESS_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 pub(crate) const FAILURE_RETRY_SECONDS: i64 = 60 * 60;
 pub(crate) const LEASE_SECONDS: i64 = 5 * 60;
@@ -89,21 +86,21 @@ impl UpdateStateStore {
         prepare_private_database_file(&path)?;
         let mut connection = Connection::open(&path)?;
         set_private_file(&path)?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         configure_resource_limits(&connection)?;
         initialize_schema(&mut connection, &path)?;
         configure_connection(&connection)?;
-        quick_check(&connection)?;
+        sqlite_quick_check(&connection, "update-state ")?;
         Ok(Self { connection })
     }
 
     pub(crate) fn open_in_memory() -> Result<Self, StoreError> {
         let mut connection = Connection::open_in_memory()?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         configure_resource_limits(&connection)?;
         initialize_schema(&mut connection, Path::new(":memory:"))?;
         connection.pragma_update(None, "journal_mode", "MEMORY")?;
-        quick_check(&connection)?;
+        sqlite_quick_check(&connection, "update-state ")?;
         Ok(Self { connection })
     }
 
@@ -121,18 +118,7 @@ impl UpdateStateStore {
             tx.commit()?;
             return Ok(AutomaticClaim::Waiting(state));
         }
-        let lease = UpdateLease {
-            token: uuid::Uuid::new_v4().to_string(),
-            etag: state.etag,
-        };
-        tx.execute(
-            "UPDATE update_state
-             SET lease_token = ?1, lease_until = ?2
-             WHERE id = 1",
-            params![lease.token, now.saturating_add(LEASE_SECONDS)],
-        )?;
-        tx.commit()?;
-        Ok(AutomaticClaim::Claimed(lease))
+        claim_lease(tx, state, now).map(AutomaticClaim::Claimed)
     }
 
     /// Manual checks ignore the normal deadline and supersede any older
@@ -145,18 +131,7 @@ impl UpdateStateStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let state = load_state(&tx)?;
-        let lease = UpdateLease {
-            token: uuid::Uuid::new_v4().to_string(),
-            etag: state.etag,
-        };
-        tx.execute(
-            "UPDATE update_state
-             SET lease_token = ?1, lease_until = ?2
-             WHERE id = 1",
-            params![lease.token, now.saturating_add(LEASE_SECONDS)],
-        )?;
-        tx.commit()?;
-        Ok(lease)
+        claim_lease(tx, state, now)
     }
 
     pub(crate) fn finish_modified(
@@ -284,16 +259,6 @@ fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), Sto
     Ok(())
 }
 
-fn quick_check(connection: &Connection) -> Result<(), StoreError> {
-    let result: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-    if result != "ok" {
-        return Err(StoreError::Corrupt(format!(
-            "update-state SQLite quick check failed: {result}"
-        )));
-    }
-    Ok(())
-}
-
 fn load_state(connection: &Connection) -> Result<UpdateState, StoreError> {
     let state = connection.query_row(
         "SELECT last_successful_check_at, next_check_at, lease_until, etag, latest_version
@@ -333,6 +298,25 @@ fn load_state(connection: &Connection) -> Result<UpdateState, StoreError> {
     Ok(state)
 }
 
+fn claim_lease(
+    tx: Transaction<'_>,
+    state: UpdateState,
+    now: i64,
+) -> Result<UpdateLease, StoreError> {
+    let lease = UpdateLease {
+        token: uuid::Uuid::new_v4().to_string(),
+        etag: state.etag,
+    };
+    tx.execute(
+        "UPDATE update_state
+         SET lease_token = ?1, lease_until = ?2
+         WHERE id = 1",
+        params![lease.token, now.saturating_add(LEASE_SECONDS)],
+    )?;
+    tx.commit()?;
+    Ok(lease)
+}
+
 fn validate_now(now: i64) -> Result<(), StoreError> {
     if now < 0 {
         return Err(StoreError::validation(
@@ -355,9 +339,7 @@ fn validate_release_version(version: Option<&str>) -> Result<(), StoreError> {
     let Some(version) = version else {
         return Ok(());
     };
-    let parsed = Version::parse(version)
-        .map_err(|_| StoreError::validation("invalid cached release version"))?;
-    if !parsed.pre.is_empty() || !parsed.build.is_empty() || parsed.to_string() != version {
+    if crate::update::parse_stable_version(version).is_none() {
         return Err(StoreError::validation(
             "cached release version must be a stable canonical semantic version",
         ));

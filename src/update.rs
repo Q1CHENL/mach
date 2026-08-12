@@ -53,13 +53,12 @@ pub struct CheckResult {
 }
 
 #[derive(Debug)]
-pub(crate) enum CheckResponse {
-    Modified {
-        info: CheckResult,
-        etag: Option<String>,
-    },
+pub(crate) enum Conditional<T> {
+    Modified { value: T, etag: Option<String> },
     NotModified,
 }
+
+pub(crate) type CheckResponse = Conditional<CheckResult>;
 
 #[derive(Debug)]
 pub(crate) struct CheckFailure {
@@ -126,7 +125,7 @@ pub fn current_version() -> &'static str {
 /// disconnected legacy Python releases without blocking legitimate majors.
 pub fn check() -> Result<CheckResult, String> {
     match check_with_etag(None).map_err(|error| error.message)? {
-        CheckResponse::Modified { info, .. } => Ok(info),
+        CheckResponse::Modified { value: info, .. } => Ok(info),
         CheckResponse::NotModified => {
             Err("GitHub returned 304 without a conditional request".into())
         }
@@ -136,7 +135,8 @@ pub fn check() -> Result<CheckResult, String> {
 /// Conditional release check used by the long-running TUI scheduler.
 pub(crate) fn check_with_etag(etag: Option<&str>) -> Result<CheckResponse, CheckFailure> {
     let current = current_version().to_string();
-    let ReleaseDocument::Modified { body, etag } = fetch_releases(RELEASES_URL, etag)? else {
+    let ReleaseDocument::Modified { value: body, etag } = fetch_releases(RELEASES_URL, etag)?
+    else {
         return Ok(CheckResponse::NotModified);
     };
     let releases: Vec<GhRelease> = serde_json::from_str(&body)
@@ -153,7 +153,7 @@ pub(crate) fn check_with_etag(etag: Option<&str>) -> Result<CheckResponse, Check
             .map_err(|e| CheckFailure::new(format!("invalid current version {current:?}: {e}")))?;
 
     Ok(CheckResponse::Modified {
-        info: CheckResult {
+        value: CheckResult {
             current,
             latest,
             tag: selected.tag,
@@ -231,13 +231,8 @@ pub(crate) fn install_with_progress(
 ) -> Result<InstallResult, String> {
     let target_version = validate_install_info(info)?;
     let destination = install_destination()?;
-    let manifest = http_get_text(
-        &info.checksums_url,
-        DOWNLOAD_TIMEOUT,
-        "application/octet-stream",
-        map_download_err,
-    )
-    .map_err(|e| format!("could not download checksums for {}: {e}", info.tag))?;
+    let manifest = download_checksum_manifest(&info.checksums_url)
+        .map_err(|e| format!("could not download checksums for {}: {e}", info.tag))?;
     let expected_sha = checksum_for_asset(&manifest, &info.asset_name)?;
     let (installed_version, disposition) = download_verified_binary(
         &info.asset_url,
@@ -275,7 +270,7 @@ fn validate_install_info(info: &CheckResult) -> Result<Version, String> {
         .ok_or_else(|| format!("invalid stable release tag {:?}", info.tag))?;
     let latest = Version::parse(&info.latest)
         .map_err(|e| format!("invalid selected release version {:?}: {e}", info.latest))?;
-    if selected_version != latest || !latest.pre.is_empty() || info.latest != latest.to_string() {
+    if selected_version != latest || !is_canonical_stable_version(&info.latest, &latest) {
         return Err("selected release tag/version is inconsistent or not stable".into());
     }
     let current = Version::parse(current_version())
@@ -656,7 +651,7 @@ fn read_receipt_version(path: &Path) -> Result<Version, String> {
         .ok_or_else(|| format!("invalid release receipt {}", path.display()))?;
     let version = Version::parse(value)
         .map_err(|e| format!("invalid release receipt {}: {e}", path.display()))?;
-    if !version.pre.is_empty() || !version.build.is_empty() || value != version.to_string() {
+    if !is_canonical_stable_version(value, &version) {
         return Err(format!("invalid release receipt {}", path.display()));
     }
     Ok(version)
@@ -679,14 +674,7 @@ fn record_release_version(
     let previous_version = if receipt.is_file() {
         let recorded = read_receipt_version(&receipt)?;
         if recorded >= *target_version {
-            return Ok((
-                recorded,
-                ReceiptUpdate {
-                    receipt,
-                    previous_version: None,
-                    changed: false,
-                },
-            ));
+            return Ok((recorded, ReceiptUpdate::Unchanged));
         }
         Some(recorded)
     } else {
@@ -694,14 +682,11 @@ fn record_release_version(
     };
 
     write_release_receipt(parent, &receipt, target_version)?;
-    Ok((
-        target_version.clone(),
-        ReceiptUpdate {
-            receipt,
-            previous_version,
-            changed: true,
-        },
-    ))
+    let update = match previous_version {
+        Some(previous) => ReceiptUpdate::Replaced { receipt, previous },
+        None => ReceiptUpdate::Created(receipt),
+    };
+    Ok((target_version.clone(), update))
 }
 
 #[cfg(unix)]
@@ -736,37 +721,40 @@ fn write_release_receipt(parent: &Path, receipt: &Path, version: &Version) -> Re
 }
 
 #[cfg(unix)]
-struct ReceiptUpdate {
-    receipt: PathBuf,
-    previous_version: Option<Version>,
-    changed: bool,
+enum ReceiptUpdate {
+    Unchanged,
+    Created(PathBuf),
+    Replaced { receipt: PathBuf, previous: Version },
 }
 
 #[cfg(unix)]
 impl ReceiptUpdate {
     fn rollback(self) -> Result<(), String> {
-        if !self.changed {
-            return Ok(());
-        }
-        let receipt_dir = self
-            .receipt
+        let receipt = match self {
+            Self::Unchanged => return Ok(()),
+            Self::Replaced { receipt, previous } => {
+                let parent = receipt
+                    .parent()
+                    .and_then(Path::parent)
+                    .ok_or_else(|| "release receipt directory has no parent".to_string())?;
+                return write_release_receipt(parent, &receipt, &previous);
+            }
+            Self::Created(receipt) => receipt,
+        };
+        let receipt_dir = receipt
             .parent()
             .ok_or_else(|| "release receipt has no parent directory".to_string())?;
         let parent = receipt_dir
             .parent()
             .ok_or_else(|| "release receipt directory has no parent".to_string())?;
-        if let Some(previous_version) = self.previous_version {
-            write_release_receipt(parent, &self.receipt, &previous_version)
-        } else {
-            fs::remove_file(&self.receipt)
-                .map_err(|e| format!("could not remove {}: {e}", self.receipt.display()))?;
-            File::open(receipt_dir)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|e| format!("could not sync release receipt directory: {e}"))?;
-            File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|e| format!("could not sync install directory {}: {e}", parent.display()))
-        }
+        fs::remove_file(&receipt)
+            .map_err(|e| format!("could not remove {}: {e}", receipt.display()))?;
+        File::open(receipt_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("could not sync release receipt directory: {e}"))?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("could not sync install directory {}: {e}", parent.display()))
     }
 }
 
@@ -879,11 +867,7 @@ struct GhAsset {
     browser_download_url: String,
 }
 
-#[derive(Debug)]
-enum ReleaseDocument {
-    Modified { body: String, etag: Option<String> },
-    NotModified,
-}
+type ReleaseDocument = Conditional<String>;
 
 fn fetch_releases(url: &str, etag: Option<&str>) -> Result<ReleaseDocument, CheckFailure> {
     let config = ureq::Agent::config_builder()
@@ -942,7 +926,7 @@ fn fetch_releases(url: &str, etag: Option<&str>) -> Result<ReleaseDocument, Chec
     let body = read_bounded_text(response.body_mut().as_reader(), MAX_TEXT_BYTES)
         .map_err(CheckFailure::new)?;
     Ok(ReleaseDocument::Modified {
-        body,
+        value: body,
         etag: response_etag,
     })
 }
@@ -969,22 +953,17 @@ fn parse_nonnegative_decimal(value: &str) -> Option<i64> {
     }))
 }
 
-fn http_get_text(
-    url: &str,
-    timeout: Duration,
-    accept: &str,
-    map_error: fn(ureq::Error) -> String,
-) -> Result<String, String> {
+fn download_checksum_manifest(url: &str) -> Result<String, String> {
     let config = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
+        .timeout_global(Some(DOWNLOAD_TIMEOUT))
         .build();
     let agent: ureq::Agent = config.into();
     let mut response = agent
         .get(url)
         .header("User-Agent", USER_AGENT)
-        .header("Accept", accept)
+        .header("Accept", "application/octet-stream")
         .call()
-        .map_err(map_error)?;
+        .map_err(map_download_err)?;
     read_bounded_text(response.body_mut().as_reader(), MAX_TEXT_BYTES)
 }
 
@@ -1013,11 +992,16 @@ fn parse_stable_tag(tag: &str) -> Option<Version> {
     }
     let tag = tag.trim();
     let normalized = tag.strip_prefix('v').unwrap_or(tag);
-    let version = Version::parse(normalized).ok()?;
-    if !version.pre.is_empty() || !version.build.is_empty() || normalized != version.to_string() {
-        return None;
-    }
-    Some(version)
+    parse_stable_version(normalized)
+}
+
+pub(crate) fn parse_stable_version(value: &str) -> Option<Version> {
+    let version = Version::parse(value).ok()?;
+    is_canonical_stable_version(value, &version).then_some(version)
+}
+
+fn is_canonical_stable_version(value: &str, version: &Version) -> bool {
+    version.pre.is_empty() && version.build.is_empty() && value == version.to_string()
 }
 
 fn map_ureq_err(e: ureq::Error) -> String {
@@ -1149,7 +1133,8 @@ mod tests {
             "HTTP/1.1 200 OK\r\nETag: \"next-etag\"\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
         );
 
-        let ReleaseDocument::Modified { body, etag } = fetch_releases(&url, None).unwrap() else {
+        let ReleaseDocument::Modified { value: body, etag } = fetch_releases(&url, None).unwrap()
+        else {
             panic!("a 200 response must carry a release document");
         };
         assert_eq!(body, "[]");

@@ -289,23 +289,14 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
     let focused = form.field == Field::Title;
     let box_inner = render_field_box(f, field_block("Title", focused, None, theme), title_box);
     form.areas.title = box_inner;
-    let view = form.title.visible(box_inner.width as usize);
-    if view.text.is_empty() {
-        render_or_placeholder(f, box_inner, "", "what needs doing?", theme);
-    } else {
-        f.render_widget(
-            Paragraph::new(line_with_selection(
-                &view.text,
-                view.sel_cols,
-                Style::new(),
-                theme,
-            )),
-            box_inner,
-        );
-    }
-    if focused {
-        f.set_cursor_position((box_inner.x.saturating_add(view.cursor_col), box_inner.y));
-    }
+    draw_text_input(
+        f,
+        &mut form.title,
+        box_inner,
+        "what needs doing?",
+        focused,
+        theme,
+    );
 
     // --- category -------------------------------------------------------
     let focused = form.field == Field::Category;
@@ -608,23 +599,14 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let focused = !form.on_description;
     let box_inner = render_field_box(f, field_block("Name", focused, None, theme), name_box);
     form.name_area = box_inner;
-    let view = form.name.visible(box_inner.width as usize);
-    if view.text.is_empty() {
-        render_or_placeholder(f, box_inner, "", "What to call it", theme);
-    } else {
-        f.render_widget(
-            Paragraph::new(line_with_selection(
-                &view.text,
-                view.sel_cols,
-                Style::new(),
-                theme,
-            )),
-            box_inner,
-        );
-    }
-    if focused {
-        f.set_cursor_position((box_inner.x.saturating_add(view.cursor_col), box_inner.y));
-    }
+    draw_text_input(
+        f,
+        &mut form.name,
+        box_inner,
+        "What to call it",
+        focused,
+        theme,
+    );
 
     let focused = form.on_description;
     let box_inner = render_field_box(
@@ -1216,7 +1198,7 @@ fn draw_due_picker(
 fn draw_image_preview(
     f: &mut Frame,
     store: &mut crate::image::ImageStore,
-    form: &mut crate::form::TaskForm,
+    form: &crate::form::TaskForm,
     theme: &Theme,
     path: &std::path::Path,
     area: Rect,
@@ -1478,24 +1460,37 @@ fn render_or_placeholder(f: &mut Frame, area: Rect, text: &str, placeholder: &st
     f.render_widget(Paragraph::new(line), area);
 }
 
+fn draw_text_input(
+    f: &mut Frame,
+    input: &mut crate::text_input::TextInput,
+    area: Rect,
+    placeholder: &str,
+    focused: bool,
+    theme: &Theme,
+) {
+    let view = input.visible(area.width as usize);
+    if view.text.is_empty() {
+        render_or_placeholder(f, area, "", placeholder, theme);
+    } else {
+        f.render_widget(
+            Paragraph::new(line_with_selection(
+                &view.text,
+                view.sel_cols,
+                Style::new(),
+                theme,
+            )),
+            area,
+        );
+    }
+    if focused {
+        f.set_cursor_position((area.x.saturating_add(view.cursor_col), area.y));
+    }
+}
+
 /// A panel: thick border glyphs, title in the top-left, accent colour
 /// while focused. (Terminal bold barely thickens box-drawing chars.)
 fn panel<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
-    let (border, title_style) = if focused {
-        (theme.accent_text(), theme.accent_text().bold())
-    } else {
-        (
-            Style::new().fg(theme.muted_color()),
-            Style::new()
-                .fg(theme.muted_color())
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-    Block::bordered()
-        .border_type(BorderType::Thick)
-        .border_style(border)
-        .title(Span::styled(format!(" {title} "), title_style))
-        .padding(Padding::horizontal(1))
+    field_block(title, focused, None, theme)
 }
 
 /// Panel scrollbar (right border). Accent when focused, grey otherwise.
@@ -1569,8 +1564,9 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let scores: Vec<String> = app
         .categories
         .iter()
-        .map(|cat| {
-            let (done, total) = app.category_progress(&cat.id);
+        .enumerate()
+        .map(|(index, _)| {
+            let (done, total) = app.category_progress_at(index);
             format!("{done}/{total}")
         })
         .collect();
@@ -1655,11 +1651,7 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     // markers live inside each task's content cell so metadata on one task
     // cannot shorten every other title in the list.
     let flags_width = crate::model::MAX_IMPORTANCE as usize;
-    let presentations: Vec<_> = app
-        .view
-        .iter()
-        .map(|task_index| TaskPresentation::new(&app.tasks[*task_index], &app.settings.date_format))
-        .collect();
+    let today = chrono::Local::now().date_naive();
 
     // Preserve a useful title at narrow widths. Flags stay aligned when the
     // panel can afford them; row-local metadata decides independently whether
@@ -1679,7 +1671,6 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         .saturating_sub(DONE_MARK_WIDTH as usize)
         .saturating_sub(column_gaps)
         .saturating_sub(if flags_visible { flags_width } else { 0 });
-    let mut presentations = presentations.into_iter().enumerate();
     let rows: Vec<Row> = app
         .list_rows
         .iter()
@@ -1690,12 +1681,9 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                 Row::new(std::iter::repeat_n(Cell::new(""), widths.len()))
             }
             crate::app::TaskListRow::Task(view_idx) => {
-                let (presentation_index, presentation) = presentations
-                    .next()
-                    .expect("task rows and task presentations must stay aligned");
-                debug_assert_eq!(*view_idx, presentation_index);
+                let task = &app.tasks[app.view[*view_idx]];
                 task_row(
-                    presentation,
+                    TaskPresentation::new(task, &app.settings.date_format, today),
                     theme,
                     *view_idx == app.task_index,
                     content_width,
@@ -1704,7 +1692,6 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             }
         })
         .collect();
-    debug_assert!(presentations.next().is_none());
     // Selected-row wash stays on during edit; bold only when the list has chrome focus.
     let table = Table::new(rows, widths)
         .block(block)
@@ -1788,32 +1775,42 @@ fn pin_section_header(app: &mut App, vis: usize) {
 
 /// The markers shown between a task's title and its due date.
 fn extras(task: &crate::model::Task) -> String {
-    let notes = if crate::model::has_prose_or_image(task) {
-        "≡"
-    } else {
-        ""
-    };
-    match crate::model::todo_progress(task) {
-        Some((done, total)) => format!("{notes} {done}/{total}").trim_start().to_string(),
-        None => notes.to_string(),
+    let mut has_prose_or_image = false;
+    let mut done = 0usize;
+    let mut total = 0usize;
+    for block in &task.description {
+        match block {
+            crate::model::Block::Todo { done: is_done, .. } => {
+                total += 1;
+                done += usize::from(*is_done);
+            }
+            block if !block.is_empty() => has_prose_or_image = true,
+            _ => {}
+        }
+    }
+    match (has_prose_or_image, total) {
+        (true, 0) => "≡".to_string(),
+        (true, _) => format!("≡ {done}/{total}"),
+        (false, 0) => String::new(),
+        (false, _) => format!("{done}/{total}"),
     }
 }
 
 /// Owned display data derived once for one task during a frame.
-struct TaskPresentation {
-    title: String,
+struct TaskPresentation<'a> {
+    title: &'a str,
     extras: String,
     due: String,
     flags: String,
     done: bool,
 }
 
-impl TaskPresentation {
-    fn new(task: &crate::model::Task, date_format: &str) -> Self {
+impl<'a> TaskPresentation<'a> {
+    fn new(task: &'a crate::model::Task, date_format: &str, today: chrono::NaiveDate) -> Self {
         Self {
-            title: task.title.clone(),
+            title: &task.title,
             extras: extras(task),
-            due: due::display_compact(&task.due, date_format),
+            due: due::display_compact_at(&task.due, date_format, today),
             flags: crate::model::importance_marks(task.importance),
             done: task.done,
         }
@@ -1843,7 +1840,7 @@ fn category_rule(title: &str, width: usize, title_x: usize) -> String {
 }
 
 fn task_row(
-    presentation: TaskPresentation,
+    presentation: TaskPresentation<'_>,
     theme: &Theme,
     selected: bool,
     content_width: usize,
@@ -1915,7 +1912,7 @@ fn task_row(
 /// Due is the highest-priority suffix; description/progress markers join it only when
 /// both complete values fit while retaining a recognisable title.
 fn task_content_line(
-    title: String,
+    title: &str,
     title_style: Style,
     extras: String,
     extras_style: Style,
@@ -1948,11 +1945,11 @@ fn task_content_line(
     }
 
     if metadata_width == 0 {
-        return Line::from(Span::styled(truncate(&title, width), title_style));
+        return Line::from(Span::styled(truncate(title, width), title_style));
     }
 
     let title_width = width.saturating_sub(META_GAP + metadata_width);
-    let title = truncate(&title, title_width);
+    let title = truncate(title, title_width);
     let padding = width.saturating_sub(title.width() + metadata_width);
     let mut spans = vec![
         Span::styled(title, title_style),
@@ -2043,38 +2040,37 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                 .concat(),
             )
         }
-        _ if archive_activity.is_some() => {
-            let text = archive_activity
-                .as_deref()
-                .expect("archive status was checked");
-            Line::from(Span::styled(truncate(text, field), theme.accent_text()))
-        }
-        _ if update_activity == Some(UpdateActivity::Checking) => {
-            Line::from(Span::styled("Checking for updates…", theme.accent_text()))
-        }
-        _ => match app.status_message() {
-            Some((text, kind)) => {
-                let style = match kind {
-                    MessageKind::Error => Style::new()
-                        .fg(theme.error_color())
-                        .add_modifier(Modifier::BOLD),
-                    MessageKind::Info => theme.plain(),
-                };
-                Line::from(Span::styled(truncate(text, field), style))
-            }
-            None => {
-                let hint = if app.searching {
-                    format!("search: {} · Esc clears", app.search_query)
-                } else {
-                    "/ commands".to_string()
-                };
-                if (left_area.width as usize) >= hint.width() + 2 {
-                    Line::from(Span::styled(hint, Style::new().fg(theme.muted_color())))
-                } else {
-                    Line::raw("")
+        _ => {
+            if let Some(text) = archive_activity.as_deref() {
+                Line::from(Span::styled(truncate(text, field), theme.accent_text()))
+            } else if update_activity == Some(UpdateActivity::Checking) {
+                Line::from(Span::styled("Checking for updates…", theme.accent_text()))
+            } else {
+                match app.status_message() {
+                    Some((text, kind)) => {
+                        let style = match kind {
+                            MessageKind::Error => Style::new()
+                                .fg(theme.error_color())
+                                .add_modifier(Modifier::BOLD),
+                            MessageKind::Info => theme.plain(),
+                        };
+                        Line::from(Span::styled(truncate(text, field), style))
+                    }
+                    None => {
+                        let hint = if app.searching {
+                            format!("search: {} · Esc clears", app.search_query)
+                        } else {
+                            "/ commands".to_string()
+                        };
+                        if (left_area.width as usize) >= hint.width() + 2 {
+                            Line::from(Span::styled(hint, Style::new().fg(theme.muted_color())))
+                        } else {
+                            Line::raw("")
+                        }
+                    }
                 }
             }
-        },
+        }
     };
     f.render_widget(Paragraph::new(left), left_area);
 }

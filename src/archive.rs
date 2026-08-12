@@ -258,7 +258,7 @@ pub(crate) struct ImportSummary {
 }
 
 impl ImportSummary {
-    fn changed(&self) -> bool {
+    pub(crate) fn changed(&self) -> bool {
         self.tasks_added > 0 || self.categories_added > 0 || self.images_added > 0
     }
 }
@@ -455,11 +455,6 @@ pub(crate) fn content_count_text(tasks: usize, categories: usize, images: usize)
 
 fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if count == 1 { singular } else { plural }
-}
-
-#[derive(Debug)]
-pub(crate) struct ImportOutcome {
-    pub summary: ImportSummary,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1077,7 +1072,7 @@ pub(crate) fn export_with_progress(
 pub(crate) fn import(
     store: &mut Store,
     requested_path: &Path,
-) -> Result<ImportOutcome, ArchiveError> {
+) -> Result<ImportSummary, ArchiveError> {
     let control = ArchiveControl::new();
     import_with_progress(store, requested_path, &control, |_| {})
 }
@@ -1087,7 +1082,7 @@ pub(crate) fn import_with_progress(
     requested_path: &Path,
     control: &ArchiveControl,
     mut progress: impl FnMut(ArchiveProgress),
-) -> Result<ImportOutcome, ArchiveError> {
+) -> Result<ImportSummary, ArchiveError> {
     progress(ArchiveProgress::Preparing);
     control.check_cancelled()?;
     let path = absolute_user_path(requested_path)?;
@@ -1122,9 +1117,7 @@ pub(crate) fn import_with_progress(
     control.begin_finalizing()?;
     progress(ArchiveProgress::Finalizing);
     if !plan.summary.changed() {
-        return Ok(ImportOutcome {
-            summary: plan.summary,
-        });
+        return Ok(plan.summary);
     }
 
     let expected_revision = current.revision;
@@ -1135,7 +1128,7 @@ pub(crate) fn import_with_progress(
             data.tasks.append(&mut plan.tasks);
             Ok(summary)
         })?;
-    Ok(ImportOutcome { summary })
+    Ok(summary)
 }
 
 fn manifest_from_snapshot(snapshot: &StoreData) -> Result<ExportManifest<'_>, ArchiveError> {
@@ -1282,20 +1275,15 @@ fn read_manifest(
         .map(Category::from)
         .collect();
     let tasks: Vec<Task> = manifest.tasks.into_iter().map(Task::from).collect();
-    validate_imported_data(&categories, &tasks, &attachments)?;
-    Ok(ImportedArchive {
-        categories,
-        tasks,
-        attachments,
-    })
+    validate_imported_data(categories, tasks, attachments)
 }
 
 fn validate_imported_data(
-    categories: &[Category],
-    tasks: &[Task],
-    attachments: &[ImportedAttachment],
-) -> Result<(), ArchiveError> {
-    let referenced = referenced_attachment_ids(tasks);
+    categories: Vec<Category>,
+    tasks: Vec<Task>,
+    attachments: Vec<ImportedAttachment>,
+) -> Result<ImportedArchive, ArchiveError> {
+    let referenced = referenced_attachment_ids(&tasks);
     let declared: BTreeSet<_> = attachments
         .iter()
         .map(|attachment| attachment.metadata.id.clone())
@@ -1307,8 +1295,8 @@ fn validate_imported_data(
     }
     let mut data = StoreData {
         revision: 0,
-        categories: categories.to_vec(),
-        tasks: tasks.to_vec(),
+        categories,
+        tasks,
         settings: Settings::default(),
         attachments: attachments
             .iter()
@@ -1316,7 +1304,12 @@ fn validate_imported_data(
             .collect(),
     };
     data.validate_as_stored()
-        .map_err(|error| ArchiveError::Invalid(format!("invalid archive data: {error}")))
+        .map_err(|error| ArchiveError::Invalid(format!("invalid archive data: {error}")))?;
+    Ok(ImportedArchive {
+        categories: data.categories,
+        tasks: data.tasks,
+        attachments,
+    })
 }
 
 fn plan_merge(
@@ -1345,7 +1338,6 @@ fn plan_merge(
         .map(|attachment| (attachment.id.as_str(), attachment))
         .collect();
 
-    let mut merged = current.clone();
     let mut categories = Vec::new();
     let mut categories_unchanged = 0usize;
     for category in &imported.categories {
@@ -1370,8 +1362,6 @@ fn plan_merge(
         }
         categories.push(category.clone());
     }
-    merged.categories.extend(categories.iter().cloned());
-
     let mut tasks = Vec::new();
     let mut tasks_unchanged = 0usize;
     for task in &imported.tasks {
@@ -1387,8 +1377,6 @@ fn plan_merge(
         }
         tasks.push(task.clone());
     }
-    merged.tasks.extend(tasks.iter().cloned());
-
     let mut attachments = Vec::new();
     let mut images_unchanged = 0usize;
     for imported_attachment in &imported.attachments {
@@ -1405,13 +1393,21 @@ fn plan_merge(
         }
         attachments.push(attachment.clone());
     }
-    merged.attachments.extend(attachments.iter().cloned());
+    let images_added = attachments.len();
+    let mut merged = current.clone();
+    let category_start = merged.categories.len();
+    let task_start = merged.tasks.len();
+    merged.categories.append(&mut categories);
+    merged.tasks.append(&mut tasks);
+    merged.attachments.append(&mut attachments);
     merged
         .attachments
         .sort_by(|left, right| left.id.cmp(&right.id));
     merged.validate_as_stored().map_err(|error| {
         ArchiveError::Conflict(format!("archive cannot be merged into this store: {error}"))
     })?;
+    let categories = merged.categories.split_off(category_start);
+    let tasks = merged.tasks.split_off(task_start);
 
     Ok(MergePlan {
         summary: ImportSummary {
@@ -1420,7 +1416,7 @@ fn plan_merge(
             tasks_unchanged,
             categories_added: categories.len(),
             categories_unchanged,
-            images_added: attachments.len(),
+            images_added,
             images_unchanged,
         },
         categories,
@@ -1536,13 +1532,8 @@ fn stage_attachments(
 }
 
 fn media_type_for_image(prefix: &[u8]) -> Option<&'static str> {
-    match image::guess_format(prefix).ok()? {
-        image::ImageFormat::Png => Some("image/png"),
-        image::ImageFormat::Jpeg => Some("image/jpeg"),
-        image::ImageFormat::Gif => Some("image/gif"),
-        image::ImageFormat::WebP => Some("image/webp"),
-        _ => None,
-    }
+    crate::image::managed_attachment_format(image::guess_format(prefix).ok()?)
+        .map(|format| format.media_type)
 }
 
 fn write_verified_attachment(

@@ -116,12 +116,7 @@ impl SlashCommand {
     }
 
     /// Whether this command matches the typed query (first word / prefix).
-    pub fn matches(self, query: &str) -> bool {
-        let q = query.trim().to_lowercase();
-        if q.is_empty() {
-            return true;
-        }
-        let head = q.split_whitespace().next().unwrap_or("");
+    fn matches_head(self, head: &str) -> bool {
         self.keywords().iter().any(|k| {
             // Keyword starts with what was typed ("set" → settings),
             // or typed text starts with the keyword ("search milk").
@@ -136,21 +131,21 @@ impl SlashCommand {
 /// An exact keyword hit (`copy`) wins over a longer progressive match
 /// (`copytitle`), so short names stay unambiguous.
 pub fn matching(query: &str) -> Vec<SlashCommand> {
-    let q = query.trim();
-    if q.is_empty() {
+    let head = query.split_whitespace().next().unwrap_or("").to_lowercase();
+    if head.is_empty() {
         return SlashCommand::ALL.to_vec();
     }
-    let hits: Vec<SlashCommand> = SlashCommand::ALL
+    let mut hits: Vec<SlashCommand> = SlashCommand::ALL
         .into_iter()
-        .filter(|c| c.matches(query))
+        .filter(|c| c.matches_head(&head))
         .collect();
-    let head = q.split_whitespace().next().unwrap_or("").to_lowercase();
-    let exact: Vec<SlashCommand> = hits
+    if hits
         .iter()
-        .copied()
-        .filter(|c| c.keywords().iter().any(|k| *k == head))
-        .collect();
-    if exact.is_empty() { hits } else { exact }
+        .any(|command| command.keywords().contains(&head.as_str()))
+    {
+        hits.retain(|command| command.keywords().contains(&head.as_str()));
+    }
+    hits
 }
 
 /// Text after the command keyword, e.g. `"search milk"` → `"milk"`.

@@ -61,12 +61,11 @@ fn paste_text(app: &mut App, text: &str) {
                     form.title.insert_str(text);
                 }
                 // Selectors are changed with arrows/clicks, not pasted text.
-                Field::Category | Field::Due => {}
+                Field::Category | Field::Due | Field::Importance => {}
                 Field::Description => {
                     form.before_edit(EditKind::Atomic);
                     form.description.insert_str(text);
                 }
-                Field::Importance => {}
             }
         }
         Mode::CategoryForm => {
@@ -116,25 +115,143 @@ fn is_redo_chord(key: KeyEvent) -> bool {
     }
 }
 
-/// Whether this key mutates editor content, and how to group it for undo.
-fn content_edit_kind(key: KeyEvent) -> Option<EditKind> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextEditAction {
+    SelectWord,
+    SelectWordLeft,
+    SelectWordRight,
+    WordLeft,
+    WordRight,
+    SelectHome,
+    SelectEnd,
+    Home,
+    End,
+    DeleteToStart,
+    DeleteToEnd,
+    DeleteWordLeft,
+    Insert(char),
+    Backspace,
+    Delete,
+    SelectLeft,
+    SelectRight,
+    Left,
+    Right,
+}
+
+impl TextEditAction {
+    const fn edit_kind(self) -> Option<EditKind> {
+        match self {
+            Self::Insert(_) | Self::Backspace | Self::Delete => Some(EditKind::Typing),
+            Self::DeleteToStart | Self::DeleteToEnd | Self::DeleteWordLeft => {
+                Some(EditKind::Atomic)
+            }
+            _ => None,
+        }
+    }
+
+    fn apply_line(self, input: &mut TextInput) {
+        match self {
+            Self::SelectWord => input.select_word(),
+            Self::SelectWordLeft => input.select_word_left(),
+            Self::SelectWordRight => input.select_word_right(),
+            Self::WordLeft => input.word_left(),
+            Self::WordRight => input.word_right(),
+            Self::SelectHome => input.select_home(),
+            Self::SelectEnd => input.select_end(),
+            Self::Home => input.home(),
+            Self::End => input.end(),
+            Self::DeleteToStart => input.delete_to_start(),
+            Self::DeleteToEnd => input.delete_to_end(),
+            Self::DeleteWordLeft => input.delete_word_left(),
+            Self::Insert(character) => input.insert(character),
+            Self::Backspace => input.backspace(),
+            Self::Delete => input.delete(),
+            Self::SelectLeft => input.select_left(),
+            Self::SelectRight => input.select_right(),
+            Self::Left => input.left(),
+            Self::Right => input.right(),
+        }
+    }
+
+    fn apply_description(self, description: &mut crate::description::DescriptionEditor) {
+        match self {
+            Self::SelectWord => description.select_word(),
+            Self::SelectWordLeft => description.select_word_left(),
+            Self::SelectWordRight => description.select_word_right(),
+            Self::WordLeft => description.word_left(),
+            Self::WordRight => description.word_right(),
+            Self::SelectHome => description.select_home(),
+            Self::SelectEnd => description.select_end(),
+            Self::Home => description.home(),
+            Self::End => description.end(),
+            Self::DeleteToStart => description.delete_to_start(),
+            Self::DeleteToEnd => description.delete_to_end(),
+            Self::DeleteWordLeft => description.delete_word_left(),
+            Self::Insert(character) => description.insert(character),
+            Self::Backspace => description.backspace(),
+            Self::Delete => description.delete(),
+            Self::SelectLeft => description.select_left(),
+            Self::SelectRight => description.select_right(),
+            Self::Left => description.left(),
+            Self::Right => description.right(),
+        }
+    }
+}
+
+fn text_edit_action(key: KeyEvent) -> Option<TextEditAction> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let word = word_mod(key);
     match key.code {
+        KeyCode::Char('w') | KeyCode::Char('W') if alt && shift => Some(TextEditAction::SelectWord),
+        KeyCode::Char('b') | KeyCode::Char('B') if alt && shift => {
+            Some(TextEditAction::SelectWordLeft)
+        }
+        KeyCode::Char('f') | KeyCode::Char('F') if alt && shift => {
+            Some(TextEditAction::SelectWordRight)
+        }
+        KeyCode::Char('b') | KeyCode::Char('B') if alt => Some(TextEditAction::WordLeft),
+        KeyCode::Char('f') | KeyCode::Char('F') if alt => Some(TextEditAction::WordRight),
         KeyCode::Char(c) if ctrl || alt => match c {
-            // Deletes / kills — always their own step.
-            'u' | 'k' | 'w' | 'W' if !shift => Some(EditKind::Atomic),
-            // Ctrl+D toggles a description to-do (handled on description only).
-            'd' | 'D' if ctrl && !alt && !shift => Some(EditKind::Atomic),
+            'a' if shift => Some(TextEditAction::SelectHome),
+            'e' if shift => Some(TextEditAction::SelectEnd),
+            'a' => Some(TextEditAction::Home),
+            'e' => Some(TextEditAction::End),
+            'u' => Some(TextEditAction::DeleteToStart),
+            'k' => Some(TextEditAction::DeleteToEnd),
+            'w' | 'W' => Some(TextEditAction::DeleteWordLeft),
             _ => None,
         },
-        KeyCode::Char(_) if !ctrl && !alt => Some(EditKind::Typing),
-        KeyCode::Backspace if word => Some(EditKind::Atomic),
-        KeyCode::Backspace | KeyCode::Delete => Some(EditKind::Typing),
+        KeyCode::Char(character) if !ctrl && !alt => Some(TextEditAction::Insert(character)),
+        KeyCode::Backspace if word => Some(TextEditAction::DeleteWordLeft),
+        KeyCode::Backspace => Some(TextEditAction::Backspace),
+        KeyCode::Delete => Some(TextEditAction::Delete),
+        KeyCode::Left if word && shift => Some(TextEditAction::SelectWordLeft),
+        KeyCode::Right if word && shift => Some(TextEditAction::SelectWordRight),
+        KeyCode::Left if shift => Some(TextEditAction::SelectLeft),
+        KeyCode::Right if shift => Some(TextEditAction::SelectRight),
+        KeyCode::Left if word => Some(TextEditAction::WordLeft),
+        KeyCode::Right if word => Some(TextEditAction::WordRight),
+        KeyCode::Left => Some(TextEditAction::Left),
+        KeyCode::Right => Some(TextEditAction::Right),
+        KeyCode::Home if shift => Some(TextEditAction::SelectHome),
+        KeyCode::End if shift => Some(TextEditAction::SelectEnd),
+        KeyCode::Home => Some(TextEditAction::Home),
+        KeyCode::End => Some(TextEditAction::End),
         _ => None,
     }
+}
+
+/// Whether this key mutates editor content, and how to group it for undo.
+fn content_edit_kind(key: KeyEvent) -> Option<EditKind> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    if matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')) && ctrl && !alt && !shift {
+        return Some(EditKind::Atomic);
+    }
+    text_edit_action(key).and_then(TextEditAction::edit_kind)
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
@@ -449,49 +566,10 @@ fn word_mod(key: KeyEvent) -> bool {
 
 /// Shared bindings for every one-line editor.
 fn edit_line(input: &mut TextInput, key: KeyEvent) -> bool {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    let word = word_mod(key);
-    match key.code {
-        // Shift+Option+W — select the word under the caret (macOS Select Word).
-        KeyCode::Char('w') | KeyCode::Char('W') if alt && shift => input.select_word(),
-        // Option/Alt+b/f — emacs meta, what many Mac terminals send for
-        // Option+←/→ when Option is wired as Meta.
-        KeyCode::Char('b') | KeyCode::Char('B') if alt && shift => input.select_word_left(),
-        KeyCode::Char('f') | KeyCode::Char('F') if alt && shift => input.select_word_right(),
-        KeyCode::Char('b') | KeyCode::Char('B') if alt => input.word_left(),
-        KeyCode::Char('f') | KeyCode::Char('F') if alt => input.word_right(),
-        KeyCode::Char(c) if ctrl || alt => match c {
-            'a' if shift => input.select_home(),
-            'e' if shift => input.select_end(),
-            'a' => input.home(),
-            'e' => input.end(),
-            'u' => input.delete_to_start(),
-            'k' => input.delete_to_end(),
-            // Option/Ctrl+W without Shift still deletes the previous word.
-            'w' | 'W' => input.delete_word_left(),
-            _ => return false,
-        },
-        KeyCode::Char(c) => input.insert(c),
-        // Option+Delete (Backspace) deletes the word to the left, like macOS.
-        KeyCode::Backspace if word => input.delete_word_left(),
-        KeyCode::Backspace => input.backspace(),
-        KeyCode::Delete => input.delete(),
-        KeyCode::Left if word && shift => input.select_word_left(),
-        KeyCode::Right if word && shift => input.select_word_right(),
-        KeyCode::Left if shift => input.select_left(),
-        KeyCode::Right if shift => input.select_right(),
-        KeyCode::Left if word => input.word_left(),
-        KeyCode::Right if word => input.word_right(),
-        KeyCode::Left => input.left(),
-        KeyCode::Right => input.right(),
-        KeyCode::Home if shift => input.select_home(),
-        KeyCode::End if shift => input.select_end(),
-        KeyCode::Home => input.home(),
-        KeyCode::End => input.end(),
-        _ => return false,
-    }
+    let Some(action) = text_edit_action(key) else {
+        return false;
+    };
+    action.apply_line(input);
     true
 }
 
@@ -499,45 +577,14 @@ fn edit_line(input: &mut TextInput, key: KeyEvent) -> bool {
 /// a task's description and a category's description. Adds ↑/↓ across blocks.
 /// The `/` menu is handled by the caller before this runs.
 fn edit_description(description: &mut crate::description::DescriptionEditor, key: KeyEvent) {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    let word = word_mod(key);
     match key.code {
-        KeyCode::Char('w') | KeyCode::Char('W') if alt && shift => description.select_word(),
-        KeyCode::Char('b') | KeyCode::Char('B') if alt && shift => description.select_word_left(),
-        KeyCode::Char('f') | KeyCode::Char('F') if alt && shift => description.select_word_right(),
-        KeyCode::Char('b') | KeyCode::Char('B') if alt => description.word_left(),
-        KeyCode::Char('f') | KeyCode::Char('F') if alt => description.word_right(),
-        KeyCode::Char(c) if ctrl || alt => match c {
-            'a' if shift => description.select_home(),
-            'e' if shift => description.select_end(),
-            'a' => description.home(),
-            'e' => description.end(),
-            'u' => description.delete_to_start(),
-            'k' => description.delete_to_end(),
-            'w' | 'W' => description.delete_word_left(),
-            _ => {}
-        },
-        KeyCode::Char(c) => description.insert(c),
-        KeyCode::Backspace if word => description.delete_word_left(),
-        KeyCode::Backspace => description.backspace(),
-        KeyCode::Delete => description.delete(),
-        KeyCode::Left if word && shift => description.select_word_left(),
-        KeyCode::Right if word && shift => description.select_word_right(),
-        KeyCode::Left if shift => description.select_left(),
-        KeyCode::Right if shift => description.select_right(),
-        KeyCode::Left if word => description.word_left(),
-        KeyCode::Right if word => description.word_right(),
-        KeyCode::Left => description.left(),
-        KeyCode::Right => description.right(),
         KeyCode::Up => description.up(),
         KeyCode::Down => description.down(),
-        KeyCode::Home if shift => description.select_home(),
-        KeyCode::End if shift => description.select_end(),
-        KeyCode::Home => description.home(),
-        KeyCode::End => description.end(),
-        _ => {}
+        _ => {
+            if let Some(action) = text_edit_action(key) {
+                action.apply_description(description);
+            }
+        }
     }
 }
 
@@ -598,7 +645,7 @@ fn handle_category_key(app: &mut App, key: KeyEvent) {
 
     match key.code {
         KeyCode::Esc => {
-            let _ = request_close_category_form(app, FormCloseSource::Escape);
+            let _ = request_close_form(app, OpenForm::Category, FormCloseSource::Escape);
         }
         KeyCode::Tab | KeyCode::BackTab => {
             if let Some(form) = &mut app.category_form {
@@ -617,10 +664,7 @@ fn handle_category_key(app: &mut App, key: KeyEvent) {
                 .filter(|form| form.on_description)
                 .and_then(|form| form.description.link_url_at_cursor());
             if let Some(url) = url {
-                match crate::open::open_url(&url) {
-                    Ok(()) => app.info(format!("Opened {url}")),
-                    Err(error) => app.error(error),
-                }
+                open_link(app, &url);
             }
         }
         KeyCode::Enter => {
@@ -663,6 +707,12 @@ fn handle_category_key(app: &mut App, key: KeyEvent) {
 }
 
 /// The `/` command palette above the status bar.
+fn cycle_index(index: &mut usize, count: usize, delta: isize) {
+    if count > 0 {
+        *index = ((*index as isize + delta).rem_euclid(count as isize)) as usize;
+    }
+}
+
 fn handle_slash_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => close_slash(app),
@@ -670,15 +720,11 @@ fn handle_slash_key(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace if app.input.is_empty() => close_slash(app),
         KeyCode::Up => {
             let n = crate::slash::matching(&app.input.value()).len();
-            if n > 0 {
-                app.slash_index = (app.slash_index + n - 1) % n;
-            }
+            cycle_index(&mut app.slash_index, n, -1);
         }
         KeyCode::Down | KeyCode::Tab => {
             let n = crate::slash::matching(&app.input.value()).len();
-            if n > 0 {
-                app.slash_index = (app.slash_index + 1) % n;
-            }
+            cycle_index(&mut app.slash_index, n, 1);
         }
         KeyCode::Enter => {
             let query = app.input.value();
@@ -895,7 +941,7 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
 
     match key.code {
         KeyCode::Esc => {
-            let _ = request_close_task_form(app, FormCloseSource::Escape);
+            let _ = request_close_form(app, OpenForm::Task, FormCloseSource::Escape);
         }
         KeyCode::Tab => {
             if let Some(form) = &mut app.form {
@@ -921,10 +967,7 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
                 .filter(|f| f.field == Field::Description)
                 .and_then(|f| f.description.link_url_at_cursor());
             if let Some(url) = url {
-                match crate::open::open_url(&url) {
-                    Ok(()) => app.info(format!("Opened {url}")),
-                    Err(err) => app.error(err),
-                }
+                open_link(app, &url);
             }
         }
         KeyCode::Enter => {
@@ -1263,63 +1306,55 @@ fn paste_from_clipboard(app: &mut App) {
     paste_clipboard_content(app, content);
 }
 
-fn paste_editor(app: &mut App) -> Option<&mut crate::description::DescriptionEditor> {
-    match app.mode {
-        Mode::TaskForm => app
-            .form
-            .as_mut()
-            .filter(|form| form.field == Field::Description)
-            .map(|form| &mut form.description),
-        Mode::CategoryForm => app
-            .category_form
-            .as_mut()
-            .filter(|form| form.on_description)
-            .map(|form| &mut form.description),
-        _ => None,
-    }
-}
-
 fn paste_clipboard_content(app: &mut App, content: ClipboardContent) {
-    if paste_editor(app).is_none() {
-        debug_assert!(
-            false,
-            "description paste command requires an active description editor"
-        );
-        return;
-    }
-
     let ClipboardContent { image, text } = content;
-    let category_ignored_image = app.mode == Mode::CategoryForm && image.is_some();
-    let staged_image = if app.mode == Mode::TaskForm {
-        image.map(crate::image::stage_clipboard_image)
-    } else {
-        None
-    };
     let pasted_text = text.is_some();
-    if let Some(text) = text {
-        // When both representations exist, keep their deterministic visual
-        // order: clipboard text first, then its image.
-        paste_editor(app)
-            .expect("active description editor checked above")
-            .insert_str(&text);
-    }
-
-    let (pasted_image, image_error) = match staged_image {
-        Some(Ok(image)) => {
-            let inserted = match app.mode {
-                Mode::TaskForm => app
-                    .form
-                    .as_mut()
-                    .is_some_and(|form| form.insert_temporary_image(image)),
-                _ => false,
+    let (pasted_image, image_error, category_ignored_image) = match app.mode {
+        Mode::TaskForm => {
+            let Some(form) = app
+                .form
+                .as_mut()
+                .filter(|form| form.field == Field::Description)
+            else {
+                debug_assert!(false, "paste requires an active task description");
+                return;
             };
-            (
-                inserted,
-                (!inserted).then(|| "this field is full".to_string()),
-            )
+            // When both representations exist, keep their deterministic
+            // visual order: clipboard text first, then its image.
+            if let Some(text) = text {
+                form.description.insert_str(&text);
+            }
+            let (pasted_image, image_error) = match image.map(crate::image::stage_clipboard_image) {
+                Some(Ok(image)) => {
+                    let inserted = form.insert_temporary_image(image);
+                    (
+                        inserted,
+                        (!inserted).then(|| "this field is full".to_string()),
+                    )
+                }
+                Some(Err(error)) => (false, Some(error)),
+                None => (false, None),
+            };
+            (pasted_image, image_error, false)
         }
-        Some(Err(error)) => (false, Some(error)),
-        None => (false, None),
+        Mode::CategoryForm => {
+            let Some(form) = app
+                .category_form
+                .as_mut()
+                .filter(|form| form.on_description)
+            else {
+                debug_assert!(false, "paste requires an active category description");
+                return;
+            };
+            if let Some(text) = text {
+                form.description.insert_str(&text);
+            }
+            (false, None, image.is_some())
+        }
+        _ => {
+            debug_assert!(false, "paste requires an active description editor");
+            return;
+        }
     };
 
     if let Some(error) = image_error {
@@ -1386,7 +1421,16 @@ const MAX_OSC52_ENCODED_BYTES: usize = 80 * 1024;
 const MAX_RICH_CLIPBOARD_BYTES: usize = 8 * 1024 * 1024;
 
 fn copy_text(text: &str) -> Result<ClipboardTarget, String> {
-    match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+    copy_with_terminal_fallback(text, || {
+        arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text))
+    })
+}
+
+fn copy_with_terminal_fallback(
+    text: &str,
+    system_copy: impl FnOnce() -> Result<(), arboard::Error>,
+) -> Result<ClipboardTarget, String> {
+    match system_copy() {
         Ok(()) => Ok(ClipboardTarget::System),
         Err(system_error) => osc52_copy(text).map_err(|terminal_error| {
             format!("system clipboard: {system_error}; terminal clipboard: {terminal_error}")
@@ -1445,14 +1489,10 @@ fn copy_image_file(path: &std::path::Path) -> Result<(), String> {
 fn copy_all(lines: &[crate::description::CopyLine]) -> Result<ClipboardTarget, String> {
     let (plain, html) = build_clipboard_payload(lines, MAX_RICH_CLIPBOARD_BYTES);
 
-    match arboard::Clipboard::new()
-        .and_then(|mut clipboard| clipboard.set_html(html.as_str(), Some(plain.as_str())))
-    {
-        Ok(()) => Ok(ClipboardTarget::System),
-        Err(system_error) => osc52_copy(&plain).map_err(|terminal_error| {
-            format!("system clipboard: {system_error}; terminal clipboard: {terminal_error}")
-        }),
-    }
+    copy_with_terminal_fallback(&plain, || {
+        arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_html(html.as_str(), Some(plain.as_str())))
+    })
 }
 
 fn build_clipboard_payload(
@@ -1633,40 +1673,38 @@ impl FormCloseSource {
 
 /// Close a form only when there is no content to lose, or after the same
 /// entity-bound discard action is explicitly confirmed with Esc.
-fn request_close_task_form(app: &mut App, source: FormCloseSource) -> bool {
-    let Some(form) = app.form.as_ref() else {
-        return true;
-    };
-    if !form.is_dirty() {
-        app.close_form();
-        return true;
-    }
-    let confirm = Confirm::DiscardTask(form.editing.clone());
-    if app.awaiting(confirm.clone()) {
-        app.close_form();
-        true
-    } else {
-        app.ask_confirm(confirm, source.discard_prompt());
-        false
-    }
+#[derive(Clone, Copy)]
+enum OpenForm {
+    Task,
+    Category,
 }
 
-fn request_close_category_form(app: &mut App, source: FormCloseSource) -> bool {
-    let Some(form) = app.category_form.as_ref() else {
+fn request_close_form(app: &mut App, form: OpenForm, source: FormCloseSource) -> bool {
+    let state = match form {
+        OpenForm::Task => app
+            .form
+            .as_ref()
+            .map(|form| (form.is_dirty(), Confirm::DiscardTask(form.editing.clone()))),
+        OpenForm::Category => app.category_form.as_ref().map(|form| {
+            (
+                form.is_dirty(),
+                Confirm::DiscardCategory(form.editing.clone()),
+            )
+        }),
+    };
+    let Some((dirty, confirm)) = state else {
         return true;
     };
-    if !form.is_dirty() {
-        app.close_category_form();
+    let confirmed = !dirty || app.awaiting(confirm.clone());
+    if confirmed {
+        match form {
+            OpenForm::Task => app.close_form(),
+            OpenForm::Category => app.close_category_form(),
+        }
         return true;
     }
-    let confirm = Confirm::DiscardCategory(form.editing.clone());
-    if app.awaiting(confirm.clone()) {
-        app.close_category_form();
-        true
-    } else {
-        app.ask_confirm(confirm, source.discard_prompt());
-        false
-    }
+    app.ask_confirm(confirm, source.discard_prompt());
+    false
 }
 
 // ------------------------------------------------------------------ mouse
@@ -1687,7 +1725,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         // A clean editor may yield to the underlying panels. Dirty content
         // stays modal; Esc is the explicit discard path.
         if click_on_panels(app, m) {
-            if !request_close_task_form(app, FormCloseSource::OutsideClick) {
+            if !request_close_form(app, OpenForm::Task, FormCloseSource::OutsideClick) {
                 return;
             }
         } else {
@@ -1697,7 +1735,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
     }
     if app.mode == Mode::CategoryForm {
         if click_on_panels(app, m) {
-            if !request_close_category_form(app, FormCloseSource::OutsideClick) {
+            if !request_close_form(app, OpenForm::Category, FormCloseSource::OutsideClick) {
                 return;
             }
         } else {
@@ -1707,7 +1745,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     .as_ref()
                     .is_some_and(|form| form.description.menu.is_some())
             {
-                match click_category_slash_menu(app, m.column, m.row) {
+                match click_form_slash_menu(app, OpenForm::Category, m.column, m.row) {
                     MenuClick::Handled => return,
                     MenuClick::Miss => {}
                 }
@@ -1733,10 +1771,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                 None
             };
             if let Some(url) = clicked_link {
-                match crate::open::open_url(&url) {
-                    Ok(()) => app.info(format!("Opened {url}")),
-                    Err(error) => app.error(error),
-                }
+                open_link(app, &url);
             }
             return;
         }
@@ -1828,11 +1863,12 @@ fn handle_slash_mouse(app: &mut App, mouse: MouseEvent) {
             if count == 0 {
                 return;
             }
-            if mouse.kind == MouseEventKind::ScrollUp {
-                app.slash_index = (app.slash_index + count - 1) % count;
+            let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                -1
             } else {
-                app.slash_index = (app.slash_index + 1) % count;
-            }
+                1
+            };
+            cycle_index(&mut app.slash_index, count, delta);
         }
         MouseEventKind::Down(MouseButton::Left) => {
             if contains(app.areas.command_bar, mouse.column, mouse.row) {
@@ -1997,7 +2033,7 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
         .as_ref()
         .is_some_and(|f| f.description.menu.is_some())
     {
-        match click_description_slash_menu(app, m.column, m.row) {
+        match click_form_slash_menu(app, OpenForm::Task, m.column, m.row) {
             MenuClick::Handled => return,
             MenuClick::Miss => {
                 // Fall through: place the cursor / change field, menu
@@ -2021,6 +2057,7 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
         };
         // Leaving Due dismisses the calendar so keys go to the new field.
         form.set_field(field);
+        let last_description_click = form.last_description_click.take();
 
         let area = form.areas.rect(field);
         let col = (m.column - area.x) as usize;
@@ -2028,17 +2065,14 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
         match field {
             Field::Title => {
                 form.title.set_cursor_from_col(col);
-                form.last_description_click = None;
                 AfterClick::None
             }
             Field::Due => {
                 form.open_due_picker();
-                form.last_description_click = None;
                 AfterClick::None
             }
             Field::Category => {
                 form.cycle_category(1);
-                form.last_description_click = None;
                 AfterClick::None
             }
             Field::Description => {
@@ -2047,10 +2081,8 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
                 let clicked_link = form.description.link_url_at_position(row as u16, col);
                 let hit = form.description.click(row as u16, col);
                 if !hit {
-                    form.last_description_click = None;
                     AfterClick::None
                 } else if let Some(url) = clicked_link {
-                    form.last_description_click = None;
                     AfterClick::OpenUrl(url)
                 } else if form.description.selected_image().is_some() {
                     // Pictures are letterboxed — only the drawn box counts.
@@ -2059,15 +2091,13 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
                     let line = form.description.cursor_line();
                     if !form.image_hit_at(line, m.column, m.row) {
                         form.description.abandon_image_selection();
-                        form.last_description_click = None;
                         AfterClick::None
                     } else {
                         let now = Instant::now();
-                        let again = form.last_description_click.is_some_and(|(at, last)| {
+                        let again = last_description_click.is_some_and(|(at, last)| {
                             last == line && now.duration_since(at) < DOUBLE_CLICK
                         });
                         if again {
-                            form.last_description_click = None;
                             match form.open_image_preview() {
                                 Some(err) => AfterClick::PreviewErr(err),
                                 None => AfterClick::None,
@@ -2078,23 +2108,18 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
                         }
                     }
                 } else {
-                    form.last_description_click = None;
                     AfterClick::None
                 }
             }
             Field::Importance => {
                 form.cycle_importance();
-                form.last_description_click = None;
                 AfterClick::None
             }
         }
     };
     match after {
         AfterClick::None => {}
-        AfterClick::OpenUrl(url) => match crate::open::open_url(&url) {
-            Ok(()) => app.info(format!("Opened {url}")),
-            Err(err) => app.error(err),
-        },
+        AfterClick::OpenUrl(url) => open_link(app, &url),
         AfterClick::PreviewErr(err) => app.error(err),
     }
 }
@@ -2140,49 +2165,43 @@ fn slash_menu_hit(
     }
 }
 
-/// Hit-test the open description `/` dropdown. Clicking a command row runs it.
-fn click_description_slash_menu(app: &mut App, x: u16, y: u16) -> MenuClick {
-    let hit = match app.form.as_ref() {
-        Some(form) => slash_menu_hit(&form.description, form.description_menu_area, x, y),
-        None => MenuHit::Miss,
+/// Hit-test an open form's description `/` dropdown. Clicking a command row runs it.
+fn click_form_slash_menu(app: &mut App, form_kind: OpenForm, x: u16, y: u16) -> MenuClick {
+    let hit = match form_kind {
+        OpenForm::Task => app.form.as_ref().map_or(MenuHit::Miss, |form| {
+            slash_menu_hit(&form.description, form.description_menu_area, x, y)
+        }),
+        OpenForm::Category => app.category_form.as_ref().map_or(MenuHit::Miss, |form| {
+            slash_menu_hit(&form.description, form.description_menu_area, x, y)
+        }),
     };
     let (index, command) = match hit {
         MenuHit::Miss => return MenuClick::Miss,
         MenuHit::Handled => return MenuClick::Handled,
         MenuHit::Command { index, command } => (index, command),
     };
-    let Some(form) = app.form.as_mut() else {
-        return MenuClick::Miss;
+    let request = match form_kind {
+        OpenForm::Task => {
+            let Some(form) = app.form.as_mut() else {
+                return MenuClick::Miss;
+            };
+            if let Some(menu) = &mut form.description.menu {
+                menu.index = index;
+            }
+            form.before_edit(EditKind::Atomic);
+            form.description.apply(command)
+        }
+        OpenForm::Category => {
+            let Some(form) = app.category_form.as_mut() else {
+                return MenuClick::Miss;
+            };
+            if let Some(menu) = &mut form.description.menu {
+                menu.index = index;
+            }
+            form.before_edit(EditKind::Atomic);
+            form.description.apply(command)
+        }
     };
-    if let Some(menu) = &mut form.description.menu {
-        menu.index = index;
-    }
-    form.before_edit(EditKind::Atomic);
-    let request = form.description.apply(command);
-    if let Some(request) = request {
-        finish_description_command(app, request);
-    }
-    MenuClick::Handled
-}
-
-fn click_category_slash_menu(app: &mut App, x: u16, y: u16) -> MenuClick {
-    let hit = match app.category_form.as_ref() {
-        Some(form) => slash_menu_hit(&form.description, form.description_menu_area, x, y),
-        None => MenuHit::Miss,
-    };
-    let (index, command) = match hit {
-        MenuHit::Miss => return MenuClick::Miss,
-        MenuHit::Handled => return MenuClick::Handled,
-        MenuHit::Command { index, command } => (index, command),
-    };
-    let Some(form) = app.category_form.as_mut() else {
-        return MenuClick::Miss;
-    };
-    if let Some(menu) = &mut form.description.menu {
-        menu.index = index;
-    }
-    form.before_edit(EditKind::Atomic);
-    let request = form.description.apply(command);
     if let Some(request) = request {
         finish_description_command(app, request);
     }
@@ -2202,6 +2221,13 @@ fn clicked_again(app: &mut App, panel: Focus, row: usize) -> bool {
 
 fn contains(area: ratatui::layout::Rect, x: u16, y: u16) -> bool {
     area.contains(ratatui::layout::Position { x, y })
+}
+
+fn open_link(app: &mut App, url: &str) {
+    match crate::open::open_url(url) {
+        Ok(()) => app.info(format!("Opened {url}")),
+        Err(error) => app.error(error),
+    }
 }
 
 #[cfg(test)]
