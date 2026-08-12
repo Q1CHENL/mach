@@ -22,13 +22,12 @@ pub fn handle_event(app: &mut App, event: Event) -> bool {
             true
         }
         Event::Mouse(m)
-            if app.pending.is_some()
-                || matches!(
-                    m.kind,
-                    MouseEventKind::Down(MouseButton::Left)
-                        | MouseEventKind::ScrollUp
-                        | MouseEventKind::ScrollDown
-                ) =>
+            if matches!(
+                m.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+            ) =>
         {
             handle_mouse(app, m);
             true
@@ -599,7 +598,7 @@ fn handle_category_key(app: &mut App, key: KeyEvent) {
 
     match key.code {
         KeyCode::Esc => {
-            let _ = request_close_category_form(app);
+            let _ = request_close_category_form(app, FormCloseSource::Escape);
         }
         KeyCode::Tab | KeyCode::BackTab => {
             if let Some(form) = &mut app.category_form {
@@ -896,7 +895,7 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
 
     match key.code {
         KeyCode::Esc => {
-            let _ = request_close_task_form(app);
+            let _ = request_close_task_form(app, FormCloseSource::Escape);
         }
         KeyCode::Tab => {
             if let Some(form) = &mut app.form {
@@ -1617,9 +1616,24 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FormCloseSource {
+    Escape,
+    OutsideClick,
+}
+
+impl FormCloseSource {
+    const fn discard_prompt(self) -> &'static str {
+        match self {
+            Self::Escape => "Unsaved changes · press Esc again to discard",
+            Self::OutsideClick => "Unsaved changes · press Esc to discard",
+        }
+    }
+}
+
 /// Close a form only when there is no content to lose, or after the same
-/// entity-bound discard action is explicitly confirmed with Esc again.
-fn request_close_task_form(app: &mut App) -> bool {
+/// entity-bound discard action is explicitly confirmed with Esc.
+fn request_close_task_form(app: &mut App, source: FormCloseSource) -> bool {
     let Some(form) = app.form.as_ref() else {
         return true;
     };
@@ -1632,12 +1646,12 @@ fn request_close_task_form(app: &mut App) -> bool {
         app.close_form();
         true
     } else {
-        app.ask_confirm(confirm, "Unsaved changes · press Esc again to discard");
+        app.ask_confirm(confirm, source.discard_prompt());
         false
     }
 }
 
-fn request_close_category_form(app: &mut App) -> bool {
+fn request_close_category_form(app: &mut App, source: FormCloseSource) -> bool {
     let Some(form) = app.category_form.as_ref() else {
         return true;
     };
@@ -1650,7 +1664,7 @@ fn request_close_category_form(app: &mut App) -> bool {
         app.close_category_form();
         true
     } else {
-        app.ask_confirm(confirm, "Unsaved changes · press Esc again to discard");
+        app.ask_confirm(confirm, source.discard_prompt());
         false
     }
 }
@@ -1673,7 +1687,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         // A clean editor may yield to the underlying panels. Dirty content
         // stays modal; Esc is the explicit discard path.
         if click_on_panels(app, m) {
-            if !request_close_task_form(app) {
+            if !request_close_task_form(app, FormCloseSource::OutsideClick) {
                 return;
             }
         } else {
@@ -1683,7 +1697,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
     }
     if app.mode == Mode::CategoryForm {
         if click_on_panels(app, m) {
-            if !request_close_category_form(app) {
+            if !request_close_category_form(app, FormCloseSource::OutsideClick) {
                 return;
             }
         } else {

@@ -2141,7 +2141,7 @@ impl App {
         false
     }
 
-    /// Arm a destructive key on its second press, and say so.
+    /// Arm a destructive action for its explicit confirmation step, and say so.
     pub fn ask_confirm(&mut self, confirm: Confirm, prompt: impl Into<String>) {
         let until = Instant::now() + MessageLifetime::Brief.duration();
         self.set_message_until(prompt.into(), MessageKind::Info, until);
@@ -2346,19 +2346,22 @@ mod tests {
         let mut app = App::with_store("test", store).expect("build app");
 
         app.info("brief info");
-        assert_message_lifetime(&app, Duration::from_secs(2));
+        assert_message_lifetime(&app, MessageLifetime::Brief.duration());
 
         app.ask_confirm(Confirm::Quit, "brief confirmation");
-        assert_message_lifetime(&app, Duration::from_secs(2));
+        assert_message_lifetime(&app, MessageLifetime::Brief.duration());
+
+        app.ask_confirm(Confirm::DiscardTask(None), "brief discard confirmation");
+        assert_message_lifetime(&app, MessageLifetime::Brief.duration());
 
         app.error("standard error");
-        assert_message_lifetime(&app, Duration::from_secs(4));
+        assert_message_lifetime(&app, MessageLifetime::Standard.duration());
 
         app.archive_result("long archive result");
-        assert_message_lifetime(&app, Duration::from_secs(8));
+        assert_message_lifetime(&app, MessageLifetime::Long.duration());
 
         app.show_update_message("long update result".into(), MessageKind::Info);
-        assert_message_lifetime(&app, Duration::from_secs(8));
+        assert_message_lifetime(&app, MessageLifetime::Long.duration());
     }
 
     #[test]

@@ -81,6 +81,18 @@ fn click(app: &mut App, column: u16, row: u16) {
     );
 }
 
+fn release_click(app: &mut App, column: u16, row: u16) {
+    handle_event(
+        app,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+}
+
 fn draw(app: &mut App, width: u16, height: u16) {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
     terminal
@@ -648,9 +660,14 @@ fn click_on_panels_does_not_discard_a_dirty_task_form() {
             modifiers: KeyModifiers::NONE,
         }),
     );
+    release_click(&mut app, 30, 3);
     assert_eq!(app.mode, Mode::TaskForm);
     assert!(app.form.is_some());
-    assert!(message(&app).to_lowercase().contains("unsaved"));
+    assert_eq!(
+        message(&app),
+        "Unsaved changes · press Esc to discard",
+        "an outside click is the first discard request, not a repeated Esc"
+    );
 }
 
 #[test]
@@ -718,7 +735,7 @@ fn click_on_panels_does_not_discard_a_dirty_category_form() {
     );
     assert_eq!(app.mode, Mode::CategoryForm);
     assert!(app.category_form.is_some());
-    assert!(message(&app).to_lowercase().contains("unsaved"));
+    assert_eq!(message(&app), "Unsaved changes · press Esc to discard");
 }
 
 #[test]
@@ -801,7 +818,10 @@ fn escape_requires_confirmation_before_discarding_a_dirty_task_form() {
 
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(app.mode, Mode::TaskForm);
-    assert!(message(&app).contains("again"));
+    assert_eq!(
+        message(&app),
+        "Unsaved changes · press Esc again to discard"
+    );
 
     press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(app.mode, Mode::Normal);
