@@ -42,7 +42,8 @@ rewrite real user data as part of development.
   Store; mutations operate against a fresh snapshot.
 - `src/store.rs`: SQLite schema, validation, migrations, transactions,
   revisions, settings, and attachment metadata.
-- `src/model.rs`: task/category data model, limits, and legacy JSON schema.
+- `src/model.rs`: task, category, and label data model, limits, and legacy JSON
+  schema.
 - `src/input.rs`: keyboard and mouse control paths.
 - `src/ui.rs`: layout, drawing, clipping, overlays, and mouse hit regions.
 - `src/form.rs`, `src/description.rs`, `src/text_input.rs`, `src/undo.rs`:
@@ -95,7 +96,7 @@ rewrite real user data as part of development.
 - Every layout must survive narrow and short terminals without panics,
   underflow, or drawing outside its rectangle.
 - Optional row metadata must consume width only on the row where it is drawn;
-  one task's due date, progress, flags, or future labels must not shorten every
+  one task's due date, progress, flags, or labels must not shorten every
   other title in the list.
 - Completion and selection styling must remain coherent across a task title,
   due date, subtask progress, and flags. Selection must remain readable even
@@ -106,10 +107,9 @@ rewrite real user data as part of development.
 
 ## Implementation and tests
 
-Use TDD for durable behavior: define the contract, add the smallest meaningful
-regression test, confirm that it fails for the intended reason, implement, and
-then run the relevant suite. Do not add tests for trivial spacing, obvious
-wiring, or visual facts that are cheaper and clearer to inspect manually.
+Apply the global TDD rules to durable behavior, using the smallest test layer
+that owns the contract. Do not add tests for trivial spacing, obvious wiring,
+or visual facts that are cheaper and clearer to inspect manually.
 
 Choose the test layer that owns the behavior:
 
@@ -160,7 +160,6 @@ For packaging, installer, updater, dependency, or release changes, also match
 the relevant CI gates:
 
 ```sh
-cargo package --locked
 cargo build --release --locked
 shellcheck install.sh scripts/*.sh
 scripts/test-install.sh
@@ -168,9 +167,10 @@ scripts/test-release.sh
 cargo deny check --hide-inclusion-graph
 ```
 
-Use `cargo package --allow-dirty` only as a local preview when the dirty state
-is understood. It is not release evidence. Release-sensitive work must also be
-checked with Rust 1.90, either locally or in CI.
+Use `cargo package --allow-dirty --locked` only as a local preview while the
+tree is dirty. It is not release evidence. Run `cargo package --locked` from
+the clean release commit, and check release-sensitive work with Rust 1.90
+locally or in CI.
 
 After any edit, inspect the final diff and run `git diff --check`. For a purely
 instructional or prose-only change, this review is normally sufficient unless
@@ -200,14 +200,13 @@ Do not call a release complete until the exact tag and SHA, CI result, GitHub
 assets and `SHA256SUMS`, attestations, crates.io version, and final Git state
 have all been verified.
 
-## Git and documentation
+## Documentation and repository hygiene
 
-- Do not create branches, commits, tags, pushes, PRs, or releases unless the
-  user asks for that specific action. A commit request does not imply a push.
-- Keep commits cohesive and use concise conventional messages that state what
-  changed and which behavior it fixes.
-- Update the README when public installation, commands, persistence, or visible
-  behavior changes. Keep maintainer-only release mechanics in workflows or a
-  dedicated runbook rather than expanding the README into an operations log.
+- Treat the README as a long-lived project entry point, not rolling release
+  notes. Update it only for enduring product positioning, installation entry
+  points, or stable public command and data contracts. Do not append
+  version-specific feature walkthroughs, option inventories, migration notes,
+  color/value lists, or implementation details; those belong in the versioned
+  GitHub release notes and `src/banner.rs::WHATS_NEW`.
 - Never add agent attribution, telemetry, scratch notes, demo databases, or
   local test artifacts to the repository.
