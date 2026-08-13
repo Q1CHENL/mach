@@ -183,6 +183,8 @@ the following:
 
 - update the version in `Cargo.toml` and `Cargo.lock`;
 - replace `src/banner.rs::WHATS_NEW` with real highlights for that version;
+- add `.github/release-notes/v<version>.md` with user-visible highlights and
+  the exact changelog range from the previous release;
 - run the full source, TUI, shell, packaging, and MSRV validation relevant to
   `.github/workflows/release.yml`;
 - ensure the release commit is on `main`, and tag that exact commit as

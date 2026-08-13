@@ -105,10 +105,12 @@ verify_local() {
 verify_github() {
   dist=$1
   release_json=$2
-  expected_draft=$3
-  release_label=$4
+  notes_path=$3
+  expected_draft=$4
+  release_label=$5
   verify_local "$dist"
   [ -f "$release_json" ] || fail "release JSON does not exist: $release_json"
+  [ -s "$notes_path" ] || fail "release notes do not exist or are empty: $notes_path"
 
   jq -e --argjson expected_draft "$expected_draft" '
     .draft == $expected_draft
@@ -122,6 +124,11 @@ verify_github() {
     ])
   ' "$release_json" >/dev/null \
     || fail "GitHub $release_label does not contain exactly the expected release assets"
+
+  expected_body=$(cat "$notes_path")
+  remote_body=$(jq -er '.body // ""' "$release_json")
+  [ "$remote_body" = "$expected_body" ] \
+    || fail "GitHub $release_label notes do not match $notes_path"
 
   for asset in \
     mach-x86_64-unknown-linux-gnu \
@@ -195,17 +202,48 @@ verify_newer() {
   ' || fail "version $candidate must be newer than $published"
 }
 
+verify_notes() {
+  notes_path=$1
+  version=$2
+  previous_version=$3
+  # Match the typographic heading used in the published GitHub notes.
+  # shellcheck disable=SC1112
+  notes_heading='## What’s new'
+  validate_stable_version "$version"
+  verify_newer "$version" "$previous_version"
+  [ -f "$notes_path" ] || fail "release notes do not exist: $notes_path"
+  [ -s "$notes_path" ] || fail "release notes are empty: $notes_path"
+  [ "${notes_path##*/}" = "v${version}.md" ] \
+    || fail "release-notes filename must be v${version}.md"
+
+  first_line=$(awk 'NR == 1 { print; exit }' "$notes_path")
+  [ "$first_line" = "$notes_heading" ] \
+    || fail "release notes must start with: $notes_heading"
+  grep -Eq '^- \*\*[^*]+:\*\* .+' "$notes_path" \
+    || fail 'release notes must contain at least one user-visible highlight'
+
+  changelog="**Full Changelog:** https://github.com/Q1CHENL/mach/compare/v${previous_version}...v${version}"
+  grep -Fqx "$changelog" "$notes_path" \
+    || fail "release notes must contain the exact changelog range from v${previous_version} to v${version}"
+  changelog_count=$(awk '/^\*\*Full Changelog:\*\*/ { count++ } END { print count + 0 }' "$notes_path")
+  [ "$changelog_count" -eq 1 ] \
+    || fail 'release notes must contain exactly one Full Changelog line'
+}
+
+usage="usage: $0 local DIST | notes FILE VERSION PREVIOUS | github DIST RELEASE_JSON NOTES_FILE | github-published DIST RELEASE_JSON NOTES_FILE | crate ARCHIVE VERSION VERSION_JSON | newer VERSION PREVIOUS"
+
 if [ "$#" -lt 2 ]; then
-  fail "usage: $0 local DIST | github DIST RELEASE_JSON | github-published DIST RELEASE_JSON | crate ARCHIVE VERSION VERSION_JSON | newer VERSION PREVIOUS"
+  fail "$usage"
 fi
 
 mode=$1
 shift
 case "$mode:$#" in
   local:1) verify_local "$1" ;;
-  github:2) verify_github "$1" "$2" true draft ;;
-  github-published:2) verify_github "$1" "$2" false release ;;
+  notes:3) verify_notes "$1" "$2" "$3" ;;
+  github:3) verify_github "$1" "$2" "$3" true draft ;;
+  github-published:3) verify_github "$1" "$2" "$3" false release ;;
   crate:3) verify_crate "$1" "$2" "$3" ;;
   newer:2) verify_newer "$1" "$2" ;;
-  *) fail "usage: $0 local DIST | github DIST RELEASE_JSON | github-published DIST RELEASE_JSON | crate ARCHIVE VERSION VERSION_JSON | newer VERSION PREVIOUS" ;;
+  *) fail "$usage" ;;
 esac

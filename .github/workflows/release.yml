@@ -67,6 +67,10 @@ jobs:
               ;;
           esac
           scripts/verify-release.sh newer "$version" "$published_version"
+          scripts/verify-release.sh notes \
+            ".github/release-notes/v${version}.md" \
+            "$version" \
+            "$published_version"
 
       - name: Verify source contract
         run: |
@@ -199,6 +203,8 @@ jobs:
       attestations: write
       contents: write
       id-token: write
+    env:
+      NOTES_FILE: .github/release-notes/v${{ needs.verify.outputs.version }}.md
     steps:
       - name: Check out release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -251,6 +257,7 @@ jobs:
             if [ "$(jq -r '.isDraft' <<< "$release_json")" = true ]; then
               gh release edit "$TAG_NAME" \
                 --draft \
+                --notes-file "$NOTES_FILE" \
                 --title "mach $TAG_NAME"
             else
               published_release=true
@@ -260,7 +267,7 @@ jobs:
               --verify-tag \
               --fail-on-no-commits \
               --draft \
-              --generate-notes \
+              --notes-file "$NOTES_FILE" \
               --title "mach $TAG_NAME"
           fi
 
@@ -289,9 +296,10 @@ jobs:
             > "$RUNNER_TEMP/release.json"
           if [ "$published_release" = true ]; then
             scripts/verify-release.sh github-published \
-              dist "$RUNNER_TEMP/release.json"
+              dist "$RUNNER_TEMP/release.json" "$NOTES_FILE"
           else
-            scripts/verify-release.sh github dist "$RUNNER_TEMP/release.json"
+            scripts/verify-release.sh github \
+              dist "$RUNNER_TEMP/release.json" "$NOTES_FILE"
           fi
           printf 'RELEASE_ID=%s\n' "$release_id" >> "$GITHUB_ENV"
 
@@ -411,17 +419,17 @@ jobs:
           if jq -e '.draft == true' \
             "$RUNNER_TEMP/release-before-publish.json" >/dev/null; then
             scripts/verify-release.sh github \
-              dist "$RUNNER_TEMP/release-before-publish.json"
+              dist "$RUNNER_TEMP/release-before-publish.json" "$NOTES_FILE"
           else
             scripts/verify-release.sh github-published \
-              dist "$RUNNER_TEMP/release-before-publish.json"
+              dist "$RUNNER_TEMP/release-before-publish.json" "$NOTES_FILE"
           fi
 
           gh release edit "$TAG_NAME" --draft=false --latest
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             > "$RUNNER_TEMP/release-after-publish.json"
           scripts/verify-release.sh github-published \
-            dist "$RUNNER_TEMP/release-after-publish.json"
+            dist "$RUNNER_TEMP/release-after-publish.json" "$NOTES_FILE"
           latest_tag="$(gh api \
             "repos/$GITHUB_REPOSITORY/releases/latest" \
             --jq '.tag_name')"

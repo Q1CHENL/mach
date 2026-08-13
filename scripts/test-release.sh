@@ -55,6 +55,38 @@ done
 
 "$verify_release" local "$dist"
 
+notes_dir=${tmpdir}/release-notes
+mkdir -p "$notes_dir"
+notes=${notes_dir}/v0.2.0.md
+# Match the typographic heading used in the published GitHub notes.
+# shellcheck disable=SC1112
+notes_heading='## What’s new'
+{
+  printf '%s\n' "$notes_heading"
+  printf '\n'
+  printf '%s\n' '- **Release notes contract:** Ship user-visible highlights from source control.'
+  printf '\n'
+  printf '%s\n' '**Full Changelog:** https://github.com/Q1CHENL/mach/compare/v0.1.1...v0.2.0'
+} > "$notes"
+
+"$verify_release" notes "$notes" 0.2.0 0.1.1
+expect_failure 'a missing release-notes file' \
+  "$verify_release" notes "${notes_dir}/v0.2.1.md" 0.2.1 0.2.0
+cp "$notes" "${notes_dir}/wrong-name.md"
+expect_failure 'a release-notes filename that does not match the version' \
+  "$verify_release" notes "${notes_dir}/wrong-name.md" 0.2.0 0.1.1
+sed 's/v0\.1\.1\.\.\.v0\.2\.0/v0.1.0...v0.2.0/' "$notes" \
+  > "${notes_dir}/wrong-changelog.md"
+expect_failure 'a release-notes file with the wrong changelog range' \
+  "$verify_release" notes "${notes_dir}/wrong-changelog.md" 0.2.0 0.1.1
+{
+  printf '%s\n' "$notes_heading"
+  printf '\n'
+  printf '%s\n' '**Full Changelog:** https://github.com/Q1CHENL/mach/compare/v0.1.1...v0.2.0'
+} > "${notes_dir}/v0.2.1.md"
+expect_failure 'release notes without a user-visible highlight' \
+  "$verify_release" notes "${notes_dir}/v0.2.1.md" 0.2.1 0.2.0
+
 cp "${dist}/SHA256SUMS" "${tmpdir}/SHA256SUMS.valid"
 awk 'BEGIN { for (i = 0; i < 64; i++) printf "0" }' > "${dist}/SHA256SUMS"
 printf '  mach-x86_64-unknown-linux-gnu\n' >> "${dist}/SHA256SUMS"
@@ -80,30 +112,37 @@ do
     '{name: $name, size: $size, digest: $digest, state: "uploaded"}' \
     >> "$assets"
 done
-jq -s '{draft: true, prerelease: false, assets: .}' "$assets" \
+jq -s --rawfile body "$notes" \
+  '{draft: true, prerelease: false, body: ($body | rtrimstr("\n")), assets: .}' \
+  "$assets" \
   > "${tmpdir}/release.json"
 
-"$verify_release" github "$dist" "${tmpdir}/release.json"
+"$verify_release" github "$dist" "${tmpdir}/release.json" "$notes"
 
 jq '.draft = false' "${tmpdir}/release.json" > "${tmpdir}/published.json"
-"$verify_release" github-published "$dist" "${tmpdir}/published.json"
+"$verify_release" github-published "$dist" "${tmpdir}/published.json" "$notes"
 expect_failure 'an already-published GitHub release' \
-  "$verify_release" github "$dist" "${tmpdir}/published.json"
+  "$verify_release" github "$dist" "${tmpdir}/published.json" "$notes"
+
+jq '.body = "Generated notes replaced the curated release notes."' \
+  "${tmpdir}/release.json" > "${tmpdir}/wrong-body.json"
+expect_failure 'a GitHub release with the wrong notes' \
+  "$verify_release" github "$dist" "${tmpdir}/wrong-body.json" "$notes"
 
 jq '.assets[0].digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
   "${tmpdir}/release.json" > "${tmpdir}/wrong-asset.json"
 expect_failure 'a GitHub asset with the wrong digest' \
-  "$verify_release" github "$dist" "${tmpdir}/wrong-asset.json"
+  "$verify_release" github "$dist" "${tmpdir}/wrong-asset.json" "$notes"
 jq '.draft = false' "${tmpdir}/wrong-asset.json" \
   > "${tmpdir}/wrong-published-asset.json"
 expect_failure 'a published GitHub asset with the wrong digest' \
   "$verify_release" github-published "$dist" \
-  "${tmpdir}/wrong-published-asset.json"
+  "${tmpdir}/wrong-published-asset.json" "$notes"
 
 jq '.assets += [{name: "unexpected", size: 1, digest: "sha256:00", state: "uploaded"}]' \
   "${tmpdir}/release.json" > "${tmpdir}/unexpected-asset.json"
 expect_failure 'an unexpected GitHub release asset' \
-  "$verify_release" github "$dist" "${tmpdir}/unexpected-asset.json"
+  "$verify_release" github "$dist" "${tmpdir}/unexpected-asset.json" "$notes"
 
 crate=${tmpdir}/mach-tui-0.2.0.crate
 printf 'crate fixture\n' > "$crate"
