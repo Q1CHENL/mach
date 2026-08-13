@@ -42,6 +42,20 @@ pub fn caseless_key(value: &str) -> String {
     value.nfkc().default_case_fold().nfkc().collect()
 }
 
+/// Whether `haystack` contains an already-normalized caseless search key.
+pub fn caseless_contains(haystack: &str, folded_needle: &str) -> bool {
+    if folded_needle.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && folded_needle.is_ascii() {
+        return haystack
+            .as_bytes()
+            .windows(folded_needle.len())
+            .any(|window| window.eq_ignore_ascii_case(folded_needle.as_bytes()));
+    }
+    caseless_key(haystack).contains(folded_needle)
+}
+
 /// Sentinel category id for the "All Tasks" view. Not written to disk.
 pub const ALL_CATEGORY: &str = "";
 
@@ -167,6 +181,20 @@ impl Block {
             Self::Image { .. } => false,
         }
     }
+}
+
+/// Whether a task title or textual description block contains a caseless key.
+/// Image attachment identities are storage metadata, not searchable task text.
+pub fn task_text_contains(task: &Task, folded_query: &str) -> bool {
+    caseless_contains(&task.title, folded_query)
+        || task.description.iter().any(|block| match block {
+            Block::Text { text }
+            | Block::Todo { text, .. }
+            | Block::Bullet { text }
+            | Block::Number { text }
+            | Block::Link { url: text } => caseless_contains(text, folded_query),
+            Block::Image { .. } => false,
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

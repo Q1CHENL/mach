@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand, ValueEnum, builder::PossibleValue};
 use serde_json::{Value, json};
 
 use crate::VERSION;
-use crate::model::{Block, Category, Label, LabelColor, Task};
+use crate::model::{Block, Category, Label, LabelColor, Task, caseless_key, task_text_contains};
 use crate::store::{
     CategoryPatch, LabelPatch, PurgeScope, RelativePosition, Store, StoreData, StoreError,
     TaskPatch,
@@ -23,6 +23,7 @@ use crate::store::{
 /// Full CLI reference under `mach --help`.
 const HELP: &str = "\
   list
+    --query QUERY        search titles and descriptions
     -c, --category NAME  only this category
     --label NAME         require label (repeatable; all must match)
     --open               only incomplete
@@ -32,6 +33,8 @@ const HELP: &str = "\
     (no args)            list categories (done/total)
     add NAME
       -d, --description TEXT
+    ensure NAME
+      -d, --description TEXT  create if missing; conflict if different
     edit NAME            rename / set description
       -n, --name NEW
       -d, --description TEXT
@@ -41,6 +44,8 @@ const HELP: &str = "\
   labels
     (no args)            list labels (done/total)
     add NAME [--color COLOR]
+    ensure NAME [--color COLOR]
+                         create if missing; conflict if different
     edit NAME [--name NEW] [--color COLOR]
                          edit label; assignments stay attached
     delete NAME          delete label; tasks stay in place
@@ -148,6 +153,9 @@ struct Cli {
 enum Command {
     /// List tasks
     List {
+        /// Search titles and descriptions
+        #[arg(long = "query", value_name = "QUERY")]
+        query: Option<String>,
         /// Category name / prefix
         #[arg(short = 'c', long = "category", value_name = "NAME")]
         category: Option<String>,
@@ -161,12 +169,12 @@ enum Command {
         #[arg(long)]
         done: bool,
     },
-    /// List / add / edit / delete categories
+    /// List / add / ensure / edit / delete categories
     Categories {
         #[command(subcommand)]
         action: Option<CatAction>,
     },
-    /// List / add / edit / delete labels
+    /// List / add / ensure / edit / delete labels
     Labels {
         #[command(subcommand)]
         action: Option<LabelAction>,
@@ -339,6 +347,14 @@ enum CatAction {
         #[arg(short = 'd', long = "description")]
         description: Option<String>,
     },
+    /// Return an exact-name category, or create it
+    Ensure {
+        /// Exact name identity
+        name: String,
+        /// If the category exists, its description must match or the command conflicts
+        #[arg(short = 'd', long = "description")]
+        description: Option<String>,
+    },
     /// Rename / set description
     Edit {
         /// Current name / prefix
@@ -369,6 +385,14 @@ enum LabelAction {
         /// Name
         name: String,
         /// Logical color (automatically balanced when omitted)
+        #[arg(long, value_enum)]
+        color: Option<LabelColor>,
+    },
+    /// Return an exact-name label, or create it
+    Ensure {
+        /// Exact name identity
+        name: String,
+        /// If the label exists, its color must match or the command conflicts
         #[arg(long, value_enum)]
         color: Option<LabelColor>,
     },
@@ -484,7 +508,9 @@ impl From<StoreError> for CliError {
             StoreError::Database(_) => "database",
             StoreError::UnsupportedLegacySchema { .. }
             | StoreError::UnsupportedDatabaseSchema { .. } => "schema",
-            StoreError::Conflict { .. } | StoreError::StaleEntity { .. } => "conflict",
+            StoreError::Conflict { .. }
+            | StoreError::MetadataConflict { .. }
+            | StoreError::StaleEntity { .. } => "conflict",
             StoreError::NotFound { .. } => "not_found",
             StoreError::Ambiguous { .. } => "ambiguous",
             StoreError::Validation(_) => "validation",
@@ -700,15 +726,27 @@ fn exit_after_write(result: io::Result<()>, intended_code: i32) -> ! {
 fn dispatch(store: &mut Store, command: Command, json_mode: bool) -> Result<Rendered, CliError> {
     match command {
         Command::List {
+            query,
             category,
             labels,
             open,
             done,
-        } => cmd_list(store, category.as_deref(), &labels, open, done, json_mode),
+        } => cmd_list(
+            store,
+            query.as_deref(),
+            category.as_deref(),
+            &labels,
+            open,
+            done,
+            json_mode,
+        ),
         Command::Categories { action } => match action {
             None | Some(CatAction::List) => cmd_categories_list(store, json_mode),
             Some(CatAction::Add { name, description }) => {
                 cmd_category_add(store, &name, description.as_deref(), json_mode)
+            }
+            Some(CatAction::Ensure { name, description }) => {
+                cmd_category_ensure(store, &name, description.as_deref(), json_mode)
             }
             Some(CatAction::Edit {
                 name,
@@ -728,6 +766,9 @@ fn dispatch(store: &mut Store, command: Command, json_mode: bool) -> Result<Rend
         Command::Labels { action } => match action {
             None | Some(LabelAction::List) => cmd_labels_list(store, json_mode),
             Some(LabelAction::Add { name, color }) => cmd_label_add(store, &name, color, json_mode),
+            Some(LabelAction::Ensure { name, color }) => {
+                cmd_label_ensure(store, &name, color, json_mode)
+            }
             Some(LabelAction::Edit {
                 name,
                 new_name,
@@ -1317,12 +1358,18 @@ fn task_line(
 
 fn cmd_list(
     store: &Store,
+    query: Option<&str>,
     category: Option<&str>,
     label_queries: &[String],
     open_only: bool,
     done_only: bool,
     json_mode: bool,
 ) -> Result<Rendered, CliError> {
+    let query = query.map(str::trim);
+    if query.is_some_and(str::is_empty) {
+        return Err(CliError::validation("search query cannot be empty"));
+    }
+    let query_key = query.map(caseless_key);
     let data = store.snapshot()?;
     let category_id = category
         .map(|query| data.resolve_category_id(query))
@@ -1350,6 +1397,11 @@ fn cmd_list(
             } else {
                 true
             }
+        })
+        .filter(|task| {
+            query_key
+                .as_deref()
+                .is_none_or(|query| task_text_contains(task, query))
         })
         .collect();
     let category_names: HashMap<_, _> = data
@@ -1475,6 +1527,34 @@ fn cmd_category_add(
         json_mode,
         || category_json(&category),
         || format!("created category {}\n", terminal_text(&category.name)),
+    ))
+}
+
+fn cmd_category_ensure(
+    store: &mut Store,
+    name: &str,
+    description: Option<&str>,
+    json_mode: bool,
+) -> Result<Rendered, CliError> {
+    let (category, created) = store.ensure_category(name, description.map(str::to_string))?;
+    Ok(rendered(
+        json_mode,
+        || {
+            json!({
+                "created": created,
+                "category": category_json(&category),
+            })
+        },
+        || {
+            if created {
+                format!("created category {}\n", terminal_text(&category.name))
+            } else {
+                format!(
+                    "category {} already exists\n",
+                    terminal_text(&category.name)
+                )
+            }
+        },
     ))
 }
 
@@ -1606,6 +1686,39 @@ fn cmd_label_add(
                 terminal_text(&label.name),
                 label.color
             )
+        },
+    ))
+}
+
+fn cmd_label_ensure(
+    store: &mut Store,
+    name: &str,
+    color: Option<LabelColor>,
+    json_mode: bool,
+) -> Result<Rendered, CliError> {
+    let (label, created) = store.ensure_label(name, color)?;
+    Ok(rendered(
+        json_mode,
+        || {
+            json!({
+                "created": created,
+                "label": label_json(&label),
+            })
+        },
+        || {
+            if created {
+                format!(
+                    "created label #{} ({})\n",
+                    terminal_text(&label.name),
+                    label.color
+                )
+            } else {
+                format!(
+                    "label #{} ({}) already exists\n",
+                    terminal_text(&label.name),
+                    label.color
+                )
+            }
         },
     ))
 }

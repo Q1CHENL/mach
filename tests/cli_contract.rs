@@ -509,6 +509,102 @@ fn task_category_and_subtask_workflow_keeps_one_json_contract() {
 }
 
 #[test]
+fn ensure_commands_create_or_return_exact_name_identities_and_reject_metadata_conflicts() {
+    let dir = TempDir::new("cli-ensure");
+
+    let category = mach(
+        dir.path(),
+        &[
+            "--json",
+            "categories",
+            "ensure",
+            "Café",
+            "--description",
+            "Projects",
+        ],
+    );
+    assert!(category.status.success());
+    let category: serde_json::Value = serde_json::from_slice(&category.stdout).unwrap();
+    assert_eq!(category["created"], true);
+    assert_eq!(category["category"]["name"], "Café");
+    assert_eq!(category["category"]["description"], "Projects");
+    let category_id = category["category"]["id"].as_str().unwrap();
+
+    let category_again = mach(
+        dir.path(),
+        &[
+            "--json",
+            "categories",
+            "ensure",
+            "CAFE\u{301}",
+            "--description",
+            "Projects",
+        ],
+    );
+    assert!(category_again.status.success());
+    let category_again: serde_json::Value = serde_json::from_slice(&category_again.stdout).unwrap();
+    assert_eq!(category_again["created"], false);
+    assert_eq!(category_again["category"]["id"], category_id);
+    assert_eq!(category_again["category"]["name"], "Café");
+
+    let category_conflict = mach(
+        dir.path(),
+        &[
+            "--json",
+            "categories",
+            "ensure",
+            "café",
+            "--description",
+            "Different",
+        ],
+    );
+    assert!(!category_conflict.status.success());
+    let category_conflict: serde_json::Value =
+        serde_json::from_slice(&category_conflict.stdout).unwrap();
+    assert_eq!(category_conflict["kind"], "conflict");
+
+    let label = mach(
+        dir.path(),
+        &["--json", "labels", "ensure", "Maße", "--color", "red"],
+    );
+    assert!(label.status.success());
+    let label: serde_json::Value = serde_json::from_slice(&label.stdout).unwrap();
+    assert_eq!(label["created"], true);
+    assert_eq!(label["label"]["name"], "Maße");
+    assert_eq!(label["label"]["color"], "red");
+    let label_id = label["label"]["id"].as_str().unwrap();
+
+    let label_again = mach(
+        dir.path(),
+        &["--json", "labels", "ensure", "MASSE", "--color", "red"],
+    );
+    assert!(label_again.status.success());
+    let label_again: serde_json::Value = serde_json::from_slice(&label_again.stdout).unwrap();
+    assert_eq!(label_again["created"], false);
+    assert_eq!(label_again["label"]["id"], label_id);
+
+    let label_conflict = mach(
+        dir.path(),
+        &["--json", "labels", "ensure", "masse", "--color", "blue"],
+    );
+    assert!(!label_conflict.status.success());
+    let label_conflict: serde_json::Value = serde_json::from_slice(&label_conflict.stdout).unwrap();
+    assert_eq!(label_conflict["kind"], "conflict");
+
+    assert!(
+        mach(dir.path(), &["labels", "add", "Backend"])
+            .status
+            .success()
+    );
+    let exact_not_prefix = mach(dir.path(), &["--json", "labels", "ensure", "Back"]);
+    assert!(exact_not_prefix.status.success());
+    let exact_not_prefix: serde_json::Value =
+        serde_json::from_slice(&exact_not_prefix.stdout).unwrap();
+    assert_eq!(exact_not_prefix["created"], true);
+    assert_eq!(exact_not_prefix["label"]["name"], "Back");
+}
+
+#[test]
 fn label_crud_preserves_identity_reports_counts_and_only_unassigns_tasks() {
     let dir = TempDir::new("cli-label-crud");
 
@@ -691,6 +787,138 @@ fn repeatable_label_filters_are_conjunctive_and_compose_with_task_filters() {
 
     assert!(bug_only["labels"].is_array());
     assert!(backend_only["labels"].is_array());
+}
+
+#[test]
+fn list_query_searches_task_text_and_composes_with_existing_filters() {
+    let dir = TempDir::new("cli-list-query");
+    for label in ["Bug", "Backend"] {
+        assert!(mach(dir.path(), &["labels", "add", label]).status.success());
+    }
+    for category in ["Work", "Home"] {
+        assert!(
+            mach(dir.path(), &["categories", "add", category])
+                .status
+                .success()
+        );
+    }
+
+    let matching = mach(
+        dir.path(),
+        &[
+            "--json",
+            "add",
+            "Release API",
+            "--description",
+            "Handles Maße correctly",
+            "--category",
+            "Work",
+            "--label",
+            "Bug",
+            "--label",
+            "Backend",
+        ],
+    );
+    assert!(matching.status.success());
+    let matching: serde_json::Value = serde_json::from_slice(&matching.stdout).unwrap();
+
+    let done = mach(
+        dir.path(),
+        &[
+            "--json",
+            "add",
+            "Maße in title",
+            "--category",
+            "Work",
+            "--label",
+            "Bug",
+            "--label",
+            "Backend",
+        ],
+    );
+    let done: serde_json::Value = serde_json::from_slice(&done.stdout).unwrap();
+    assert!(
+        mach(dir.path(), &["done", done["id"].as_str().unwrap()])
+            .status
+            .success()
+    );
+
+    assert!(
+        mach(
+            dir.path(),
+            &[
+                "add",
+                "Home match",
+                "--description",
+                "masse",
+                "--category",
+                "Home",
+                "--label",
+                "Bug",
+                "--label",
+                "Backend",
+            ],
+        )
+        .status
+        .success()
+    );
+    assert!(
+        mach(
+            dir.path(),
+            &[
+                "add",
+                "No text match",
+                "--category",
+                "Work",
+                "--label",
+                "Bug",
+                "--label",
+                "Backend",
+            ],
+        )
+        .status
+        .success()
+    );
+
+    let filtered = mach(
+        dir.path(),
+        &[
+            "--json",
+            "list",
+            "--query",
+            "MASSE",
+            "--category",
+            "Work",
+            "--label",
+            "Bug",
+            "--label",
+            "Backend",
+            "--open",
+        ],
+    );
+    assert!(
+        filtered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&filtered.stdout)
+    );
+    let filtered: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(filtered.as_array().unwrap().len(), 1);
+    assert_eq!(filtered[0]["id"], matching["id"]);
+
+    let title_match = mach(dir.path(), &["--json", "list", "--query", "release"]);
+    let title_match: serde_json::Value = serde_json::from_slice(&title_match.stdout).unwrap();
+    assert_eq!(title_match.as_array().unwrap().len(), 1);
+    assert_eq!(title_match[0]["id"], matching["id"]);
+
+    let label_name_only = mach(dir.path(), &["--json", "list", "--query", "Backend"]);
+    let label_name_only: serde_json::Value =
+        serde_json::from_slice(&label_name_only.stdout).unwrap();
+    assert_eq!(label_name_only, serde_json::json!([]));
+
+    let empty = mach(dir.path(), &["--json", "list", "--query", "   "]);
+    assert!(!empty.status.success());
+    let empty: serde_json::Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(empty["kind"], "validation");
 }
 
 #[test]

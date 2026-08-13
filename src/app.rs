@@ -16,8 +16,8 @@ use crate::form::{CategoryForm, TaskDraft, TaskForm};
 use crate::image::ImageStore;
 use crate::model::{
     ALL_CATEGORY, Category, Label, LabelColor, MAX_CATEGORY_COUNT, MAX_CATEGORY_NAME_LEN,
-    MAX_LABEL_COUNT, MAX_LABEL_NAME_LEN, MAX_TASK_COUNT, MAX_TITLE_LEN, Task, caseless_key,
-    category_name_key,
+    MAX_LABEL_COUNT, MAX_LABEL_NAME_LEN, MAX_TASK_COUNT, MAX_TITLE_LEN, Task, caseless_contains,
+    caseless_key, category_name_key, task_text_contains,
 };
 use crate::settings::{LaunchState, Settings};
 use crate::store::{
@@ -1283,9 +1283,7 @@ impl App {
                 .enumerate()
                 .filter(|(_, t)| {
                     !(hide_done && t.done)
-                        && (contains_ignore_case(&t.title, &q)
-                            || description_contains(t, &q)
-                            || task_labels_contain(t, &self.labels, &q))
+                        && (task_text_contains(t, &q) || task_labels_contain(t, &self.labels, &q))
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -2451,39 +2449,12 @@ impl App {
     }
 }
 
-/// Unicode-caseless contains. `folded_needle` must already be normalized.
-/// ASCII path avoids allocating.
-fn contains_ignore_case(haystack: &str, folded_needle: &str) -> bool {
-    if folded_needle.is_empty() {
-        return true;
-    }
-    if haystack.is_ascii() && folded_needle.is_ascii() {
-        return haystack
-            .as_bytes()
-            .windows(folded_needle.len())
-            .any(|w| w.eq_ignore_ascii_case(folded_needle.as_bytes()));
-    }
-    caseless_key(haystack).contains(folded_needle)
-}
-
-/// Whether any prose or to-do in the description mentions `query`.
-fn description_contains(task: &Task, query: &str) -> bool {
-    task.description.iter().any(|block| match block {
-        crate::model::Block::Text { text }
-        | crate::model::Block::Todo { text, .. }
-        | crate::model::Block::Bullet { text }
-        | crate::model::Block::Number { text }
-        | crate::model::Block::Link { url: text } => contains_ignore_case(text, query),
-        crate::model::Block::Image { .. } => false,
-    })
-}
-
 fn task_labels_contain(task: &Task, labels: &[Label], query: &str) -> bool {
     task.label_ids.iter().any(|id| {
         labels
             .iter()
             .find(|label| label.id == *id)
-            .is_some_and(|label| contains_ignore_case(&label.name, query))
+            .is_some_and(|label| caseless_contains(&label.name, query))
     })
 }
 

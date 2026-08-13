@@ -70,6 +70,11 @@ pub enum StoreError {
         expected: u64,
         actual: u64,
     },
+    MetadataConflict {
+        entity: &'static str,
+        name: String,
+        field: &'static str,
+    },
     StaleEntity {
         entity: &'static str,
         id: String,
@@ -134,6 +139,14 @@ impl std::fmt::Display for StoreError {
             Self::Conflict { expected, actual } => write!(
                 f,
                 "store changed since it was loaded (expected revision {expected}, found {actual})"
+            ),
+            Self::MetadataConflict {
+                entity,
+                name,
+                field,
+            } => write!(
+                f,
+                "{entity} {name:?} already exists with a different {field}"
             ),
             Self::StaleEntity { entity, id } => {
                 write!(f, "{entity} {id:?} changed since it was loaded")
@@ -658,6 +671,37 @@ impl StoreData {
         self.insert_category(category)
     }
 
+    /// Return the category with this exact name identity, or create it.
+    /// Supplied metadata is an assertion and never edits an existing category.
+    pub fn ensure_category(
+        &mut self,
+        name: impl Into<String>,
+        description: Option<String>,
+    ) -> Result<(Category, bool), StoreError> {
+        let name = name.into();
+        let name_key = category_name_key(&name);
+        if let Some(category) = self
+            .categories
+            .iter()
+            .find(|category| category_name_key(&category.name) == name_key)
+        {
+            if description
+                .as_ref()
+                .is_some_and(|description| description != &category.description)
+            {
+                return Err(StoreError::MetadataConflict {
+                    entity: "category",
+                    name: category.name.clone(),
+                    field: "description",
+                });
+            }
+            return Ok((category.clone(), false));
+        }
+
+        let category = self.create_category(name.trim(), description.unwrap_or_default())?;
+        Ok((category, true))
+    }
+
     pub fn insert_category(&mut self, category: Category) -> Result<Category, StoreError> {
         let index = self.categories.len();
         self.categories.push(category);
@@ -734,6 +778,37 @@ impl StoreData {
     pub fn create_label(&mut self, name: impl Into<String>) -> Result<Label, StoreError> {
         let color = LabelColor::least_used(&self.labels);
         self.create_label_with_color(name, color)
+    }
+
+    /// Return the label with this exact name identity, or create it.
+    /// A supplied color is an assertion and never recolors an existing label.
+    pub fn ensure_label(
+        &mut self,
+        name: impl Into<String>,
+        color: Option<LabelColor>,
+    ) -> Result<(Label, bool), StoreError> {
+        let name = name.into();
+        let name_key = label_name_key(&name);
+        if let Some(label) = self
+            .labels
+            .iter()
+            .find(|label| label_name_key(&label.name) == name_key)
+        {
+            if color.is_some_and(|color| color != label.color) {
+                return Err(StoreError::MetadataConflict {
+                    entity: "label",
+                    name: label.name.clone(),
+                    field: "color",
+                });
+            }
+            return Ok((label.clone(), false));
+        }
+
+        let label = match color {
+            Some(color) => self.create_label_with_color(name, color)?,
+            None => self.create_label(name)?,
+        };
+        Ok((label, true))
     }
 
     pub fn create_label_with_color(
@@ -887,6 +962,11 @@ pub struct Store {
     persistent_attachments: bool,
 }
 
+enum TransactionOutcome<R> {
+    Changed(R),
+    Unchanged(R),
+}
+
 impl Store {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
         let paths = Paths::new(expand_user(dir.as_ref().to_path_buf())?);
@@ -968,6 +1048,44 @@ impl Store {
         Ok(self.snapshot()?.settings)
     }
 
+    /// Atomically return an exact-name category or create it. Finding an
+    /// existing match does not write the store or advance its revision.
+    pub fn ensure_category(
+        &mut self,
+        name: impl Into<String>,
+        description: Option<String>,
+    ) -> Result<(Category, bool), StoreError> {
+        let name = name.into();
+        self.update_inner_outcome(None, &[], |data| {
+            let result = data.ensure_category(name, description)?;
+            Ok(if result.1 {
+                TransactionOutcome::Changed(result)
+            } else {
+                TransactionOutcome::Unchanged(result)
+            })
+        })
+        .map(|(result, _)| result)
+    }
+
+    /// Atomically return an exact-name label or create it. Finding an existing
+    /// match does not write the store or advance its revision.
+    pub fn ensure_label(
+        &mut self,
+        name: impl Into<String>,
+        color: Option<LabelColor>,
+    ) -> Result<(Label, bool), StoreError> {
+        let name = name.into();
+        self.update_inner_outcome(None, &[], |data| {
+            let result = data.ensure_label(name, color)?;
+            Ok(if result.1 {
+                TransactionOutcome::Changed(result)
+            } else {
+                TransactionOutcome::Unchanged(result)
+            })
+        })
+        .map(|(result, _)| result)
+    }
+
     pub fn save_settings(&mut self, settings: &Settings) -> Result<(), StoreError> {
         self.update(|data| {
             data.replace_settings(settings.clone())?;
@@ -1027,6 +1145,17 @@ impl Store {
         staged_attachments: &[StagedAttachment],
         operation: impl FnOnce(&mut StoreData) -> Result<R, StoreError>,
     ) -> Result<(R, StoreData), StoreError> {
+        self.update_inner_outcome(expected_revision, staged_attachments, |data| {
+            operation(data).map(TransactionOutcome::Changed)
+        })
+    }
+
+    fn update_inner_outcome<R>(
+        &mut self,
+        expected_revision: Option<u64>,
+        staged_attachments: &[StagedAttachment],
+        operation: impl FnOnce(&mut StoreData) -> Result<TransactionOutcome<R>, StoreError>,
+    ) -> Result<(R, StoreData), StoreError> {
         let images_root = self
             .persistent_attachments
             .then(|| self.paths.images.clone());
@@ -1046,26 +1175,30 @@ impl Store {
                 });
             }
             let mut data = before.clone();
-            let result = operation(&mut data)?;
-            import_task_description_attachments(
-                &mut data,
-                images_root.as_deref(),
-                staged_attachments,
-                &mut installed_attachments,
-            )?;
-            prune_unreferenced_attachments(&mut data);
-            normalize_and_validate(
-                &mut data,
-                Local::now().naive_local(),
-                DueMode::NewWrite,
-                AttachmentMode::Persisted,
-            )?;
-            let next_revision = base_revision
-                .checked_add(1)
-                .ok_or_else(|| StoreError::Corrupt("revision overflow".into()))?;
-            data.revision = next_revision;
-            persist_diff(&tx, &before, &data)?;
-            Ok((result, data))
+            match operation(&mut data)? {
+                TransactionOutcome::Unchanged(result) => Ok((result, before)),
+                TransactionOutcome::Changed(result) => {
+                    import_task_description_attachments(
+                        &mut data,
+                        images_root.as_deref(),
+                        staged_attachments,
+                        &mut installed_attachments,
+                    )?;
+                    prune_unreferenced_attachments(&mut data);
+                    normalize_and_validate(
+                        &mut data,
+                        Local::now().naive_local(),
+                        DueMode::NewWrite,
+                        AttachmentMode::Persisted,
+                    )?;
+                    let next_revision = base_revision
+                        .checked_add(1)
+                        .ok_or_else(|| StoreError::Corrupt("revision overflow".into()))?;
+                    data.revision = next_revision;
+                    persist_diff(&tx, &before, &data)?;
+                    Ok((result, data))
+                }
+            }
         })();
 
         let prepared = match prepared {

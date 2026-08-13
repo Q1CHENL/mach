@@ -129,6 +129,64 @@ fn revision_increments_once_per_commit_and_not_on_failure() {
 }
 
 #[test]
+fn ensure_only_advances_the_revision_when_it_creates_an_entity() {
+    let dir = TempDir::new("store-ensure-revision");
+    let mut store = Store::open(dir.path()).expect("open store");
+
+    let (category, created) = store
+        .ensure_category("Café", Some("Projects".to_string()))
+        .expect("create category");
+    assert!(created);
+    assert_eq!(store.revision().unwrap(), 1);
+
+    let (same_category, created) = store
+        .ensure_category("CAFE\u{301}", None)
+        .expect("return category");
+    assert!(!created);
+    assert_eq!(same_category.id, category.id);
+    assert_eq!(store.revision().unwrap(), 1);
+
+    let error = store
+        .ensure_category("café", Some("Different".to_string()))
+        .expect_err("conflicting description");
+    assert!(matches!(
+        error,
+        StoreError::MetadataConflict {
+            entity: "category",
+            field: "description",
+            ..
+        }
+    ));
+    assert_eq!(store.revision().unwrap(), 1);
+
+    let (label, created) = store
+        .ensure_label("Maße", Some(LabelColor::Red))
+        .expect("create label");
+    assert!(created);
+    assert_eq!(store.revision().unwrap(), 2);
+
+    let (same_label, created) = store
+        .ensure_label("MASSE", Some(LabelColor::Red))
+        .expect("return label");
+    assert!(!created);
+    assert_eq!(same_label.id, label.id);
+    assert_eq!(store.revision().unwrap(), 2);
+
+    let error = store
+        .ensure_label("masse", Some(LabelColor::Blue))
+        .expect_err("conflicting color");
+    assert!(matches!(
+        error,
+        StoreError::MetadataConflict {
+            entity: "label",
+            field: "color",
+            ..
+        }
+    ));
+    assert_eq!(store.revision().unwrap(), 2);
+}
+
+#[test]
 fn editing_one_task_does_not_rewrite_unchanged_rows() {
     let dir = TempDir::new("incremental-task-write");
     let mut store = Store::open(dir.path()).unwrap();

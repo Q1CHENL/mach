@@ -100,7 +100,9 @@ impl ArchiveError {
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Cancelled => "cancelled",
-            Self::Conflict(_) | Self::Store(StoreError::Conflict { .. }) => "conflict",
+            Self::Conflict(_)
+            | Self::Store(StoreError::Conflict { .. })
+            | Self::Store(StoreError::MetadataConflict { .. }) => "conflict",
             Self::Io { .. } | Self::Store(StoreError::Io { .. }) => "io",
             Self::Store(StoreError::Database(_)) => "database",
             Self::Store(StoreError::UnsupportedLegacySchema { .. })
