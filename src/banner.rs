@@ -15,16 +15,16 @@ pub const BANNER_WIDTH: u16 = 35;
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
     (
-        "Description, everywhere",
-        "CLI and JSON now use description (-d replaces -b; due dates use --due), with numbered lists and links.",
+        "Reusable labels",
+        "Create labels once, assign several to a task, and manage them from the TUI or CLI.",
     ),
     (
-        "Mixed clipboard paste",
-        "Task descriptions paste clipboard text and images together; category descriptions keep text only.",
+        "Your colors",
+        "Choose label colors from the editor palette; badges stay readable across themes and completed tasks.",
     ),
     (
-        "Safer editing",
-        "Outside clicks keep drafts, and Esc confirmations stay visible long enough to act.",
+        "Labels everywhere",
+        "Search tasks by label, combine CLI label filters, and preserve assignments in JSON archives.",
     ),
 ];
 

@@ -1,6 +1,6 @@
 [package]
 name = "mach-tui"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.90"
 description = "A terminal-first task manager for people who live in the shell and work with agents"
