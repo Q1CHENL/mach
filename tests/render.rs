@@ -325,6 +325,34 @@ fn draws_labels_manager_and_task_label_picker_at_supported_sizes() {
 }
 
 #[test]
+fn task_form_overlays_replace_overlapped_description_images_with_a_marker() {
+    for field in [mach::form::Field::Labels, mach::form::Field::Due] {
+        let mut app = sample_app();
+        app.create_label("bug").unwrap();
+        app.tasks[0].description = vec![
+            Block::text("one"),
+            Block::text("two"),
+            Block::image("missing.png"),
+        ];
+        app.rebuild_view();
+        app.open_edit_task();
+
+        let form = app.form.as_mut().unwrap();
+        match field {
+            mach::form::Field::Labels => form.open_label_picker(),
+            mach::form::Field::Due => form.open_due_picker(),
+            _ => unreachable!(),
+        }
+
+        let screen = render(&mut app, 140, 50);
+        assert!(
+            screen.contains("[image]"),
+            "{field:?} overlay must hide the image protocol it covers:\n{screen}"
+        );
+    }
+}
+
+#[test]
 fn narrow_side_preview_uses_a_stacked_in_place_editor() {
     let mut app = sample_app();
     app.settings.preview_position = "right".into();

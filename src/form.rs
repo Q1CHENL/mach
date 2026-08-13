@@ -359,9 +359,6 @@ pub struct TaskForm {
     pub label_picker: Option<LabelPicker>,
     /// Last description click (line index), for double-click to open a picture.
     pub last_description_click: Option<(Instant, usize)>,
-    /// Whether the `/` menu was open last frame — used to re-emit images
-    /// after the menu is dismissed (see `ui::draw_description`).
-    pub menu_was_open: bool,
     /// Description scroll after last paint — scroll changes need the same protocol
     /// drop as menu close so pictures that shrink/move do not ghost.
     pub description_scroll: usize,
@@ -371,6 +368,9 @@ pub struct TaskForm {
     /// Clicks only select a picture when they land inside this rect — not the
     /// full-width letterbox gutter.
     pub image_hits: Vec<(usize, Rect)>,
+    /// Overlay rectangles that occluded description images last frame.
+    /// Changes require graphics placements to be emitted again.
+    pub(crate) image_occlusions: Vec<Rect>,
     pub(crate) image_layout: Vec<(std::path::PathBuf, u16, u16)>,
     history: History<TaskSnap>,
     initial: TaskDraft,
@@ -414,10 +414,10 @@ impl TaskForm {
             picker: None,
             label_picker: None,
             last_description_click: None,
-            menu_was_open: false,
             description_scroll: 0,
             description_menu_area: None,
             image_hits: Vec::new(),
+            image_occlusions: Vec::new(),
             image_layout: Vec::new(),
             history: History::new(),
             initial: TaskDraft::default(),

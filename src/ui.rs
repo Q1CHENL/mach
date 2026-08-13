@@ -373,7 +373,9 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
         description_box,
     );
     form.areas.description = box_inner;
-    draw_description(f, form, store, theme, box_inner, focused);
+    let overlay = f.area();
+    let image_occlusion = task_form_image_occlusion(form, overlay);
+    draw_description(f, form, store, theme, box_inner, focused, image_occlusion);
     scrollbar(
         f,
         theme,
@@ -405,7 +407,6 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
 
     // Drawn last so it sits over the description box below it.
     // Picker/image lightbox use the full frame so they are not clipped.
-    let overlay = f.area();
     if let Some(picker) = form.picker.as_mut() {
         draw_due_picker(f, theme, picker, form.areas.due, overlay);
     }
@@ -545,7 +546,7 @@ fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         ..
     } = app;
     if let Some(paint) = preview_form.as_mut() {
-        draw_description(f, paint, store, theme, description_area, false);
+        draw_description(f, paint, store, theme, description_area, false, None);
         if paint.description.content_height() > usize::from(description_area.height)
             && description_area.height > 0
         {
@@ -703,13 +704,14 @@ fn draw_description(
     theme: &Theme,
     area: Rect,
     focused: bool,
+    external_occlusion: Option<Rect>,
 ) {
     let crate::form::TaskForm {
         description,
-        menu_was_open,
         description_scroll,
         description_menu_area,
         image_hits,
+        image_occlusions,
         image_layout,
         ..
     } = form;
@@ -720,11 +722,12 @@ fn draw_description(
         theme,
         area,
         focused,
-        menu_was_open,
         description_scroll,
         description_menu_area,
         image_hits,
+        image_occlusions,
         image_layout,
+        external_occlusion,
     );
 }
 
@@ -736,13 +739,13 @@ fn draw_block_editor(
     theme: &Theme,
     area: Rect,
     focused: bool,
-    menu_was_open: &mut bool,
     previous_scroll: &mut usize,
     menu_area: &mut Option<Rect>,
     image_hits: &mut Vec<(usize, Rect)>,
+    previous_image_occlusions: &mut Vec<Rect>,
     previous_image_layout: &mut Vec<(std::path::PathBuf, u16, u16)>,
+    external_occlusion: Option<Rect>,
 ) {
-    let menu_open = editor.menu.is_some();
     if editor.is_empty() && editor.menu.is_none() {
         render_or_placeholder(f, area, "", "Press / for commands", theme);
     }
@@ -755,24 +758,28 @@ fn draw_block_editor(
             crate::description::Painted::Text { .. } => None,
         })
         .collect();
-    // Graphics protocols ignore cell Clear. Drop placements when the `/`
-    // menu closes or an image moves/disappears so the next get re-emits
-    // cleanly. Pixels stay in RAM — encode only.
-    if (*menu_was_open && !menu_open)
+    let menu_rect = slash_menu_rect(editor, area, cursor);
+    *menu_area = menu_rect;
+    let image_occlusions = [menu_rect, external_occlusion]
+        .into_iter()
+        .flatten()
+        .filter(|rect| rect.width > 0 && rect.height > 0 && rects_overlap(*rect, area))
+        .collect::<Vec<_>>();
+    // Graphics protocols ignore cell Clear. Drop placements when overlays,
+    // scrolling, or image geometry changes so the next get re-emits cleanly.
+    // Decoded pixels stay in RAM; only the terminal encoding is rebuilt.
+    if *previous_image_occlusions != image_occlusions
         || *previous_scroll != scroll
         || *previous_image_layout != image_layout
     {
         store.clear_cache();
         f.render_widget(Clear, area);
     }
-    *menu_was_open = menu_open;
+    *previous_image_occlusions = image_occlusions.clone();
     *previous_scroll = scroll;
     *previous_image_layout = image_layout;
-    // Only hide images the dropdown actually covers. Graphics protocols
-    // cannot be "punched" cleanly, so an overlapping image becomes a
-    // compact marker; anything the menu does not touch stays real.
-    let menu_rect = slash_menu_rect(editor, area, cursor);
-    *menu_area = menu_rect;
+    // Only hide images an overlay actually covers. Graphics protocols cannot
+    // be "punched" cleanly, so an overlapping image becomes a compact marker.
     image_hits.clear();
     for placed in blocks {
         match &placed.block {
@@ -782,7 +789,9 @@ fn draw_block_editor(
                     height: placed.rows,
                     ..area
                 };
-                let covered = menu_rect.is_some_and(|m| rects_overlap(m, row));
+                let covered = image_occlusions
+                    .iter()
+                    .any(|occlusion| rects_overlap(*occlusion, row));
                 // Frame + type label only while the description field owns focus
                 // and the cursor is on this picture — not when the dialog
                 // opens on Title with the cursor still sitting on line 0.
@@ -1100,6 +1109,35 @@ fn draw_slash_menu(
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
+fn task_form_image_occlusion(form: &crate::form::TaskForm, area: Rect) -> Option<Rect> {
+    if form.picker.is_some() {
+        Some(due_picker_rect(form.areas.due, area))
+    } else if form.label_picker_open() {
+        let total_rows = form.label_choices().count().saturating_add(1);
+        Some(label_picker_rect(total_rows, form.areas.labels, area))
+    } else {
+        None
+    }
+}
+
+const DUE_PICKER_CAL_COLS: u16 = 21;
+const DUE_PICKER_HEIGHT: u16 = 13;
+
+fn due_picker_rect(field: Rect, area: Rect) -> Rect {
+    let width = (DUE_PICKER_CAL_COLS + 2).max(field.width).min(area.width);
+    let below = field.bottom();
+    Rect {
+        x: field.x.min(area.right().saturating_sub(width)),
+        y: if area.bottom().saturating_sub(below) >= DUE_PICKER_HEIGHT {
+            below
+        } else {
+            field.y.saturating_sub(DUE_PICKER_HEIGHT)
+        },
+        width,
+        height: DUE_PICKER_HEIGHT,
+    }
+}
+
 /// Calendar + clock, dropped under the due field. Date and time are both
 /// set here — the Due field itself is not typed into.
 fn draw_due_picker(
@@ -1123,22 +1161,7 @@ fn draw_due_picker(
     // Monthly needs 21 columns (` Su Mo …` / 7×3-wide day cells). Borders
     // add 2; keep the panel at least that wide so headers and days line up,
     // even when the Due field itself is narrower.
-    const CAL_COLS: u16 = 21;
-    let width = (CAL_COLS + 2).max(field.width).min(area.width);
-    // Borders (2) + calendar (8) + blank (1) + clock (1) + title_bottom row.
-    let height = 13;
-    let below = field.bottom(); // flush under Due — field already includes its border
-    let rect = Rect {
-        // Left-align with the Due field's outer box.
-        x: field.x.min(area.right().saturating_sub(width)),
-        y: if area.bottom().saturating_sub(below) >= height {
-            below
-        } else {
-            field.y.saturating_sub(height)
-        },
-        width,
-        height,
-    };
+    let rect = due_picker_rect(field, area);
     let block = Block::bordered()
         .border_type(BorderType::Thick)
         .border_style(theme.accent_text())
@@ -1157,11 +1180,11 @@ fn draw_due_picker(
     ])
     .areas(inner);
     let cal_area = Rect {
-        width: CAL_COLS.min(cal_area.width),
+        width: DUE_PICKER_CAL_COLS.min(cal_area.width),
         ..cal_area
     };
     let time_area = Rect {
-        width: CAL_COLS.min(time_area.width),
+        width: DUE_PICKER_CAL_COLS.min(time_area.width),
         ..time_area
     };
 
@@ -1230,6 +1253,32 @@ fn draw_due_picker(
 
 /// Bounded, scrolling task-label selector. Selection changes remain in the
 /// task draft; dismissing the overlay does not save the form.
+fn label_picker_rect(total_rows: usize, field: Rect, area: Rect) -> Rect {
+    let desired_rows = total_rows.clamp(1, 8) as u16;
+    let desired_height = desired_rows.saturating_add(2).min(area.height);
+    let width = field.width.min(area.width);
+    let below = field.bottom();
+    let below_space = area.bottom().saturating_sub(below);
+    let above_space = field.y.saturating_sub(area.y);
+    let place_below = below_space >= 3 || below_space >= above_space;
+    let available_height = if place_below {
+        below_space
+    } else {
+        above_space
+    };
+    let height = desired_height.min(available_height);
+    Rect {
+        x: field.x.min(area.right().saturating_sub(width)),
+        y: if place_below {
+            below
+        } else {
+            field.y.saturating_sub(height)
+        },
+        width,
+        height,
+    }
+}
+
 fn draw_label_picker(
     f: &mut Frame,
     theme: &Theme,
@@ -1248,29 +1297,8 @@ fn draw_label_picker(
         .map(|picker| picker.index)
         .unwrap_or_default()
         .min(total_rows.saturating_sub(1));
-    let desired_rows = total_rows.clamp(1, 8) as u16;
-    let desired_height = desired_rows.saturating_add(2).min(area.height);
-    let width = field.width.min(area.width);
-    let below = field.bottom();
-    let below_space = area.bottom().saturating_sub(below);
-    let above_space = field.y.saturating_sub(area.y);
-    let place_below = below_space >= 3 || below_space >= above_space;
-    let available_height = if place_below {
-        below_space
-    } else {
-        above_space
-    };
-    let height = desired_height.min(available_height);
-    let rect = Rect {
-        x: field.x.min(area.right().saturating_sub(width)),
-        y: if place_below {
-            below
-        } else {
-            field.y.saturating_sub(height)
-        },
-        width,
-        height,
-    };
+    let rect = label_picker_rect(total_rows, field, area);
+    let width = rect.width;
     let footer = if let Some(error) = &form.error {
         Line::styled(
             format!(" {} ", truncate(error, width.saturating_sub(4) as usize)),
