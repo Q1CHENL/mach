@@ -186,29 +186,6 @@ fn search_uses_the_same_unicode_caseless_identity_as_typeahead_and_categories() 
 }
 
 #[test]
-fn search_matches_assigned_label_names_with_or_without_the_display_hash() {
-    let mut app = setup();
-    let release = app.create_label("Release").expect("create label");
-    let task = app
-        .create_task(&TaskDraft {
-            title: "opaque title".into(),
-            label_ids: vec![release.clone()],
-            ..TaskDraft::default()
-        })
-        .expect("create labelled task");
-
-    for query in ["release", "#RELEASE"] {
-        app.start_search(query);
-        assert_eq!(app.task_count(), 1, "query {query:?}");
-        assert_eq!(app.selected_task().unwrap().id, task);
-        app.end_search();
-    }
-
-    app.start_search("##release");
-    assert_eq!(app.task_count(), 0, "only one display prefix is optional");
-}
-
-#[test]
 fn filters_by_category_and_sorts_as_configured() {
     let mut app = setup();
 

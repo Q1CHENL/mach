@@ -1278,11 +1278,6 @@ impl App {
         let hide_done = self.settings.hide_done;
         let candidates: Vec<usize> = if self.searching {
             let q = caseless_key(&self.search_query);
-            let label_query = self
-                .search_query
-                .strip_prefix('#')
-                .unwrap_or(&self.search_query);
-            let label_q = caseless_key(label_query);
             self.tasks
                 .iter()
                 .enumerate()
@@ -1290,7 +1285,7 @@ impl App {
                     !(hide_done && t.done)
                         && (contains_ignore_case(&t.title, &q)
                             || description_contains(t, &q)
-                            || task_labels_contain(t, &self.labels, &label_q))
+                            || task_labels_contain(t, &self.labels, &q))
                 })
                 .map(|(i, _)| i)
                 .collect()
