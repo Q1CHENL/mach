@@ -1797,11 +1797,19 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let chrome_focus = focused && !app.mode.command_bar_focused();
     let block = panel("Categories", chrome_focus, theme);
     let inner = block.inner(area);
-    app.areas.sidebar = inner;
     if inner.height == 0 || inner.width == 0 {
         f.render_widget(block, area);
         return;
     }
+
+    let (list_area, hint_area) = if chrome_focus && inner.height > 1 {
+        let [list_area, hint_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+        (list_area, Some(hint_area))
+    } else {
+        (inner, None)
+    };
+    app.areas.sidebar = list_area;
 
     let width = inner.width as usize;
     // `done/total` per category, right-aligned to the widest score.
@@ -1834,18 +1842,34 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let rows = items.len();
 
     app.cat_state.select(Some(app.cat_index));
-    let list = List::new(items).block(block).highlight_style(if focused {
+    let list = List::new(items).highlight_style(if focused {
         theme.selection()
     } else {
         theme.selection_unfocused()
     });
-    f.render_stateful_widget(list, area, &mut app.cat_state);
+    f.render_widget(block, area);
+    f.render_stateful_widget(list, list_area, &mut app.cat_state);
+    if let Some(hint_area) = hint_area {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "⌥↑↓ reorder",
+                Style::new().fg(theme.muted_color()),
+            )))
+            .right_aligned(),
+            hint_area,
+        );
+    }
+
+    let scrollbar_area = Rect {
+        height: list_area.height.saturating_add(2).min(area.height),
+        ..area
+    };
     scrollbar(
         f,
         theme,
-        area,
+        scrollbar_area,
         rows,
-        inner.height as usize,
+        list_area.height as usize,
         app.cat_state.offset(),
         chrome_focus,
     );
