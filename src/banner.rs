@@ -24,7 +24,7 @@ pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
     ),
     (
         "Cleaner task views",
-        "Hidden-completed views show open counts, and form pickers no longer leave artifacts over images.",
+        "Label names render as entered, hidden-completed views show open counts, and overlays no longer corrupt images.",
     ),
 ];
 
