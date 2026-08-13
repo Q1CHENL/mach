@@ -89,7 +89,7 @@ impl SlashCommand {
         match self {
             Self::Search => "search tasks by text or label",
             Self::Settings => "sort, theme, date, preview",
-            Self::Labels => "create, rename, delete labels",
+            Self::Labels => "create, color, rename, delete labels",
             Self::Help => "key reference",
             Self::WhatsNew => "release highlights",
             Self::CopyTitle => "copy task title",

@@ -89,8 +89,10 @@ fn paste_text(app: &mut App, text: &str) {
             app.update_search();
         }
         Mode::Labels => {
-            if let Some((_, input)) = &mut app.label_input {
-                input.insert_str(text);
+            if let Some(editor) = &mut app.label_editor
+                && !editor.color_focused
+            {
+                editor.name.insert_str(text);
                 app.label_error = None;
                 app.dirty = true;
             }
@@ -1719,18 +1721,39 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_labels_key(app: &mut App, key: KeyEvent) {
-    if app.label_input.is_some() {
+    if app.label_editor.is_some() {
         match key.code {
-            KeyCode::Esc => app.cancel_label_input(),
-            KeyCode::Enter => app.submit_label_input(),
+            KeyCode::Esc => app.cancel_label_editor(),
+            KeyCode::Enter => app.submit_label_editor(),
             KeyCode::Char('s') | KeyCode::Char('S')
                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                app.submit_label_input()
+                app.submit_label_editor()
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(editor) = &mut app.label_editor {
+                    editor.color_focused = !editor.color_focused;
+                }
+                app.label_error = None;
+                app.dirty = true;
+            }
+            KeyCode::Left | KeyCode::Right
+                if app
+                    .label_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.color_focused) =>
+            {
+                if let Some(editor) = &mut app.label_editor {
+                    editor.move_color(if key.code == KeyCode::Left { -1 } else { 1 });
+                }
+                app.label_error = None;
+                app.dirty = true;
             }
             _ => {
-                if let Some((_, input)) = &mut app.label_input {
-                    edit_line(input, key);
+                if let Some(editor) = &mut app.label_editor
+                    && !editor.color_focused
+                {
+                    edit_line(&mut editor.name, key);
                 }
                 app.label_error = None;
                 app.dirty = true;
@@ -2031,7 +2054,30 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
 }
 
 fn handle_labels_mouse(app: &mut App, mouse: MouseEvent) {
-    if app.label_input.is_some() || mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+    if app.label_editor.is_some() {
+        let swatch = app
+            .areas
+            .label_color_hits
+            .iter()
+            .find(|(_, area)| contains(*area, mouse.column, mouse.row))
+            .map(|(color, _)| *color);
+        if let Some(editor) = &mut app.label_editor {
+            if let Some(color) = swatch {
+                editor.color = color;
+                editor.color_focused = true;
+                app.label_error = None;
+                app.dirty = true;
+            } else if contains(app.areas.label_name_input, mouse.column, mouse.row) {
+                editor.color_focused = false;
+                editor.name.set_cursor_from_col(
+                    mouse.column.saturating_sub(app.areas.label_name_input.x) as usize,
+                );
+                app.dirty = true;
+            }
+        }
         return;
     }
     let Some(row) = app

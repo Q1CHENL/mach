@@ -473,10 +473,10 @@ fn external_refresh_waits_while_the_label_manager_owns_an_edit() {
     pair.app.open_labels();
     pair.app.begin_new_label();
     pair.app
-        .label_input
+        .label_editor
         .as_mut()
         .unwrap()
-        .1
+        .name
         .insert_str("typed draft");
     pair.external
         .update(|data| {
@@ -487,7 +487,7 @@ fn external_refresh_waits_while_the_label_manager_owns_an_edit() {
 
     assert!(!pair.app.poll_external_changes());
     assert_eq!(
-        pair.app.label_input.as_ref().unwrap().1.value(),
+        pair.app.label_editor.as_ref().unwrap().name.value(),
         "typed draft"
     );
     assert!(pair.app.labels.is_empty());

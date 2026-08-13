@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use mach::model::{Category, Task};
-use mach::store::{PurgeScope, RelativePosition, Store, StoreError, TaskPatch};
+use mach::model::{Category, LabelColor, Task};
+use mach::store::{LabelPatch, PurgeScope, RelativePosition, Store, StoreError, TaskPatch};
 use sha2::{Digest, Sha256};
 
 mod common;
@@ -381,8 +381,8 @@ fn label_identity_key_is_persisted_enforced_and_verified() {
     assert_eq!(stored_key, mach::model::label_name_key("Maße"));
 
     let duplicate = connection.execute(
-        "INSERT INTO labels(id, position, name, name_key)
-         VALUES ('duplicate', 1, 'MASSE', ?1)",
+        "INSERT INTO labels(id, position, name, name_key, color)
+         VALUES ('duplicate', 1, 'MASSE', ?1, 'red')",
         [&stored_key],
     );
     assert!(
@@ -405,6 +405,47 @@ fn label_identity_key_is_persisted_enforced_and_verified() {
 }
 
 #[test]
+fn label_color_is_persisted_constrained_and_verified() {
+    let dir = TempDir::new("label-color-storage");
+    let mut store = Store::open(dir.path()).expect("open store");
+    let label = store
+        .update(|data| data.create_label_with_color("Bug", LabelColor::Purple))
+        .expect("create colored label");
+    let connection = rusqlite::Connection::open(store.database_path()).unwrap();
+    let stored_color: String = connection
+        .query_row(
+            "SELECT color FROM labels WHERE id = ?1",
+            [&label.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_color, "purple");
+
+    let invalid = connection.execute(
+        "UPDATE labels SET color = 'violet' WHERE id = ?1",
+        [&label.id],
+    );
+    assert!(invalid.is_err(), "SQLite must reject unknown label colors");
+
+    connection
+        .pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE labels SET color = 'violet' WHERE id = ?1",
+            [&label.id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = store
+        .snapshot()
+        .expect_err("an unknown persisted color is corruption");
+    assert!(matches!(error, StoreError::Corrupt(_)));
+    assert!(error.to_string().contains("unknown color"));
+}
+
+#[test]
 fn label_rename_preserves_identity_and_delete_only_unassigns() {
     let dir = TempDir::new("label-lifecycle");
     let mut store = Store::open(dir.path()).expect("open store");
@@ -419,6 +460,11 @@ fn label_rename_preserves_identity_and_delete_only_unassigns() {
         .expect("create and assign labels");
 
     let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.label(&first_id).unwrap().color, LabelColor::Red);
+    assert_eq!(
+        snapshot.label(&second_id).unwrap().color,
+        LabelColor::Orange
+    );
     assert_eq!(
         snapshot.task(&task_id).unwrap().label_ids,
         vec![first_id.clone(), second_id.clone()],
@@ -426,9 +472,18 @@ fn label_rename_preserves_identity_and_delete_only_unassigns() {
     );
 
     let renamed = store
-        .update(|data| data.edit_label(&first_id, "server"))
-        .expect("rename label");
+        .update(|data| {
+            data.edit_label(
+                &first_id,
+                LabelPatch {
+                    name: Some("server".into()),
+                    color: Some(LabelColor::Purple),
+                },
+            )
+        })
+        .expect("edit label name and color atomically");
     assert_eq!(renamed.id, first_id);
+    assert_eq!(renamed.color, LabelColor::Purple);
     assert_eq!(
         store.snapshot().unwrap().task(&task_id).unwrap().label_ids[0],
         first_id
@@ -442,6 +497,43 @@ fn label_rename_preserves_identity_and_delete_only_unassigns() {
     let snapshot = reopened.snapshot().unwrap();
     assert_eq!(snapshot.tasks.len(), 1);
     assert_eq!(snapshot.task(&task_id).unwrap().label_ids, vec![second_id]);
+}
+
+#[test]
+fn automatic_label_colors_balance_across_the_full_editor_palette() {
+    let mut store = Store::open_in_memory_with_paths(
+        std::env::temp_dir().join(format!("mach-label-palette-{}", uuid::Uuid::new_v4())),
+    )
+    .unwrap();
+    let colors = store
+        .update(|data| {
+            (0..13)
+                .map(|index| {
+                    data.create_label(format!("label-{index}"))
+                        .map(|label| label.color)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap();
+
+    assert_eq!(
+        colors,
+        [
+            LabelColor::Red,
+            LabelColor::Orange,
+            LabelColor::Yellow,
+            LabelColor::Lime,
+            LabelColor::Green,
+            LabelColor::Teal,
+            LabelColor::Cyan,
+            LabelColor::Blue,
+            LabelColor::Indigo,
+            LabelColor::Purple,
+            LabelColor::Pink,
+            LabelColor::Brown,
+            LabelColor::Red,
+        ]
+    );
 }
 
 #[test]

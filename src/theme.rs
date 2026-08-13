@@ -2,6 +2,8 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::model::LabelColor;
+
 pub fn color(name: &str) -> Color {
     Color::Indexed(match name {
         "red" => 160,
@@ -84,6 +86,7 @@ pub struct Theme {
     pub accent: Color,
     high_contrast_selection: bool,
     colors_disabled: bool,
+    light_background: bool,
 }
 
 impl Theme {
@@ -116,6 +119,7 @@ impl Theme {
             accent,
             high_contrast_selection: colors_disabled || light_background,
             colors_disabled,
+            light_background,
         }
     }
 
@@ -186,16 +190,54 @@ impl Theme {
         Style::new().fg(self.accent)
     }
 
-    /// Keeps label identity visually stable across task-row focus and
-    /// completion states.
-    pub fn label_badge(&self, done: bool) -> Style {
+    fn label_color(&self, color: LabelColor) -> Color {
+        Color::Indexed(if self.light_background {
+            match color {
+                LabelColor::Red => 124,
+                LabelColor::Orange => 166,
+                LabelColor::Yellow => 136,
+                LabelColor::Lime => 64,
+                LabelColor::Green => 28,
+                LabelColor::Teal => 29,
+                LabelColor::Cyan => 30,
+                LabelColor::Blue => 25,
+                LabelColor::Indigo => 55,
+                LabelColor::Purple => 91,
+                LabelColor::Pink => 125,
+                LabelColor::Brown => 94,
+            }
+        } else {
+            match color {
+                LabelColor::Red => 196,
+                LabelColor::Orange => 208,
+                LabelColor::Yellow => 226,
+                LabelColor::Lime => 118,
+                LabelColor::Green => 41,
+                LabelColor::Teal => 36,
+                LabelColor::Cyan => 45,
+                LabelColor::Blue => 39,
+                LabelColor::Indigo => 63,
+                LabelColor::Purple => 141,
+                LabelColor::Pink => 205,
+                LabelColor::Brown => 130,
+            }
+        })
+    }
+
+    fn completed_label_color(&self) -> Color {
+        Color::Indexed(if self.light_background { 238 } else { 244 })
+    }
+
+    /// Active labels keep their identity color under row focus; labels on a
+    /// completed task share a neutral gray completion style.
+    pub fn label_badge(&self, color: LabelColor, done: bool) -> Style {
         if self.colors_disabled {
             return Style::new().add_modifier(Modifier::REVERSED);
         }
         let background = if done {
-            self.dimmed_accent()
+            self.completed_label_color()
         } else {
-            self.accent
+            self.label_color(color)
         };
         let (r, g, b) = rgb_of(background);
         let luminance = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1_000;
@@ -204,17 +246,35 @@ impl Theme {
         } else {
             Color::Indexed(231)
         };
-        Style::new().fg(foreground).bg(background)
+        Style::new()
+            .fg(foreground)
+            .bg(background)
+            .remove_modifier(Modifier::REVERSED)
     }
 
-    /// Separates label-manager navigation from accent-backed label identity.
+    /// A picker swatch is an inset glyph rather than a cell background, so
+    /// the surrounding selection brackets can visibly enclose it.
+    pub fn label_swatch(&self, color: LabelColor) -> Style {
+        if self.colors_disabled {
+            Style::new()
+        } else {
+            Style::new()
+                .fg(self.label_color(color))
+                .remove_modifier(Modifier::REVERSED)
+        }
+    }
+
+    /// Manager focus is neutral so it cannot be mistaken for label color.
     pub fn label_focus(&self) -> Style {
         if self.colors_disabled {
             Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
             Style::new()
-                .fg(Color::Indexed(231))
-                .bg(Color::Indexed(240))
+                .bg(Color::Indexed(if self.light_background {
+                    250
+                } else {
+                    240
+                }))
                 .add_modifier(Modifier::BOLD)
         }
     }
@@ -265,7 +325,7 @@ mod tests {
         assert_eq!(no_color.dimmed_accent(), Color::Reset);
         assert!(
             no_color
-                .label_badge(false)
+                .label_badge(LabelColor::Blue, false)
                 .add_modifier
                 .contains(Modifier::REVERSED)
         );
@@ -273,12 +333,36 @@ mod tests {
         let light = Theme::with_environment("white", false, true);
         assert_eq!(light.accent, Color::Indexed(238));
         assert!(light.selection().add_modifier.contains(Modifier::REVERSED));
-        assert_eq!(light.label_badge(false).bg, Some(Color::Indexed(238)));
-        assert_eq!(light.label_badge(false).fg, Some(Color::Indexed(231)));
-
+        assert_eq!(
+            light.label_badge(LabelColor::Brown, false).bg,
+            Some(Color::Indexed(94))
+        );
+        assert_eq!(
+            light.label_badge(LabelColor::Brown, false).fg,
+            Some(Color::Indexed(231))
+        );
+        assert_eq!(
+            light.label_badge(LabelColor::Red, true).bg,
+            Some(Color::Indexed(238))
+        );
         let dark_yellow = Theme::with_environment("yellow", false, false);
-        assert_eq!(dark_yellow.label_badge(false).bg, Some(Color::Indexed(226)));
-        assert_eq!(dark_yellow.label_badge(false).fg, Some(Color::Indexed(16)));
+        assert_eq!(
+            dark_yellow.label_badge(LabelColor::Yellow, false).bg,
+            Some(Color::Indexed(226))
+        );
+        assert_eq!(
+            dark_yellow.label_badge(LabelColor::Yellow, false).fg,
+            Some(Color::Indexed(16))
+        );
+        assert_eq!(
+            dark_yellow.label_badge(LabelColor::Red, true).bg,
+            Some(Color::Indexed(244))
+        );
+        assert_eq!(
+            dark_yellow.label_badge(LabelColor::Blue, true).bg,
+            Some(Color::Indexed(244)),
+            "completed task labels share one neutral background"
+        );
         assert_eq!(dark_yellow.label_focus().bg, Some(Color::Indexed(240)));
     }
 }

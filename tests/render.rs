@@ -167,7 +167,7 @@ fn help_marks_both_section_headings() {
     // be recognised by its casing — it has to be marked as one.
     assert!(is_bold(&buffer, "MOVING AROUND"), "first heading not bold");
     assert!(
-        is_bold(&buffer, "TASKS & CATEGORIES"),
+        is_bold(&buffer, "TASKS, CATEGORIES & LABELS"),
         "first heading not bold"
     );
     assert!(
@@ -230,14 +230,24 @@ fn preview_wraps_every_label_and_rows_compact_only_whole_label_tokens() {
     }
     assert!(!wide.contains("#bug"), "TUI labels no longer use #: {wide}");
     let (bug_x, bug_y) = find_cells(&wide_buffer, "bug");
+    let (title_x, title_y) = find_cells(&wide_buffer, "ship the release");
+    assert_eq!(
+        bug_y, title_y,
+        "first label match should be on the task row"
+    );
+    let expected_badge = app.theme().label_badge(app.labels[0].color, false);
     assert_eq!(
         wide_buffer[(bug_x, bug_y)].bg,
-        app.theme()
-            .label_badge(false)
-            .bg
-            .unwrap_or(ratatui::style::Color::Reset),
-        "task focus must not replace the label badge background"
+        expected_badge.bg.unwrap_or(ratatui::style::Color::Reset),
+        "the focused task row must preserve the label badge background"
     );
+    if expected_badge.bg.is_some() {
+        assert_ne!(
+            wide_buffer[(bug_x, bug_y)].bg,
+            wide_buffer[(title_x, title_y)].bg,
+            "the label color belongs to its badge, not its text"
+        );
+    }
 
     app.settings.preview_position = "right".into();
     let narrow = render(&mut app, 90, 30);
@@ -276,7 +286,13 @@ fn draws_labels_manager_and_task_label_picker_at_supported_sizes() {
         let (_, backend_y) = find_cells(&manager_buffer, "backend");
         assert_eq!(bug_y, backend_y, "labels should flow across the row");
 
-        app.mode = Mode::Normal;
+        app.begin_rename_label();
+        let editor = render(&mut app, width, height);
+        for field in ["Edit label", "Name", "Color"] {
+            assert!(editor.contains(field), "missing {field:?}:\n{editor}");
+        }
+
+        app.close_labels();
         app.open_edit_task();
         app.form
             .as_mut()
@@ -479,7 +495,7 @@ fn wide_help_uses_paired_columns_and_content_height() {
 
     let (_, title_y) = find_cells(&buffer, " mach ");
     let (_, moving_y) = find_cells(&buffer, "MOVING AROUND");
-    let (_, tasks_y) = find_cells(&buffer, "TASKS & CATEGORIES");
+    let (_, tasks_y) = find_cells(&buffer, "TASKS, CATEGORIES & LABELS");
 
     assert_eq!(moving_y, tasks_y, "wide help sections must share a row");
     assert!(title_y > 0, "wide help must not fill the terminal height");

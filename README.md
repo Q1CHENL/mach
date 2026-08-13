@@ -41,12 +41,18 @@ Labels are global and reusable. Create them explicitly, assign multiple labels
 to a task, and repeat `--label` to require every named label when listing:
 
 ```sh
-mach labels add bug
+mach labels add bug --color red
 mach labels add backend
+mach labels edit backend --color green
 mach add "Fix retry handling" --label bug --label backend
 mach list --label bug --label backend --open
 mach edit TASK_ID --remove-label bug --add-label release
 ```
+
+Colors are stored as portable logical names: `red`, `orange`, `yellow`, `lime`,
+`green`, `teal`, `cyan`, `blue`, `indigo`, `purple`, `pink`, or `brown`. When
+`--color` is omitted, Mach picks the least-used color. In the TUI, open
+`/labels`; the New/Edit editor lets you choose a color before saving.
 
 Export every task, category, label and referenced image to one portable archive,
 then safely merge it into another mach data directory:

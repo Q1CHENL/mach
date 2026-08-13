@@ -7,6 +7,8 @@
 use caseless::Caseless;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 use unicode_normalization::UnicodeNormalization;
 
 /// Legacy `tasks.json` / `categories.json` envelope schema accepted on import.
@@ -24,6 +26,7 @@ pub const MAX_CATEGORY_COUNT: usize = 128;
 pub const MAX_LABEL_COUNT: usize = 128;
 pub const MAX_LABELS_PER_TASK: usize = 32;
 pub const MAX_LABEL_NAME_LEN: usize = 64;
+pub const MAX_LABEL_COLOR_LEN: usize = 6;
 
 /// Byte budget paired with a user-visible grapheme limit. This keeps a single
 /// grapheme with pathological combining sequences from bypassing every text
@@ -197,17 +200,109 @@ impl Category {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LabelColor {
+    #[default]
+    Red,
+    Orange,
+    Yellow,
+    Lime,
+    Green,
+    Teal,
+    Cyan,
+    Blue,
+    Indigo,
+    Purple,
+    Pink,
+    Brown,
+}
+
+impl LabelColor {
+    /// Colors persisted by current databases and archives.
+    pub const ALL: [Self; 12] = [
+        Self::Red,
+        Self::Orange,
+        Self::Yellow,
+        Self::Lime,
+        Self::Green,
+        Self::Teal,
+        Self::Cyan,
+        Self::Blue,
+        Self::Indigo,
+        Self::Purple,
+        Self::Pink,
+        Self::Brown,
+    ];
+
+    /// Colors offered for new labels and explicit color selection.
+    pub const SWATCHES: [Self; 12] = Self::ALL;
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Red => "red",
+            Self::Orange => "orange",
+            Self::Yellow => "yellow",
+            Self::Lime => "lime",
+            Self::Green => "green",
+            Self::Teal => "teal",
+            Self::Cyan => "cyan",
+            Self::Blue => "blue",
+            Self::Indigo => "indigo",
+            Self::Purple => "purple",
+            Self::Pink => "pink",
+            Self::Brown => "brown",
+        }
+    }
+
+    pub fn automatic(position: usize) -> Self {
+        Self::SWATCHES[position % Self::SWATCHES.len()]
+    }
+
+    pub fn least_used(labels: &[Label]) -> Self {
+        let counts =
+            Self::SWATCHES.map(|color| labels.iter().filter(|label| label.color == color).count());
+        Self::SWATCHES
+            .iter()
+            .copied()
+            .enumerate()
+            .min_by_key(|(position, _)| (counts[*position], *position))
+            .map(|(_, color)| color)
+            .unwrap_or_default()
+    }
+}
+
+impl fmt::Display for LabelColor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for LabelColor {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|color| color.as_str() == value)
+            .ok_or_else(|| format!("unknown label color {value:?}"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Label {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub color: LabelColor,
 }
 
 impl Label {
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: &str, color: LabelColor) -> Self {
         Self {
             id: new_uuid(),
             name: name.to_string(),
+            color,
         }
     }
 }
@@ -252,4 +347,58 @@ pub fn has_prose_or_image(task: &Task) -> bool {
     task.description
         .iter()
         .any(|b| !matches!(b, Block::Todo { .. }) && !b.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LabelColor, MAX_LABEL_COLOR_LEN};
+
+    #[test]
+    fn label_colors_have_stable_storage_names_and_order() {
+        let names = LabelColor::ALL
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "red", "orange", "yellow", "lime", "green", "teal", "cyan", "blue", "indigo",
+                "purple", "pink", "brown",
+            ]
+        );
+        assert_eq!(
+            names.iter().map(|name| name.len()).max(),
+            Some(MAX_LABEL_COLOR_LEN)
+        );
+        for color in LabelColor::ALL {
+            assert_eq!(color.to_string().parse::<LabelColor>().unwrap(), color);
+        }
+        assert!("violet".parse::<LabelColor>().is_err());
+        assert!("gray".parse::<LabelColor>().is_err());
+        assert_eq!(
+            serde_json::to_string(&LabelColor::Brown).unwrap(),
+            r#""brown""#
+        );
+        assert_eq!(
+            LabelColor::SWATCHES,
+            [
+                LabelColor::Red,
+                LabelColor::Orange,
+                LabelColor::Yellow,
+                LabelColor::Lime,
+                LabelColor::Green,
+                LabelColor::Teal,
+                LabelColor::Cyan,
+                LabelColor::Blue,
+                LabelColor::Indigo,
+                LabelColor::Purple,
+                LabelColor::Pink,
+                LabelColor::Brown,
+            ]
+        );
+        assert_eq!(
+            LabelColor::automatic(LabelColor::SWATCHES.len()),
+            LabelColor::Red
+        );
+    }
 }

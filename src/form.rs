@@ -9,7 +9,7 @@ use crate::description::DescriptionEditor;
 use crate::due;
 use crate::duepicker::DuePicker;
 use crate::image::{GifLoad, GifPlayback, TemporaryImage};
-use crate::model::{Block, Category, Label, MAX_LABELS_PER_TASK, MAX_TITLE_LEN, Task};
+use crate::model::{Block, Category, Label, LabelColor, MAX_LABELS_PER_TASK, MAX_TITLE_LEN, Task};
 use crate::text_input::TextInput;
 use crate::undo::{EditKind, History};
 
@@ -311,6 +311,7 @@ struct CategoryChoice {
 struct LabelChoice {
     id: String,
     name: String,
+    color: LabelColor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -546,6 +547,7 @@ impl TaskForm {
             .map(|label| LabelChoice {
                 id: label.id.clone(),
                 name: label.name.clone(),
+                color: label.color,
             })
             .collect();
         self.label_ids = self
@@ -566,6 +568,7 @@ impl TaskForm {
             .map(|label| LabelChoice {
                 id: label.id.clone(),
                 name: label.name.clone(),
+                color: label.color,
             })
             .collect();
         let order = self
@@ -590,19 +593,20 @@ impl TaskForm {
         &self.label_ids
     }
 
-    pub fn selected_label_names(&self) -> Vec<&str> {
+    pub fn selected_labels(&self) -> Vec<(&str, LabelColor)> {
         self.label_choices
             .iter()
             .filter(|choice| self.label_ids.contains(&choice.id))
-            .map(|choice| choice.name.as_str())
+            .map(|choice| (choice.name.as_str(), choice.color))
             .collect()
     }
 
-    pub fn label_choices(&self) -> impl Iterator<Item = (&str, &str, bool)> {
+    pub fn label_choices(&self) -> impl Iterator<Item = (&str, &str, LabelColor, bool)> {
         self.label_choices.iter().map(|choice| {
             (
                 choice.id.as_str(),
                 choice.name.as_str(),
+                choice.color,
                 self.label_ids.contains(&choice.id),
             )
         })

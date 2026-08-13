@@ -55,10 +55,10 @@ const fn heading(left: &'static str, right: &'static str) -> HelpRow {
 
 /// Two-column key reference. Empty strings are gaps.
 pub const HELP_COLUMNS: [HelpRow; 17] = [
-    heading("MOVING AROUND", "TASKS & CATEGORIES"),
+    heading("MOVING AROUND", "TASKS, CATEGORIES & LABELS"),
     row(
         "← →          between the two panels",
-        "Ctrl+A       new task / category",
+        "Ctrl+A       new task / category / label",
     ),
     row(
         "↑ ↓          within a panel",

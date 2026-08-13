@@ -15,12 +15,14 @@ use crate::due;
 use crate::form::{CategoryForm, TaskDraft, TaskForm};
 use crate::image::ImageStore;
 use crate::model::{
-    ALL_CATEGORY, Category, Label, MAX_CATEGORY_COUNT, MAX_CATEGORY_NAME_LEN, MAX_LABEL_COUNT,
-    MAX_LABEL_NAME_LEN, MAX_TASK_COUNT, MAX_TITLE_LEN, Task, caseless_key, category_name_key,
+    ALL_CATEGORY, Category, Label, LabelColor, MAX_CATEGORY_COUNT, MAX_CATEGORY_NAME_LEN,
+    MAX_LABEL_COUNT, MAX_LABEL_NAME_LEN, MAX_TASK_COUNT, MAX_TITLE_LEN, Task, caseless_key,
+    category_name_key,
 };
 use crate::settings::{LaunchState, Settings};
 use crate::store::{
-    Attachment, CategoryPatch, RelativePosition, Store, StoreData, StoreError, TaskPatch,
+    Attachment, CategoryPatch, LabelPatch, RelativePosition, Store, StoreData, StoreError,
+    TaskPatch,
 };
 use crate::text_input::TextInput;
 use crate::theme::Theme;
@@ -252,6 +254,41 @@ pub struct Areas {
     pub slash_menu_start: usize,
     /// Final badge rectangles in the global label manager.
     pub label_hits: Vec<(usize, Rect)>,
+    /// Name field and selectable color swatches in the label editor.
+    pub label_name_input: Rect,
+    pub label_color_hits: Vec<(LabelColor, Rect)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LabelEditor {
+    pub editing_id: Option<String>,
+    pub name: TextInput,
+    pub color: LabelColor,
+    pub color_focused: bool,
+}
+
+impl LabelEditor {
+    fn new(editing_id: Option<String>, name: &str, color: LabelColor) -> Self {
+        Self {
+            editing_id,
+            name: TextInput::new(name, MAX_LABEL_NAME_LEN),
+            color,
+            color_focused: false,
+        }
+    }
+
+    pub(crate) fn move_color(&mut self, delta: isize) {
+        let len = LabelColor::SWATCHES.len();
+        let position = LabelColor::SWATCHES
+            .iter()
+            .position(|color| *color == self.color);
+        let next = match position {
+            Some(position) => (position as isize + delta).rem_euclid(len as isize) as usize,
+            None if delta.is_negative() => len - 1,
+            None => 0,
+        };
+        self.color = LabelColor::SWATCHES[next];
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,8 +345,8 @@ pub struct App {
     pub category_form: Option<CategoryForm>,
     /// Selected row in the global label manager.
     pub label_index: usize,
-    /// Inline create/rename input; `Some(None)` creates, `Some(Some(id))` renames.
-    pub label_input: Option<(Option<String>, TextInput)>,
+    /// Inline create/rename editor with an explicit name/color focus.
+    pub label_editor: Option<LabelEditor>,
     pub label_error: Option<String>,
     labels_return_to_form: bool,
     pub settings_index: usize,
@@ -443,7 +480,7 @@ impl App {
             form: None,
             category_form: None,
             label_index: 0,
-            label_input: None,
+            label_editor: None,
             label_error: None,
             labels_return_to_form: false,
             settings_index: 0,
@@ -2018,7 +2055,7 @@ impl App {
     fn open_labels_manager(&mut self) {
         self.mode = Mode::Labels;
         self.label_index = self.label_index.min(self.labels.len().saturating_sub(1));
-        self.label_input = None;
+        self.label_editor = None;
         self.label_error = None;
         self.cancel_pending();
         self.dirty = true;
@@ -2034,7 +2071,7 @@ impl App {
             self.mode = Mode::Normal;
         }
         self.labels_return_to_form = false;
-        self.label_input = None;
+        self.label_editor = None;
         self.label_error = None;
         self.cancel_pending();
         self.dirty = true;
@@ -2055,7 +2092,11 @@ impl App {
             self.label_error = Some(format!("At most {MAX_LABEL_COUNT} labels"));
             return;
         }
-        self.label_input = Some((None, TextInput::new("", MAX_LABEL_NAME_LEN)));
+        self.label_editor = Some(LabelEditor::new(
+            None,
+            "",
+            LabelColor::least_used(&self.labels),
+        ));
         self.label_error = None;
         self.cancel_pending();
     }
@@ -2064,29 +2105,39 @@ impl App {
         let Some(label) = self.labels.get(self.label_index) else {
             return;
         };
-        self.label_input = Some((
+        self.label_editor = Some(LabelEditor::new(
             Some(label.id.clone()),
-            TextInput::new(&label.name, MAX_LABEL_NAME_LEN),
+            &label.name,
+            label.color,
         ));
         self.label_error = None;
         self.cancel_pending();
     }
 
-    pub fn cancel_label_input(&mut self) {
-        self.label_input = None;
+    pub fn cancel_label_editor(&mut self) {
+        self.label_editor = None;
         self.label_error = None;
         self.dirty = true;
     }
 
-    pub fn submit_label_input(&mut self) {
-        let Some((editing, input)) = &self.label_input else {
+    pub fn submit_label_editor(&mut self) {
+        let Some(editor) = &self.label_editor else {
             return;
         };
-        let editing = editing.clone();
-        let name = input.value();
+        let editing = editor.editing_id.clone();
+        let name = editor.name.value();
+        let color = editor.color;
         let result = match editing {
-            Some(id) => self.update_store(|data| data.edit_label(&id, name)),
-            None => self.update_store(|data| data.create_label(name)),
+            Some(id) => self.update_store(|data| {
+                data.edit_label(
+                    &id,
+                    LabelPatch {
+                        name: Some(name),
+                        color: Some(color),
+                    },
+                )
+            }),
+            None => self.update_store(|data| data.create_label_with_color(name, color)),
         };
         match result {
             Ok(label) => {
@@ -2095,7 +2146,7 @@ impl App {
                     .iter()
                     .position(|item| item.id == label.id)
                     .unwrap_or_default();
-                self.label_input = None;
+                self.label_editor = None;
                 self.label_error = None;
             }
             Err(error) => {

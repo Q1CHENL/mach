@@ -512,11 +512,15 @@ fn task_category_and_subtask_workflow_keeps_one_json_contract() {
 fn label_crud_preserves_identity_reports_counts_and_only_unassigns_tasks() {
     let dir = TempDir::new("cli-label-crud");
 
-    let bug = mach(dir.path(), &["--json", "labels", "add", "Bug"]);
+    let bug = mach(
+        dir.path(),
+        &["--json", "labels", "add", "Bug", "--color", "red"],
+    );
     assert!(bug.status.success());
     let bug: serde_json::Value = serde_json::from_slice(&bug.stdout).unwrap();
     let bug_id = bug["id"].as_str().unwrap().to_string();
     assert_eq!(bug["name"], "Bug");
+    assert_eq!(bug["color"], "red");
 
     let backend = mach(dir.path(), &["--json", "labels", "add", "Backend"]);
     assert!(backend.status.success());
@@ -546,24 +550,36 @@ fn label_crud_preserves_identity_reports_counts_and_only_unassigns_tasks() {
         listed,
         serde_json::json!({
             "labels": [
-                {"id": bug_id, "name": "Bug", "total": 2, "done": 1},
-                {"id": backend_id, "name": "Backend", "total": 1, "done": 0},
+                {"id": bug_id, "name": "Bug", "color": "red", "total": 2, "done": 1},
+                {"id": backend_id, "name": "Backend", "color": "orange", "total": 1, "done": 0},
             ]
         })
     );
     let plain_labels = mach(dir.path(), &["labels"]);
     let plain_labels = String::from_utf8(plain_labels.stdout).unwrap();
-    assert!(plain_labels.contains("#Bug  1/2"));
-    assert!(plain_labels.contains("#Backend  0/1"));
+    assert!(plain_labels.contains("#Bug  red  1/2"));
+    assert!(plain_labels.contains("#Backend  orange  0/1"));
 
     let renamed = mach(
         dir.path(),
-        &["--json", "labels", "edit", "bug", "--name", "Defect"],
+        &[
+            "--json", "labels", "edit", "bug", "--name", "Defect", "--color", "indigo",
+        ],
     );
     assert!(renamed.status.success());
     let renamed: serde_json::Value = serde_json::from_slice(&renamed.stdout).unwrap();
     assert_eq!(renamed["id"], bug_id);
     assert_eq!(renamed["name"], "Defect");
+    assert_eq!(renamed["color"], "indigo");
+
+    let recolored = mach(
+        dir.path(),
+        &["--json", "labels", "edit", "Back", "--color", "cyan"],
+    );
+    assert!(recolored.status.success());
+    let recolored: serde_json::Value = serde_json::from_slice(&recolored.stdout).unwrap();
+    assert_eq!(recolored["name"], "Backend");
+    assert_eq!(recolored["color"], "cyan");
 
     let deleted = mach(dir.path(), &["--json", "labels", "delete", "Back"]);
     assert!(deleted.status.success());
@@ -577,7 +593,7 @@ fn label_crud_preserves_identity_reports_counts_and_only_unassigns_tasks() {
     let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
     assert_eq!(
         shown["labels"],
-        serde_json::json!([{"id": bug_id, "name": "Defect"}])
+        serde_json::json!([{"id": bug_id, "name": "Defect", "color": "indigo"}])
     );
 }
 

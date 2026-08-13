@@ -10,13 +10,14 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum, builder::PossibleValue};
 use serde_json::{Value, json};
 
 use crate::VERSION;
-use crate::model::{Block, Category, Label, Task};
+use crate::model::{Block, Category, Label, LabelColor, Task};
 use crate::store::{
-    CategoryPatch, PurgeScope, RelativePosition, Store, StoreData, StoreError, TaskPatch,
+    CategoryPatch, LabelPatch, PurgeScope, RelativePosition, Store, StoreData, StoreError,
+    TaskPatch,
 };
 
 /// Full CLI reference under `mach --help`.
@@ -39,9 +40,12 @@ const HELP: &str = "\
 
   labels
     (no args)            list labels (done/total)
-    add NAME
-    edit NAME --name NEW rename label; assignments stay attached
+    add NAME [--color COLOR]
+    edit NAME [--name NEW] [--color COLOR]
+                         edit label; assignments stay attached
     delete NAME          delete label; tasks stay in place
+
+  Label colors: red, orange, yellow, lime, green, teal, cyan, blue, indigo, purple, pink, brown
 
   add [TITLE]
     -t, --title TITLE    title (required if no positional TITLE)
@@ -364,20 +368,41 @@ enum LabelAction {
     Add {
         /// Name
         name: String,
+        /// Logical color (automatically balanced when omitted)
+        #[arg(long, value_enum)]
+        color: Option<LabelColor>,
     },
-    /// Rename label
+    /// Edit label name or color
     Edit {
         /// Current name / prefix
         name: String,
         /// New name
-        #[arg(short = 'n', long = "name", value_name = "NEW")]
-        new_name: String,
+        #[arg(
+            short = 'n',
+            long = "name",
+            value_name = "NEW",
+            required_unless_present = "color"
+        )]
+        new_name: Option<String>,
+        /// Logical color
+        #[arg(long, value_enum)]
+        color: Option<LabelColor>,
     },
     /// Delete label (tasks remain in place)
     Delete {
         /// Name / prefix
         name: String,
     },
+}
+
+impl ValueEnum for LabelColor {
+    fn value_variants<'a>() -> &'a [Self] {
+        &Self::SWATCHES
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        Some(PossibleValue::new(self.as_str()))
+    }
 }
 
 #[derive(Subcommand)]
@@ -702,10 +727,12 @@ fn dispatch(store: &mut Store, command: Command, json_mode: bool) -> Result<Rend
         },
         Command::Labels { action } => match action {
             None | Some(LabelAction::List) => cmd_labels_list(store, json_mode),
-            Some(LabelAction::Add { name }) => cmd_label_add(store, &name, json_mode),
-            Some(LabelAction::Edit { name, new_name }) => {
-                cmd_label_edit(store, &name, &new_name, json_mode)
-            }
+            Some(LabelAction::Add { name, color }) => cmd_label_add(store, &name, color, json_mode),
+            Some(LabelAction::Edit {
+                name,
+                new_name,
+                color,
+            }) => cmd_label_edit(store, &name, new_name.as_deref(), color, json_mode),
             Some(LabelAction::Delete { name }) => cmd_label_delete(store, &name, json_mode),
         },
         Command::Add(arguments) => cmd_add(store, &arguments, json_mode),
@@ -1086,6 +1113,7 @@ fn label_json(label: &Label) -> Value {
     json!({
         "id": label.id,
         "name": label.name,
+        "color": label.color,
     })
 }
 
@@ -1533,6 +1561,7 @@ fn cmd_labels_list(store: &Store, json_mode: bool) -> Result<Rendered, CliError>
                     json!({
                         "id": label.id,
                         "name": label.name,
+                        "color": label.color,
                         "total": total,
                         "done": done,
                     })
@@ -1547,36 +1576,67 @@ fn cmd_labels_list(store: &Store, json_mode: bool) -> Result<Rendered, CliError>
                 .iter()
                 .zip(&counts)
                 .map(|(label, (done, total))| {
-                    format!("#{}  {done}/{total}\n", terminal_text(&label.name))
+                    format!(
+                        "#{}  {}  {done}/{total}\n",
+                        terminal_text(&label.name),
+                        label.color
+                    )
                 })
                 .collect()
         },
     ))
 }
 
-fn cmd_label_add(store: &mut Store, name: &str, json_mode: bool) -> Result<Rendered, CliError> {
-    let label = store.update(|data| data.create_label(name))?;
+fn cmd_label_add(
+    store: &mut Store,
+    name: &str,
+    color: Option<LabelColor>,
+    json_mode: bool,
+) -> Result<Rendered, CliError> {
+    let label = store.update(|data| match color {
+        Some(color) => data.create_label_with_color(name, color),
+        None => data.create_label(name),
+    })?;
     Ok(rendered(
         json_mode,
         || label_json(&label),
-        || format!("created label #{}\n", terminal_text(&label.name)),
+        || {
+            format!(
+                "created label #{} ({})\n",
+                terminal_text(&label.name),
+                label.color
+            )
+        },
     ))
 }
 
 fn cmd_label_edit(
     store: &mut Store,
     query: &str,
-    new_name: &str,
+    new_name: Option<&str>,
+    color: Option<LabelColor>,
     json_mode: bool,
 ) -> Result<Rendered, CliError> {
     let label = store.update(|data| {
         let id = data.resolve_label_id(query)?;
-        data.edit_label(&id, new_name)
+        data.edit_label(
+            &id,
+            LabelPatch {
+                name: new_name.map(str::to_string),
+                color,
+            },
+        )
     })?;
     Ok(rendered(
         json_mode,
         || label_json(&label),
-        || format!("updated label #{}\n", terminal_text(&label.name)),
+        || {
+            format!(
+                "updated label #{} ({})\n",
+                terminal_text(&label.name),
+                label.color
+            )
+        },
     ))
 }
 

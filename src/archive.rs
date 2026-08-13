@@ -16,10 +16,10 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::model::{
-    Block, Category, Label, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN,
-    MAX_CATEGORY_DESC_LINES, MAX_CATEGORY_NAME_LEN, MAX_DESCRIPTION_LINES, MAX_LABEL_COUNT,
-    MAX_LABEL_NAME_LEN, MAX_LABELS_PER_TASK, MAX_NOTES_LINE_LEN, MAX_TASK_COUNT, MAX_TITLE_LEN,
-    Task, caseless_key, text_byte_limit,
+    Block, Category, Label, LabelColor, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN,
+    MAX_CATEGORY_DESC_LINES, MAX_CATEGORY_NAME_LEN, MAX_DESCRIPTION_LINES, MAX_LABEL_COLOR_LEN,
+    MAX_LABEL_COUNT, MAX_LABEL_NAME_LEN, MAX_LABELS_PER_TASK, MAX_NOTES_LINE_LEN, MAX_TASK_COUNT,
+    MAX_TITLE_LEN, Task, caseless_key, text_byte_limit,
 };
 use crate::settings::Settings;
 use crate::store::{
@@ -45,7 +45,10 @@ const MAX_MANIFEST_STRING_BYTES: u64 = ARCHIVE_FORMAT.len() as u64
         * (ID_MAX_BYTES as u64
             + text_byte_limit(MAX_CATEGORY_NAME_LEN) as u64
             + MAX_CATEGORY_DESCRIPTION_BYTES)
-    + MAX_LABEL_COUNT as u64 * (ID_MAX_BYTES as u64 + text_byte_limit(MAX_LABEL_NAME_LEN) as u64)
+    + MAX_LABEL_COUNT as u64
+        * (ID_MAX_BYTES as u64
+            + text_byte_limit(MAX_LABEL_NAME_LEN) as u64
+            + MAX_LABEL_COLOR_LEN as u64)
     + MAX_TASK_COUNT as u64
         * (ID_MAX_BYTES as u64
             + text_byte_limit(MAX_TITLE_LEN) as u64
@@ -504,6 +507,7 @@ struct ExportManifest<'a> {
 struct ExportLabel<'a> {
     id: &'a str,
     name: &'a str,
+    color: LabelColor,
 }
 
 impl<'a> From<&'a Label> for ExportLabel<'a> {
@@ -511,6 +515,7 @@ impl<'a> From<&'a Label> for ExportLabel<'a> {
         Self {
             id: &label.id,
             name: &label.name,
+            color: label.color,
         }
     }
 }
@@ -568,6 +573,7 @@ struct ArchiveLabel {
     id: String,
     #[serde(deserialize_with = "deserialize_label_name")]
     name: String,
+    color: LabelColor,
 }
 
 impl From<ArchiveLabel> for Label {
@@ -575,6 +581,7 @@ impl From<ArchiveLabel> for Label {
         Self {
             id: label.id,
             name: label.name,
+            color: label.color,
         }
     }
 }
@@ -1344,6 +1351,15 @@ fn read_manifest(
         )));
     }
 
+    let schema = manifest.schema;
+    if schema < ARCHIVE_SCHEMA
+        && (!manifest.labels.is_empty()
+            || manifest.tasks.iter().any(|task| !task.label_ids.is_empty()))
+    {
+        return Err(ArchiveError::Invalid(format!(
+            "archive schema {schema} does not support labels"
+        )));
+    }
     let attachments: Vec<_> = manifest
         .attachments
         .into_iter()
@@ -1901,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_v3_exports_description_and_imports_v1_body() {
+    fn current_archive_exports_description_and_imports_v1_body() {
         let source_directory = TestDirectory::new("description-schema-source");
         let output_directory = TestDirectory::new("description-schema-output");
         let destination_directory = TestDirectory::new("description-schema-destination");
@@ -1958,7 +1974,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_v3_round_trip_preserves_labels_and_v2_defaults_to_empty() {
+    fn archive_v3_round_trip_preserves_colors_and_v2_defaults_to_empty() {
         let source_directory = TestDirectory::new("label-schema-source");
         let output_directory = TestDirectory::new("label-schema-output");
         let destination_directory = TestDirectory::new("label-schema-destination");
@@ -1990,6 +2006,8 @@ mod tests {
         };
         assert_eq!(manifest["schema"], 3);
         assert_eq!(manifest["labels"].as_array().unwrap().len(), 2);
+        assert_eq!(manifest["labels"][0]["color"], "red");
+        assert_eq!(manifest["labels"][1]["color"], "orange");
         assert_eq!(
             manifest["tasks"][0]["label_ids"],
             serde_json::json!([first_id, second_id])
@@ -2003,7 +2021,7 @@ mod tests {
         assert_eq!(snapshot.labels, source.snapshot().unwrap().labels);
         assert_eq!(
             snapshot.task(&task_id).unwrap().label_ids,
-            vec![first_id, second_id]
+            vec![first_id.clone(), second_id]
         );
         let unchanged = import(&mut destination, &archive_path).unwrap();
         assert_eq!(unchanged.labels_added, 0);
@@ -2036,6 +2054,65 @@ mod tests {
         let snapshot = legacy_destination.snapshot().unwrap();
         assert!(snapshot.labels.is_empty());
         assert!(snapshot.tasks[0].label_ids.is_empty());
+    }
+
+    #[test]
+    fn archive_v3_requires_every_label_color() {
+        let output_directory = TestDirectory::new("label-color-required-output");
+        let destination_directory = TestDirectory::new("label-color-required-destination");
+        let archive_path = output_directory.0.join("missing-label-color.mach");
+        write_manifest_archive(
+            &archive_path,
+            &serde_json::json!({
+                "format": ARCHIVE_FORMAT,
+                "schema": 3,
+                "categories": [],
+                "labels": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "name": "missing color"
+                }],
+                "tasks": [],
+                "attachments": []
+            }),
+        );
+
+        let mut destination = Store::open(&destination_directory.0).unwrap();
+        let error = import(&mut destination, &archive_path).unwrap_err();
+        assert_eq!(error.kind(), "archive");
+        assert!(error.to_string().contains("color"));
+        assert!(destination.snapshot().unwrap().labels.is_empty());
+    }
+
+    #[test]
+    fn archive_v2_rejects_label_data() {
+        let output_directory = TestDirectory::new("legacy-label-output");
+        let destination_directory = TestDirectory::new("legacy-label-destination");
+        let archive_path = output_directory.0.join("schema-v2-with-labels.mach");
+        write_manifest_archive(
+            &archive_path,
+            &serde_json::json!({
+                "format": ARCHIVE_FORMAT,
+                "schema": 2,
+                "categories": [],
+                "labels": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "name": "unsupported",
+                    "color": "red"
+                }],
+                "tasks": [],
+                "attachments": []
+            }),
+        );
+
+        let mut destination = Store::open(&destination_directory.0).unwrap();
+        let error = import(&mut destination, &archive_path).unwrap_err();
+        assert_eq!(error.kind(), "archive");
+        assert!(
+            error
+                .to_string()
+                .contains("archive schema 2 does not support labels")
+        );
+        assert!(destination.snapshot().unwrap().labels.is_empty());
     }
 
     #[test]
@@ -2088,7 +2165,8 @@ mod tests {
             .update(|data| {
                 data.insert_label(Label {
                     id: label.id.clone(),
-                    name: "local name".into(),
+                    name: label.name.clone(),
+                    color: LabelColor::Purple,
                 })?;
                 data.create_task("keep", Vec::new(), "", 0, None)?;
                 Ok(())

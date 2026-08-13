@@ -24,7 +24,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::due;
 use crate::model::{
-    Block, Category, Label, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN,
+    Block, Category, Label, LabelColor, MAX_CATEGORY_COUNT, MAX_CATEGORY_DESC_LINE_LEN,
     MAX_CATEGORY_DESC_LINES, MAX_CATEGORY_NAME_LEN, MAX_DESCRIPTION_LINES, MAX_IMPORTANCE,
     MAX_LABEL_COUNT, MAX_LABEL_NAME_LEN, MAX_LABELS_PER_TASK, MAX_NOTES_LINE_LEN, MAX_TASK_COUNT,
     MAX_TITLE_LEN, SCHEMA_VERSION, Task, category_name_key, label_name_key, text_byte_limit,
@@ -218,6 +218,12 @@ pub struct TaskPatch {
 pub struct CategoryPatch {
     pub name: Option<String>,
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LabelPatch {
+    pub name: Option<String>,
+    pub color: Option<LabelColor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -726,8 +732,17 @@ impl StoreData {
     }
 
     pub fn create_label(&mut self, name: impl Into<String>) -> Result<Label, StoreError> {
+        let color = LabelColor::least_used(&self.labels);
+        self.create_label_with_color(name, color)
+    }
+
+    pub fn create_label_with_color(
+        &mut self,
+        name: impl Into<String>,
+        color: LabelColor,
+    ) -> Result<Label, StoreError> {
         let name = name.into();
-        self.insert_label(Label::new(&name))
+        self.insert_label(Label::new(&name, color))
     }
 
     pub fn insert_label(&mut self, label: Label) -> Result<Label, StoreError> {
@@ -740,10 +755,15 @@ impl StoreData {
         Ok(self.labels[index].clone())
     }
 
-    pub fn edit_label(&mut self, id: &str, name: impl Into<String>) -> Result<Label, StoreError> {
+    pub fn edit_label(&mut self, id: &str, patch: LabelPatch) -> Result<Label, StoreError> {
         let index = self.label_index(id)?;
         let before = self.labels[index].clone();
-        self.labels[index].name = name.into();
+        if let Some(name) = patch.name {
+            self.labels[index].name = name;
+        }
+        if let Some(color) = patch.color {
+            self.labels[index].color = color;
+        }
         if let Err(error) = self.normalize_and_validate_new_write() {
             self.labels[index] = before;
             return Err(error);
@@ -1302,7 +1322,9 @@ fn initialize_schema(connection: &mut Connection, path: &Path) -> Result<(), Sto
             id TEXT PRIMARY KEY,
             position INTEGER NOT NULL UNIQUE CHECK (position >= 0),
             name TEXT NOT NULL CHECK (length(trim(name)) > 0),
-            name_key TEXT NOT NULL UNIQUE CHECK (length(name_key) > 0)
+            name_key TEXT NOT NULL UNIQUE CHECK (length(name_key) > 0),
+            color TEXT NOT NULL DEFAULT 'red'
+                CHECK (color IN ('red', 'orange', 'yellow', 'lime', 'green', 'teal', 'cyan', 'blue', 'indigo', 'purple', 'pink', 'brown'))
         ) STRICT;
         CREATE TABLE IF NOT EXISTS task_labels (
             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -1448,16 +1470,15 @@ fn load_snapshot(connection: &Connection) -> Result<StoreData, StoreError> {
         categories.push(category);
     }
 
-    let mut labels_statement =
-        connection.prepare("SELECT position, id, name, name_key FROM labels ORDER BY position")?;
+    let mut labels_statement = connection
+        .prepare("SELECT position, id, name, name_key, color FROM labels ORDER BY position")?;
     let label_rows = labels_statement.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
-            Label {
-                id: row.get(1)?,
-                name: row.get(2)?,
-            },
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
         ))
     })?;
     let mut labels = Vec::new();
@@ -1467,8 +1488,12 @@ fn load_snapshot(connection: &Connection) -> Result<StoreData, StoreError> {
                 "label count exceeds {MAX_LABEL_COUNT}"
             )));
         }
-        let (stored_position, label, stored_name_key) = row?;
+        let (stored_position, id, name, stored_name_key, stored_color) = row?;
         validate_stored_position(stored_position, expected_position, "label")?;
+        let color = stored_color.parse::<LabelColor>().map_err(|_| {
+            StoreError::Corrupt(format!("label {id:?} has unknown color {stored_color:?}"))
+        })?;
+        let label = Label { id, name, color };
         let expected_name_key = label_name_key(&label.name);
         if stored_name_key != expected_name_key {
             return Err(StoreError::Corrupt(format!(
@@ -1844,8 +1869,15 @@ fn persist_diff(
                 temporary_position(label_position_base, label_position_offset, "labels")?;
             label_position_offset += 1;
             tx.execute(
-                "INSERT INTO labels(id, position, name, name_key) VALUES (?1, ?2, ?3, ?4)",
-                params![label.id, temporary, label.name, label_name_key(&label.name),],
+                "INSERT INTO labels(id, position, name, name_key, color)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    label.id,
+                    temporary,
+                    label.name,
+                    label_name_key(&label.name),
+                    label.color.as_str(),
+                ],
             )?;
         }
     }
@@ -2029,8 +2061,13 @@ fn persist_diff(
         {
             execute_one(
                 tx,
-                "UPDATE labels SET name = ?1, name_key = ?2 WHERE id = ?3",
-                params![label.name, label_name_key(&label.name), label.id],
+                "UPDATE labels SET name = ?1, name_key = ?2, color = ?3 WHERE id = ?4",
+                params![
+                    label.name,
+                    label_name_key(&label.name),
+                    label.color.as_str(),
+                    label.id,
+                ],
                 "label",
                 &label.id,
             )?;

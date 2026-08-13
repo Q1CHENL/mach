@@ -11,7 +11,7 @@ use ratatui::layout::Rect;
 use mach::app::{App, Confirm, Focus, Mode};
 use mach::form::{TaskDraft, TaskForm};
 use mach::input::handle_event;
-use mach::model::{Category, Task};
+use mach::model::{Category, LabelColor, Task};
 use mach::store::Store;
 
 mod common;
@@ -931,7 +931,13 @@ fn task_form_label_picker_supports_click_scroll_and_outside_close() {
         form.label_picker_open(),
         "clicking a row keeps the picker open"
     );
-    assert_eq!(form.selected_label_names(), vec!["label-1"]);
+    assert_eq!(
+        form.selected_labels()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        vec!["label-1"]
+    );
 
     scroll(
         &mut app,
@@ -974,7 +980,7 @@ fn label_picker_manage_row_returns_to_the_draft_with_refreshed_labels() {
     assert_eq!(form.label_ids(), &[bug]);
     assert_eq!(
         form.label_choices()
-            .map(|(_, name, _)| name)
+            .map(|(_, name, _, _)| name)
             .collect::<Vec<_>>(),
         vec!["bug", "backend"]
     );
@@ -1014,8 +1020,13 @@ fn slash_labels_manager_creates_renames_and_deletes_a_global_label() {
 
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
     press(&mut app, KeyCode::Char('!'), KeyModifiers::NONE);
+    assert_eq!(app.label_editor.as_ref().unwrap().color, LabelColor::Red);
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert!(app.label_editor.as_ref().unwrap().color_focused);
+    press(&mut app, KeyCode::Left, KeyModifiers::NONE);
     press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
     assert_eq!(app.labels[0].name, "bug!");
+    assert_eq!(app.labels[0].color, LabelColor::Brown);
 
     press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
     assert!(message(&app).contains("remove it from every task"));
@@ -1058,12 +1069,28 @@ fn double_clicking_a_label_starts_renaming_that_label() {
 
     click(&mut app, x, y);
     assert_eq!(app.label_index, 1);
-    assert!(app.label_input.is_none(), "the first click only selects");
+    assert!(app.label_editor.is_none(), "the first click only selects");
 
     click(&mut app, x, y);
-    let (editing, input) = app.label_input.as_ref().expect("rename input");
-    assert_eq!(editing.as_deref(), Some(app.labels[1].id.as_str()));
-    assert_eq!(input.value(), "backend");
+    let editor = app.label_editor.as_ref().expect("rename input");
+    assert_eq!(
+        editor.editing_id.as_deref(),
+        Some(app.labels[1].id.as_str())
+    );
+    assert_eq!(editor.name.value(), "backend");
+
+    draw(&mut app, 100, 30);
+    let (_, green) = app
+        .areas
+        .label_color_hits
+        .iter()
+        .find(|(color, _)| *color == LabelColor::Green)
+        .copied()
+        .expect("green swatch");
+    click(&mut app, green.x.saturating_add(green.width / 2), green.y);
+    assert_eq!(app.label_editor.as_ref().unwrap().color, LabelColor::Green);
+    press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+    assert_eq!(app.labels[1].color, LabelColor::Green);
 }
 
 #[test]
