@@ -1812,14 +1812,17 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     app.areas.sidebar = list_area;
 
     let width = inner.width as usize;
-    // `done/total` per category, right-aligned to the widest score.
     let scores: Vec<String> = app
         .categories
         .iter()
         .enumerate()
         .map(|(index, _)| {
             let (done, total) = app.category_progress_at(index);
-            format!("{done}/{total}")
+            if app.settings.hide_done {
+                (total - done).to_string()
+            } else {
+                format!("{done}/{total}")
+            }
         })
         .collect();
     let count_width = scores.iter().map(|s| s.width()).max().unwrap_or(3).max(3);

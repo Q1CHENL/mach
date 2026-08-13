@@ -836,13 +836,7 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
             }
         }
         SlashCommand::Done => {
-            if let Some(hidden) = app.toggle_hide_done() {
-                if hidden {
-                    app.info("Hiding completed tasks");
-                } else {
-                    app.info("Showing completed tasks");
-                }
-            }
+            let _ = app.toggle_hide_done();
         }
         SlashCommand::Purge => {
             let ids = app.purge_candidate_ids();
