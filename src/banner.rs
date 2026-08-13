@@ -15,16 +15,16 @@ pub const BANNER_WIDTH: u16 = 35;
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
     (
-        "Reusable labels",
-        "Create labels once, assign several to a task, and manage them from the TUI or CLI.",
+        "Agent-ready CLI",
+        "Search task text and idempotently ensure categories or labels from scripts and agents.",
     ),
     (
-        "Your colors",
-        "Choose label colors from the editor palette; badges stay readable across themes and completed tasks.",
+        "Reorder categories",
+        "Use Option+Up or Option+Down in manual view to put categories in the order you want.",
     ),
     (
-        "Labels everywhere",
-        "Search tasks by label, combine CLI label filters, and preserve assignments in JSON archives.",
+        "Cleaner task views",
+        "Hidden-completed views show open counts, and form pickers no longer leave artifacts over images.",
     ),
 ];
 
