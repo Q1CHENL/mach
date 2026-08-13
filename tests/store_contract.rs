@@ -411,14 +411,10 @@ fn labels_use_stable_unicode_caseless_identities() {
         .update(|data| data.create_label("Cafe\u{301}"))
         .expect_err("canonically equivalent label names must conflict");
     assert!(matches!(duplicate, StoreError::Validation(_)));
-    let presentation_syntax = store
+    let literal_hash = store
         .update(|data| data.create_label("#bug"))
-        .expect_err("the display prefix is not part of a stored label name");
-    assert!(
-        presentation_syntax
-            .to_string()
-            .contains("must not start with '#'")
-    );
+        .expect("hash must be ordinary label text");
+    assert_eq!(literal_hash.name, "#bug");
 }
 
 #[test]

@@ -1168,7 +1168,7 @@ fn task_labels<'a>(labels: &'a [Label], task: &Task) -> Vec<&'a Label> {
 fn task_label_text(labels: &[Label], task: &Task) -> String {
     task_labels(labels, task)
         .into_iter()
-        .map(|label| format!("#{}", terminal_text(&label.name)))
+        .map(|label| terminal_text(&label.name))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -1657,7 +1657,7 @@ fn cmd_labels_list(store: &Store, json_mode: bool) -> Result<Rendered, CliError>
                 .zip(&counts)
                 .map(|(label, (done, total))| {
                     format!(
-                        "#{}  {}  {done}/{total}\n",
+                        "{}  {}  {done}/{total}\n",
                         terminal_text(&label.name),
                         label.color
                     )
@@ -1682,7 +1682,7 @@ fn cmd_label_add(
         || label_json(&label),
         || {
             format!(
-                "created label #{} ({})\n",
+                "created label {} ({})\n",
                 terminal_text(&label.name),
                 label.color
             )
@@ -1708,13 +1708,13 @@ fn cmd_label_ensure(
         || {
             if created {
                 format!(
-                    "created label #{} ({})\n",
+                    "created label {} ({})\n",
                     terminal_text(&label.name),
                     label.color
                 )
             } else {
                 format!(
-                    "label #{} ({}) already exists\n",
+                    "label {} ({}) already exists\n",
                     terminal_text(&label.name),
                     label.color
                 )
@@ -1745,7 +1745,7 @@ fn cmd_label_edit(
         || label_json(&label),
         || {
             format!(
-                "updated label #{} ({})\n",
+                "updated label {} ({})\n",
                 terminal_text(&label.name),
                 label.color
             )
@@ -1775,7 +1775,7 @@ fn cmd_label_delete(store: &mut Store, query: &str, json_mode: bool) -> Result<R
         },
         || {
             format!(
-                "deleted label #{} (unassigned from {tasks_unassigned} task{})\n",
+                "deleted label {} (unassigned from {tasks_unassigned} task{})\n",
                 terminal_text(&label.name),
                 if tasks_unassigned == 1 { "" } else { "s" }
             )

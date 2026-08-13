@@ -1029,10 +1029,14 @@ fn slash_labels_manager_creates_renames_and_deletes_a_global_label() {
     assert_eq!(app.labels[0].color, LabelColor::Brown);
 
     press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
-    assert!(message(&app).contains("remove it from every task"));
+    assert_eq!(
+        message(&app),
+        "Press Backspace again to delete bug! and remove it from every task"
+    );
     press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
     assert!(app.labels.is_empty());
     assert!(app.selected_task().unwrap().label_ids.is_empty());
+    assert_eq!(message(&app), "Label bug! deleted and unassigned");
 }
 
 #[test]

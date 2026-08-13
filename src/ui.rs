@@ -2831,7 +2831,7 @@ fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             f,
             &mut editor.name,
             name_area,
-            "name without #",
+            "",
             !editor.color_focused,
             theme,
         );

@@ -1792,13 +1792,13 @@ fn handle_labels_key(app: &mut App, key: KeyEvent) {
             let confirm = Confirm::DeleteLabel(label.id.clone());
             if app.awaiting(confirm.clone()) {
                 if app.delete_label_by_id(&label.id) {
-                    app.info(format!("Label #{} deleted and unassigned", label.name));
+                    app.info(format!("Label {} deleted and unassigned", label.name));
                 }
             } else {
                 app.ask_confirm(
                     confirm,
                     format!(
-                        "Press Backspace again to delete #{} and remove it from every task",
+                        "Press Backspace again to delete {} and remove it from every task",
                         label.name
                     ),
                 );

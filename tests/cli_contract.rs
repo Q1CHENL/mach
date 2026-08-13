@@ -653,8 +653,10 @@ fn label_crud_preserves_identity_reports_counts_and_only_unassigns_tasks() {
     );
     let plain_labels = mach(dir.path(), &["labels"]);
     let plain_labels = String::from_utf8(plain_labels.stdout).unwrap();
-    assert!(plain_labels.contains("#Bug  red  1/2"));
-    assert!(plain_labels.contains("#Backend  orange  0/1"));
+    assert!(plain_labels.contains("Bug  red  1/2"));
+    assert!(plain_labels.contains("Backend  orange  0/1"));
+    assert!(!plain_labels.contains("#Bug"));
+    assert!(!plain_labels.contains("#Backend"));
 
     let renamed = mach(
         dir.path(),
@@ -776,14 +778,16 @@ fn repeatable_label_filters_are_conjunctive_and_compose_with_task_filters() {
 
     let plain = mach(dir.path(), &["list", "--label", "Bug", "--open"]);
     let plain = String::from_utf8(plain.stdout).unwrap();
-    assert!(plain.contains("#Backend #Bug"));
+    assert!(plain.contains("Backend Bug"));
+    assert!(!plain.contains("#Backend"));
+    assert!(!plain.contains("#Bug"));
     assert!(plain.contains("both open"));
     assert!(plain.contains("bug only"));
     assert!(!plain.contains("backend only"));
 
     let shown = mach(dir.path(), &["show", both_open["id"].as_str().unwrap()]);
     let shown = String::from_utf8(shown.stdout).unwrap();
-    assert!(shown.contains("labels:     #Backend #Bug"));
+    assert!(shown.contains("labels:     Backend Bug"));
 
     assert!(bug_only["labels"].is_array());
     assert!(backend_only["labels"].is_array());

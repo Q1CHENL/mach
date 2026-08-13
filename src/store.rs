@@ -2987,11 +2987,6 @@ fn normalize_and_validate(
         if trimmed.is_empty() {
             return Err(StoreError::Validation("label name cannot be empty".into()));
         }
-        if trimmed.starts_with('#') {
-            return Err(StoreError::Validation(
-                "label name must not start with '#'".into(),
-            ));
-        }
         if trimmed.graphemes(true).count() > MAX_LABEL_NAME_LEN {
             return Err(StoreError::Validation(format!(
                 "label name {:?} exceeds {MAX_LABEL_NAME_LEN} characters",
