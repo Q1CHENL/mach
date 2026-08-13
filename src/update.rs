@@ -341,9 +341,8 @@ fn resolve_install_destination(
         .unwrap_or_else(|| home.join(".cargo"))
         .join("bin");
     if is_cargo_managed(current_exe, &cargo_bin) {
-        return Err("this mach executable is managed by Cargo; update it with \
-             'cargo install --locked mach-tui', or set MACH_INSTALL_DIR to install a release \
-             binary elsewhere"
+        return Err("Installation managed by Cargo: \
+             cargo install --locked mach-tui"
             .into());
     }
     if install_paths_match(current_exe, &default_destination) {
@@ -1219,15 +1218,17 @@ mod tests {
     }
 
     #[test]
-    fn cargo_managed_binary_requires_cargo_or_an_explicit_release_destination() {
+    fn cargo_managed_binary_names_its_update_command() {
         let home = Path::new("/home/alice");
         let cargo_home = home.join(".cargo");
         let current_exe = cargo_home.join("bin/mach");
 
         let error = resolve_install_destination(None, Some(home), Some(&current_exe), None)
             .expect_err("a Cargo-managed executable must not create a shadow release install");
-        assert!(error.contains("Cargo"));
-        assert!(error.contains("cargo install --locked mach-tui"));
+        assert_eq!(
+            error,
+            "Installation managed by Cargo: cargo install --locked mach-tui"
+        );
 
         assert_eq!(
             resolve_install_destination(
