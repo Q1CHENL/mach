@@ -72,6 +72,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     let theme = app.theme();
+    let labels_layout = (app.mode == Mode::Labels).then(|| label_manager_layout(app, area));
+    let preview_image_occlusion = labels_layout.as_ref().map(|layout| layout.rect);
     let [content, status] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(area);
     // The panels sit against each other: two borders is already a
@@ -94,11 +96,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Mode::TaskForm => match docked_task_form_layout(preview_rect) {
                 Some(layout) => draw_task_form(f, app, &theme, preview_rect, layout),
                 None => {
-                    draw_task_preview(f, app, &theme, preview_rect);
+                    draw_task_preview(f, app, &theme, preview_rect, preview_image_occlusion);
                     modal_task_form = true;
                 }
             },
-            _ => draw_task_preview(f, app, &theme, preview_rect),
+            _ => draw_task_preview(f, app, &theme, preview_rect, preview_image_occlusion),
         }
     } else {
         app.areas.preview = Rect::ZERO;
@@ -116,7 +118,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.mode {
         Mode::Help => draw_help(f, app, &theme, area),
         Mode::Settings => draw_settings(f, app, &theme, area),
-        Mode::Labels => draw_labels(f, app, &theme, area),
+        Mode::Labels => draw_labels(
+            f,
+            app,
+            &theme,
+            labels_layout.as_ref().expect("labels mode owns its layout"),
+        ),
         Mode::Welcome => draw_welcome(f, app, &theme, area),
         Mode::WhatsNew => draw_whats_new(f, &theme, area),
         Mode::CategoryForm => draw_category_form(f, app, &theme, area),
@@ -426,7 +433,13 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
 }
 
 /// Read-only view of the selected task in the permanent preview pane.
-fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+fn draw_task_preview(
+    f: &mut Frame,
+    app: &mut App,
+    theme: &Theme,
+    area: Rect,
+    image_occlusion: Option<Rect>,
+) {
     let focused = false;
     let block = panel("Task preview", focused, theme);
     let inner = block.inner(area);
@@ -546,7 +559,15 @@ fn draw_task_preview(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         ..
     } = app;
     if let Some(paint) = preview_form.as_mut() {
-        draw_description(f, paint, store, theme, description_area, false, None);
+        draw_description(
+            f,
+            paint,
+            store,
+            theme,
+            description_area,
+            false,
+            image_occlusion,
+        );
         if paint.description.content_height() > usize::from(description_area.height)
             && description_area.height > 0
         {
@@ -2705,7 +2726,13 @@ fn draw_settings(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
-fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+struct LabelManagerLayout {
+    rect: Rect,
+    flow: Vec<(String, Rect)>,
+    flow_rows: u16,
+}
+
+fn label_manager_layout(app: &App, area: Rect) -> LabelManagerLayout {
     let editing = app.label_editor.is_some();
     let width = 48.min(area.width);
     let content_width = width.saturating_sub(4);
@@ -2716,6 +2743,22 @@ fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         .saturating_add(if editing { 10 } else { 2 })
         .min(area.height);
     let rect = centered(area, width, height);
+    LabelManagerLayout {
+        rect,
+        flow,
+        flow_rows,
+    }
+}
+
+fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, layout: &LabelManagerLayout) {
+    let editing = app.label_editor.is_some();
+    let LabelManagerLayout {
+        rect,
+        flow,
+        flow_rows,
+    } = layout;
+    let rect = *rect;
+    let width = rect.width;
     let hint = if let Some(error) = &app.label_error {
         Line::styled(
             format!(" {} ", truncate(error, width.saturating_sub(4) as usize)),
@@ -2793,7 +2836,7 @@ fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             f,
             theme,
             rect,
-            flow_rows as usize,
+            *flow_rows as usize,
             visible_rows as usize,
             start_row as usize,
             true,

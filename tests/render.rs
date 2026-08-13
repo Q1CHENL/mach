@@ -353,6 +353,25 @@ fn task_form_overlays_replace_overlapped_description_images_with_a_marker() {
 }
 
 #[test]
+fn labels_manager_occludes_underlying_task_preview_images() {
+    let mut app = sample_app();
+    app.settings.preview_position = "right".into();
+    app.tasks[0].description = (0..14)
+        .map(|_| Block::text("line"))
+        .chain(std::iter::once(Block::image("missing.png")))
+        .collect();
+    app.rebuild_view();
+    app.open_labels();
+    app.begin_new_label();
+
+    let screen = render(&mut app, 140, 50);
+    assert!(
+        screen.contains("[image]"),
+        "the labels manager must hide the preview image protocol it covers:\n{screen}"
+    );
+}
+
+#[test]
 fn narrow_side_preview_uses_a_stacked_in_place_editor() {
     let mut app = sample_app();
     app.settings.preview_position = "right".into();
