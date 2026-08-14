@@ -10,7 +10,7 @@ use ratatui::style::Modifier;
 
 use mach::app::{App, Focus, Mode};
 use mach::form::CategoryForm;
-use mach::model::{Block, Category, Task};
+use mach::model::{Block, Category, LabelColor, Task};
 use mach::store::Store;
 use mach::ui;
 
@@ -322,6 +322,26 @@ fn draws_labels_manager_and_task_label_picker_at_supported_sizes() {
             assert!(picker.contains("bug"), "{picker}");
         }
     }
+}
+
+#[test]
+fn task_label_picker_shows_manage_when_choices_fit_the_color_palette() {
+    let mut app = sample_app();
+    let choice_count = LabelColor::ALL.len().saturating_sub(2);
+    for index in 0..choice_count {
+        app.create_label(&format!("label-{index:02}")).unwrap();
+    }
+    app.open_edit_task();
+    app.form
+        .as_mut()
+        .unwrap()
+        .set_field(mach::form::Field::Labels);
+    app.form.as_mut().unwrap().open_label_picker();
+
+    let picker = render(&mut app, 100, 44);
+
+    assert!(picker.contains("label-09"), "{picker}");
+    assert!(picker.contains("Manage"), "{picker}");
 }
 
 #[test]

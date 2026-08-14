@@ -38,6 +38,8 @@ const LIST_WIDTH_MIN: u16 = 24;
 const PREVIEW_WIDTH_MIN: u16 = 28;
 /// Whole right column narrower than this → no side preview.
 const PREVIEW_SIDE_MIN: u16 = LIST_WIDTH_MIN + PREVIEW_WIDTH_MIN + 1;
+/// One full color cycle plus the Manage labels action before scrolling.
+const LABEL_PICKER_MAX_ROWS: usize = LabelColor::ALL.len() + 1;
 pub const MIN_TERMINAL_WIDTH: u16 = 60;
 pub const MIN_TERMINAL_HEIGHT: u16 = 16;
 
@@ -1275,7 +1277,7 @@ fn draw_due_picker(
 /// Bounded, scrolling task-label selector. Selection changes remain in the
 /// task draft; dismissing the overlay does not save the form.
 fn label_picker_rect(total_rows: usize, field: Rect, area: Rect) -> Rect {
-    let desired_rows = total_rows.clamp(1, 8) as u16;
+    let desired_rows = total_rows.clamp(1, LABEL_PICKER_MAX_ROWS) as u16;
     let desired_height = desired_rows.saturating_add(2).min(area.height);
     let width = field.width.min(area.width);
     let below = field.bottom();
