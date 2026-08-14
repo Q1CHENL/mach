@@ -79,8 +79,9 @@ is_raw_asset() {
 raw_count=0
 for raw_path in "$raw_dist"/*; do
   [ -e "$raw_path" ] || continue
-  [ -f "$raw_path" ] && [ ! -L "$raw_path" ] \
-    || fail "unexpected non-file raw artifact: $raw_path"
+  if [ ! -f "$raw_path" ] || [ -L "$raw_path" ]; then
+    fail "unexpected non-file raw artifact: $raw_path"
+  fi
   is_raw_asset "${raw_path##*/}" \
     || fail "unexpected raw artifact: ${raw_path##*/}"
   raw_count=$((raw_count + 1))
@@ -104,8 +105,9 @@ do
   raw_asset=mach-${target}
   archive_asset=${raw_asset}.tar.gz
   raw_path=${raw_dist}/${raw_asset}
-  [ -f "$raw_path" ] && [ ! -L "$raw_path" ] \
-    || fail "missing raw platform binary: $raw_asset"
+  if [ ! -f "$raw_path" ] || [ -L "$raw_path" ]; then
+    fail "missing raw platform binary: $raw_asset"
+  fi
 
   cp "$raw_path" "${stage}/mach"
   chmod 755 "${stage}/mach"
