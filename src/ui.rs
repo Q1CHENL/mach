@@ -1233,10 +1233,13 @@ fn task_form_image_occlusion(form: &crate::form::TaskForm, area: Rect) -> Option
 }
 
 const DUE_PICKER_CAL_COLS: u16 = 21;
+const DUE_PICKER_TRAILING_COLS: u16 = 1;
 const DUE_PICKER_HEIGHT: u16 = 13;
 
 fn due_picker_rect(field: Rect, area: Rect) -> Rect {
-    let width = (DUE_PICKER_CAL_COLS + 2).max(field.width).min(area.width);
+    let width = (DUE_PICKER_CAL_COLS + DUE_PICKER_TRAILING_COLS + 2)
+        .max(field.width)
+        .min(area.width);
     let below = field.bottom();
     Rect {
         x: field.x.min(area.right().saturating_sub(width)),
@@ -1271,9 +1274,9 @@ fn draw_due_picker(
     // Underlined rather than filled, to match the task list.
     events.add(day, theme.selection().add_modifier(Modifier::UNDERLINED));
 
-    // Monthly needs 21 columns (` Su Mo …` / 7×3-wide day cells). Borders
-    // add 2; keep the panel at least that wide so headers and days line up,
-    // even when the Due field itself is narrower.
+    // Monthly needs 21 columns (` Su Mo …` / 7×3-wide day cells). It includes
+    // a leading gutter but no trailing one, so retain one column before the
+    // right border even when the Due field itself is narrower.
     let rect = due_picker_rect(field, area);
     areas.occlude_hover(rect);
     let block = Block::bordered()
