@@ -15,16 +15,16 @@ pub const BANNER_WIDTH: u16 = 35;
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
     (
-        "Agent-ready CLI",
-        "Search task text and idempotently ensure categories or labels from scripts and agents.",
+        "Faster label navigation",
+        "Type to jump in the Labels manager or task label picker without filtering or changing assignments.",
     ),
     (
-        "Reorder categories",
-        "Use Option+Up or Option+Down in manual view to put categories in the order you want.",
+        "Scroll descriptions",
+        "Use the mouse wheel over long task previews and task or category description editors.",
     ),
     (
-        "Cleaner task views",
-        "Label names render as entered, hidden-completed views show open counts, and overlays no longer corrupt images.",
+        "Clearer mouse feedback",
+        "Interactive rows and calendar dates now respond to hover, with more balanced label and due pickers.",
     ),
 ];
 
