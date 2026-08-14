@@ -431,16 +431,7 @@ fn download_verified_binary(
     target_version: &Version,
     progress: impl FnMut(DownloadProgress),
 ) -> Result<(Version, InstallDisposition), String> {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(DOWNLOAD_TIMEOUT))
-        .build();
-    let agent: ureq::Agent = config.into();
-    let mut response = agent
-        .get(url)
-        .header("User-Agent", USER_AGENT)
-        .header("Accept", "application/octet-stream")
-        .call()
-        .map_err(map_download_err)?;
+    let mut response = download_response(url)?;
     let total = response.body().content_length();
     if total.is_some_and(|total| total > MAX_BINARY_BYTES) {
         return Err(format!(
@@ -456,6 +447,19 @@ fn download_verified_binary(
         total,
         progress,
     )
+}
+
+fn download_response(url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(DOWNLOAD_TIMEOUT))
+        .build();
+    let agent: ureq::Agent = config.into();
+    agent
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/octet-stream")
+        .call()
+        .map_err(map_download_err)
 }
 
 fn write_verified_binary<R: Read>(
@@ -953,16 +957,7 @@ fn parse_nonnegative_decimal(value: &str) -> Option<i64> {
 }
 
 fn download_checksum_manifest(url: &str) -> Result<String, String> {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(DOWNLOAD_TIMEOUT))
-        .build();
-    let agent: ureq::Agent = config.into();
-    let mut response = agent
-        .get(url)
-        .header("User-Agent", USER_AGENT)
-        .header("Accept", "application/octet-stream")
-        .call()
-        .map_err(map_download_err)?;
+    let mut response = download_response(url)?;
     read_bounded_text(response.body_mut().as_reader(), MAX_TEXT_BYTES)
 }
 

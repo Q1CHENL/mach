@@ -73,6 +73,10 @@ const MAX_MANIFEST_STRUCTURE_BYTES: u64 = (1
 const MAX_MANIFEST_BYTES: u64 =
     MAX_MANIFEST_STRING_BYTES * JSON_ESCAPE_EXPANSION + MAX_MANIFEST_STRUCTURE_BYTES + 1;
 
+fn archive_image_path(storage_name: &str) -> String {
+    format!("images/{storage_name}")
+}
+
 #[derive(Debug)]
 pub(crate) enum ArchiveError {
     Cancelled,
@@ -607,7 +611,7 @@ impl<'a> ExportAttachment<'a> {
             sha256: &attachment.sha256,
             media_type: &attachment.media_type,
             byte_len: attachment.byte_len,
-            file: format!("images/{}", attachment.storage_name),
+            file: archive_image_path(&attachment.storage_name),
         }
     }
 }
@@ -749,7 +753,6 @@ impl ArchiveAttachment {
                 byte_len: self.byte_len,
                 storage_name,
             },
-            file: self.file,
         })
     }
 }
@@ -1045,7 +1048,6 @@ where
 #[derive(Debug, Clone)]
 struct ImportedAttachment {
     metadata: Attachment,
-    file: String,
 }
 
 struct ImportedArchive {
@@ -1368,7 +1370,11 @@ fn read_manifest(
         .map(ArchiveAttachment::into_imported)
         .collect::<Result<_, _>>()?;
     let expected_names: HashSet<_> = std::iter::once(MANIFEST_PATH.to_string())
-        .chain(attachments.iter().map(|attachment| attachment.file.clone()))
+        .chain(
+            attachments
+                .iter()
+                .map(|attachment| archive_image_path(&attachment.metadata.storage_name)),
+        )
         .collect();
     if &expected_names != names {
         let mut unexpected: Vec<_> = names.difference(&expected_names).cloned().collect();
@@ -1607,7 +1613,8 @@ fn stage_attachments(
         control.check_cancelled()?;
         let path = directory.join(&attachment.metadata.storage_name);
         let mut output = create_private_file(&path)?;
-        let mut entry = zip.by_name(&attachment.file)?;
+        let archive_path = archive_image_path(&attachment.metadata.storage_name);
+        let mut entry = zip.by_name(&archive_path)?;
         if entry.size() != attachment.metadata.byte_len {
             return Err(ArchiveError::Invalid(format!(
                 "archive image {} has length {}, expected {}",
