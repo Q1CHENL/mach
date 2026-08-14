@@ -362,7 +362,7 @@ pub struct App {
     /// Description/preview image store.
     pub images: ImageStore,
     pub(crate) attachments: Vec<Attachment>,
-    /// Type-to-jump buffer (Tasks/Sidebar focus); cleared on timeout.
+    /// Type-to-jump buffer for task, category, and label rows; cleared on timeout.
     typeahead: String,
     typeahead_at: Option<Instant>,
     /// Needs a redraw.
@@ -1447,6 +1447,8 @@ impl App {
 
     /// Type-to-jump: append `c` and select the best fuzzy match (list unchanged).
     pub fn typeahead_jump(&mut self, c: char) {
+        let label_picker_open = self.mode == Mode::TaskForm
+            && self.form.as_ref().is_some_and(TaskForm::label_picker_open);
         let now = Instant::now();
         if self
             .typeahead_at
@@ -1454,14 +1456,41 @@ impl App {
         {
             self.typeahead.clear();
         }
-        let limit = match self.focus {
-            Focus::Tasks => MAX_TITLE_LEN,
-            Focus::Sidebar => MAX_CATEGORY_NAME_LEN,
+        let limit = match self.mode {
+            Mode::Labels => MAX_LABEL_NAME_LEN,
+            Mode::TaskForm if label_picker_open => MAX_LABEL_NAME_LEN,
+            _ => match self.focus {
+                Focus::Tasks => MAX_TITLE_LEN,
+                Focus::Sidebar => MAX_CATEGORY_NAME_LEN,
+            },
         };
         if self.typeahead.graphemes(true).count() < limit {
             self.typeahead.push(c);
         }
         self.typeahead_at = Some(now);
+
+        if label_picker_open {
+            let best = self.form.as_ref().and_then(|form| {
+                let names = form.label_choices().map(|(_, name, _, _)| name);
+                crate::fuzzy::best_index(&self.typeahead, names)
+            });
+            if let Some(pos) = best {
+                if let Some(form) = &mut self.form {
+                    form.select_label_picker(pos);
+                }
+                self.cancel_pending();
+            }
+            return;
+        }
+
+        if self.mode == Mode::Labels {
+            let names = self.labels.iter().map(|label| label.name.as_str());
+            if let Some(pos) = crate::fuzzy::best_index(&self.typeahead, names) {
+                self.label_index = pos;
+                self.cancel_pending();
+            }
+            return;
+        }
 
         match self.focus {
             Focus::Tasks => {
@@ -1560,7 +1589,7 @@ impl App {
         }
     }
 
-    fn clear_typeahead(&mut self) {
+    pub(crate) fn clear_typeahead(&mut self) {
         self.typeahead.clear();
         self.typeahead_at = None;
     }
@@ -1687,6 +1716,7 @@ impl App {
         self.task_edit_base = None;
         self.form = Some(form);
         self.mode = Mode::TaskForm;
+        self.clear_typeahead();
     }
 
     /// Opens the dialog on the selected task.
@@ -1705,6 +1735,7 @@ impl App {
             self.task_edit_base = Some(task);
             self.form = Some(form);
             self.mode = Mode::TaskForm;
+            self.clear_typeahead();
         }
     }
 
@@ -1718,6 +1749,7 @@ impl App {
         self.images.release_form_graphics();
         self.images.clear_preview();
         self.cancel_pending();
+        self.clear_typeahead();
     }
 
     /// Validates the open form and writes it back to the task list.
@@ -2051,6 +2083,7 @@ impl App {
         self.label_editor = None;
         self.label_error = None;
         self.cancel_pending();
+        self.clear_typeahead();
         self.dirty = true;
     }
 
@@ -2067,6 +2100,7 @@ impl App {
         self.label_editor = None;
         self.label_error = None;
         self.cancel_pending();
+        self.clear_typeahead();
         self.dirty = true;
     }
 
@@ -2075,9 +2109,17 @@ impl App {
             return;
         }
         let last = self.labels.len() - 1;
-        self.label_index = (self.label_index as isize + delta).clamp(0, last as isize) as usize;
-        self.cancel_pending();
-        self.dirty = true;
+        let next = (self.label_index as isize + delta).clamp(0, last as isize) as usize;
+        self.select_label(next);
+    }
+
+    pub fn select_label(&mut self, index: usize) {
+        if index < self.labels.len() && index != self.label_index {
+            self.label_index = index;
+            self.cancel_pending();
+            self.clear_typeahead();
+            self.dirty = true;
+        }
     }
 
     pub fn begin_new_label(&mut self) {
@@ -2092,6 +2134,7 @@ impl App {
         ));
         self.label_error = None;
         self.cancel_pending();
+        self.clear_typeahead();
     }
 
     pub fn begin_rename_label(&mut self) {
@@ -2105,6 +2148,7 @@ impl App {
         ));
         self.label_error = None;
         self.cancel_pending();
+        self.clear_typeahead();
     }
 
     pub fn cancel_label_editor(&mut self) {
@@ -2159,6 +2203,7 @@ impl App {
             Ok(_) => {
                 self.label_index = self.label_index.min(self.labels.len().saturating_sub(1));
                 self.cancel_pending();
+                self.clear_typeahead();
                 true
             }
             Err(error) => {

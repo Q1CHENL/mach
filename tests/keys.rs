@@ -542,6 +542,68 @@ fn typing_jumps_to_the_best_matching_category() {
 }
 
 #[test]
+fn typing_jumps_to_the_best_matching_label() {
+    let mut app = app();
+    app.create_label("bug").unwrap();
+    app.create_label("backend").unwrap();
+    app.create_label("release").unwrap();
+    app.open_labels();
+    assert_eq!(
+        app.selected_label().map(|label| label.name.as_str()),
+        Some("bug")
+    );
+
+    press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+    assert_eq!(
+        app.selected_label().map(|label| label.name.as_str()),
+        Some("release")
+    );
+
+    press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+    assert_eq!(
+        app.selected_label().map(|label| label.name.as_str()),
+        Some("release")
+    );
+    assert_eq!(app.labels.len(), 3, "labels are not filtered");
+}
+
+#[test]
+fn typing_jumps_to_the_best_matching_label_in_task_form_picker() {
+    let mut app = app();
+    app.create_label("bug").unwrap();
+    app.create_label("backend").unwrap();
+    app.create_label("release").unwrap();
+    app.focus = Focus::Tasks;
+    press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+    assert_eq!(
+        app.selected_task().map(|task| task.title.as_str()),
+        Some("second")
+    );
+    app.open_edit_task();
+    app.form
+        .as_mut()
+        .unwrap()
+        .set_field(mach::form::Field::Labels);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+    assert_eq!(app.form.as_ref().unwrap().label_picker.unwrap().index, 2);
+
+    press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+    assert_eq!(app.form.as_ref().unwrap().label_picker.unwrap().index, 2);
+
+    press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+    let form = app.form.as_ref().unwrap();
+    assert_eq!(form.label_picker.unwrap().index, 1);
+    assert_eq!(form.label_choices().count(), 3, "labels are not filtered");
+    assert!(
+        form.label_ids().is_empty(),
+        "typing does not toggle a label"
+    );
+}
+
+#[test]
 fn ctrl_a_opens_new_task_and_plain_a_does_not() {
     let mut app = app();
     app.select_category(1); // Work

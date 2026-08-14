@@ -1077,6 +1077,18 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_label_picker_key(app: &mut App, key: KeyEvent) {
+    if let KeyCode::Char(c) = key.code
+        && c != ' '
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        && !c.is_control()
+    {
+        app.typeahead_jump(c);
+        return;
+    }
+    app.clear_typeahead();
+
     let manage = app
         .form
         .as_ref()
@@ -1764,21 +1776,8 @@ fn handle_labels_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down => move_label_selection_row(app, true),
         KeyCode::PageUp => app.move_label_selection(-10),
         KeyCode::PageDown => app.move_label_selection(10),
-        KeyCode::Home => {
-            if app.label_index != 0 {
-                app.label_index = 0;
-                app.cancel_pending();
-                app.dirty = true;
-            }
-        }
-        KeyCode::End => {
-            let last = app.labels.len().saturating_sub(1);
-            if app.label_index != last {
-                app.label_index = last;
-                app.cancel_pending();
-                app.dirty = true;
-            }
-        }
+        KeyCode::Home => app.select_label(0),
+        KeyCode::End => app.select_label(app.labels.len().saturating_sub(1)),
         KeyCode::Char('a') | KeyCode::Char('A')
             if key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
@@ -1803,6 +1802,14 @@ fn handle_labels_key(app: &mut App, key: KeyEvent) {
                     ),
                 );
             }
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                && !c.is_control() =>
+        {
+            app.typeahead_jump(c);
         }
         _ => {}
     }
@@ -1838,9 +1845,7 @@ fn move_label_selection_row(app: &mut App, down: bool) {
         })
         .map(|(index, _)| *index);
     if let Some(index) = candidate {
-        app.label_index = index;
-        app.cancel_pending();
-        app.dirty = true;
+        app.select_label(index);
     } else {
         app.move_label_selection(if down { 1 } else { -1 });
     }
@@ -2083,8 +2088,7 @@ fn handle_labels_mouse(app: &mut App, mouse: MouseEvent) {
     else {
         return;
     };
-    app.label_index = row;
-    app.dirty = true;
+    app.select_label(row);
     if clicked_again(app, ClickTarget::Labels, row) {
         app.begin_rename_label();
     }
@@ -2211,6 +2215,7 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
         form.label_picker_area()
             .is_some_and(|area| contains(area, m.column, m.row))
     }) {
+        app.clear_typeahead();
         let delta = if m.kind == MouseEventKind::ScrollUp {
             -1
         } else {
@@ -2275,6 +2280,7 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
         .as_ref()
         .is_some_and(|form| form.label_picker_open())
     {
+        app.clear_typeahead();
         let inside = app.form.as_ref().is_some_and(|form| {
             form.label_picker_area()
                 .is_some_and(|area| contains(area, m.column, m.row))
