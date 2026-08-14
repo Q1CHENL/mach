@@ -4,7 +4,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Text;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -15,7 +15,9 @@ use ratatui_image::{Resize, StatefulImage};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Focus, MessageKind, Mode, SETTINGS_ITEMS, UpdateActivity};
+use crate::app::{
+    App, Focus, HoverPaint, HoverTarget, MessageKind, Mode, SETTINGS_ITEMS, UpdateActivity,
+};
 use crate::banner;
 use crate::due;
 use crate::form::Field;
@@ -47,7 +49,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     // Every frame owns its hit targets. Hidden overlays and undersized
     // terminals must never retain clickable geometry from an older frame.
-    app.areas = crate::app::Areas::default();
+    app.areas.reset();
     if let Some(form) = &mut app.form {
         form.areas = crate::form::FieldAreas::default();
         form.form_area = Rect::ZERO;
@@ -70,6 +72,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ))
         .centered();
         f.render_widget(p, area);
+        app.finish_hover_frame();
         return;
     }
 
@@ -135,6 +138,37 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         Mode::TaskForm => {} // Already drawn in the task preview pane.
         _ => {}
+    }
+    draw_hover(f, app, &theme);
+}
+
+/// Paint only the topmost semantic row under the pointer. Hit geometry is
+/// rebuilt from the final clipped layout on every frame, so hidden controls
+/// cannot retain hover state and modal chrome can occlude rows beneath it.
+fn draw_hover(f: &mut Frame, app: &mut App, theme: &Theme) {
+    let hit = app
+        .mouse_position()
+        .and_then(|position| app.areas.hover_hit_at(position));
+    if let Some(hit) = hit {
+        match hit.paint {
+            HoverPaint::Fill(rect) => paint_hover_background(f, rect, theme.hover()),
+            HoverPaint::Badge => f.buffer_mut().set_style(hit.hit, theme.label_hover()),
+            HoverPaint::None => {}
+        }
+    }
+    app.finish_hover_frame();
+}
+
+fn paint_hover_background(f: &mut Frame, rect: Rect, style: Style) {
+    let buffer = f.buffer_mut();
+    let rect = buffer.area.intersection(rect);
+    for y in rect.top()..rect.bottom() {
+        for x in rect.left()..rect.right() {
+            let cell = &mut buffer[(x, y)];
+            if cell.bg == Color::Reset && !cell.modifier.contains(Modifier::REVERSED) {
+                cell.set_style(style);
+            }
+        }
     }
 }
 
@@ -232,6 +266,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
     let App {
         form,
         images: store,
+        areas,
         ..
     } = app;
     let Some(form) = form.as_mut() else { return };
@@ -251,6 +286,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
         )
     };
     form.form_area = rect;
+    areas.occlude_hover(rect);
     let h_pad = if layout.is_docked() { 1 } else { 2 };
     let block = Block::bordered()
         .border_type(BorderType::Thick)
@@ -385,6 +421,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
     let overlay = f.area();
     let image_occlusion = task_form_image_occlusion(form, overlay);
     draw_description(f, form, store, theme, box_inner, focused, image_occlusion);
+    register_task_description_hover(areas, form);
     scrollbar(
         f,
         theme,
@@ -417,10 +454,10 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
     // Drawn last so it sits over the description box below it.
     // Picker/image lightbox use the full frame so they are not clipped.
     if let Some(picker) = form.picker.as_mut() {
-        draw_due_picker(f, theme, picker, form.areas.due, overlay);
+        draw_due_picker(f, theme, picker, form.areas.due, overlay, areas);
     }
     if form.label_picker_open() {
-        draw_label_picker(f, theme, form, form.areas.labels, overlay);
+        draw_label_picker(f, theme, form, form.areas.labels, overlay, areas);
     }
 
     // Preview the picture the cursor is on, or the first one otherwise.
@@ -430,6 +467,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
             .selected_image()
             .or_else(|| form.description.images().first().cloned())
     {
+        areas.occlude_hover(overlay);
         draw_image_preview(f, store, form, theme, &path, overlay);
     }
 }
@@ -626,7 +664,12 @@ fn field_block<'a>(
 /// The category dialog: the same shape as a task's, with a name and a
 /// note about what the category is for.
 fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
-    let Some(form) = &mut app.category_form else {
+    let App {
+        category_form,
+        areas,
+        ..
+    } = app;
+    let Some(form) = category_form else {
         return;
     };
     // Borders (2), name box (3), hint (1).
@@ -635,6 +678,7 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let width = 72.min(area.width.saturating_sub(4));
     let rect = centered(area, width, (CHROME + text_height).min(area.height));
     form.form_area = rect;
+    areas.occlude_hover(rect);
 
     let block = Block::bordered()
         .border_type(BorderType::Thick)
@@ -694,6 +738,14 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     if focused {
         form.description_menu_area = slash_menu_rect(&form.description, box_inner, cursor);
         draw_slash_menu(f, &form.description, theme, box_inner, cursor);
+        if let Some(menu) = form.description_menu_area {
+            register_description_menu_hover(
+                areas,
+                menu,
+                form.description.menu_commands().len(),
+                HoverTarget::CategoryDescriptionCommand,
+            );
+        }
     }
     scrollbar(
         f,
@@ -753,6 +805,42 @@ fn draw_description(
         image_layout,
         external_occlusion,
     );
+}
+
+fn register_task_description_hover(areas: &mut crate::app::Areas, form: &crate::form::TaskForm) {
+    if let Some(menu) = form.description_menu_area {
+        register_description_menu_hover(
+            areas,
+            menu,
+            form.description.menu_commands().len(),
+            HoverTarget::TaskDescriptionCommand,
+        );
+    }
+}
+
+fn register_description_menu_hover(
+    areas: &mut crate::app::Areas,
+    menu: Rect,
+    count: usize,
+    target: impl Fn(usize) -> HoverTarget,
+) {
+    areas.occlude_hover(menu);
+    let inner = menu.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    for index in 0..count.min(inner.height as usize) {
+        areas.hover_fill(
+            target(index),
+            Rect {
+                y: inner
+                    .y
+                    .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
+                height: 1,
+                ..inner
+            },
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1170,6 +1258,7 @@ fn draw_due_picker(
     picker: &mut crate::duepicker::DuePicker,
     field: Rect,
     area: Rect,
+    areas: &mut crate::app::Areas,
 ) {
     use crate::duepicker::{PickerFocus, PickerLayout};
 
@@ -1186,6 +1275,7 @@ fn draw_due_picker(
     // add 2; keep the panel at least that wide so headers and days line up,
     // even when the Due field itself is narrower.
     let rect = due_picker_rect(field, area);
+    areas.occlude_hover(rect);
     let block = Block::bordered()
         .border_type(BorderType::Thick)
         .border_style(theme.accent_text())
@@ -1228,6 +1318,7 @@ fn draw_due_picker(
                 .fg(theme.muted_color())
                 .add_modifier(Modifier::DIM),
         );
+    let day_rows = calendar.height().saturating_sub(2).min(days.height);
     f.render_widget(calendar, cal_area);
 
     // Clock only — no "Time" label — centered under the calendar.
@@ -1273,6 +1364,30 @@ fn draw_due_picker(
         },
         time_row: time_area,
     };
+    for row in 0..day_rows {
+        for column in 0..7u16 {
+            let x = days.x.saturating_add(column.saturating_mul(3));
+            let cell = Rect {
+                x,
+                y: days.y.saturating_add(row),
+                width: 3.min(days.right().saturating_sub(x)),
+                height: 1,
+            };
+            let Some(date) = picker.day_at(cell.x, cell.y) else {
+                continue;
+            };
+            if date == picker.day {
+                areas.hover_no_paint(HoverTarget::DueDay(date), cell);
+            } else {
+                let day_text = Rect {
+                    x: cell.x.saturating_add(1),
+                    width: cell.width.saturating_sub(1),
+                    ..cell
+                };
+                areas.hover_fill_with_paint(HoverTarget::DueDay(date), cell, day_text);
+            }
+        }
+    }
 }
 
 /// Bounded, scrolling task-label selector. Selection changes remain in the
@@ -1309,6 +1424,7 @@ fn draw_label_picker(
     form: &mut crate::form::TaskForm,
     field: Rect,
     area: Rect,
+    areas: &mut crate::app::Areas,
 ) {
     let choices = form
         .label_choices()
@@ -1322,6 +1438,7 @@ fn draw_label_picker(
         .unwrap_or_default()
         .min(total_rows.saturating_sub(1));
     let rect = label_picker_rect(total_rows, field, area);
+    areas.occlude_hover(rect);
     let width = rect.width;
     let footer = if let Some(error) = &form.error {
         Line::styled(
@@ -1387,6 +1504,18 @@ fn draw_label_picker(
         })
         .collect::<Vec<_>>();
     f.render_widget(Paragraph::new(lines), inner);
+    for index in start..total_rows.min(start.saturating_add(visible)) {
+        areas.hover_fill(
+            HoverTarget::TaskLabel(index),
+            Rect {
+                y: inner
+                    .y
+                    .saturating_add(u16::try_from(index - start).unwrap_or(u16::MAX)),
+                height: 1,
+                ..inner
+            },
+        );
+    }
     paint_scrollbar(f, theme, rect, total_rows, visible, start, true, 1);
 }
 
@@ -1904,6 +2033,25 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     });
     f.render_widget(block, area);
     f.render_stateful_widget(list, list_area, &mut app.cat_state);
+    if panels_accept_mouse(app) && !app.searching {
+        let start = app.cat_state.offset();
+        for index in start..app.categories.len() {
+            let y = list_area
+                .y
+                .saturating_add(u16::try_from(index - start).unwrap_or(u16::MAX));
+            if y >= list_area.bottom() {
+                break;
+            }
+            app.areas.hover_fill(
+                HoverTarget::Sidebar(index),
+                Rect {
+                    y,
+                    height: 1,
+                    ..list_area
+                },
+            );
+        }
+    }
     if let Some(hint_area) = hint_area {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -2049,21 +2197,34 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         if y >= inner.bottom() {
             break;
         }
-        let crate::app::TaskListRow::Separator { title } = row else {
-            continue;
-        };
-        // Align the name with task titles (after `[ ]` + column gap).
-        let title_x = (DONE_MARK_WIDTH + 1) as usize;
-        let line = category_rule(title, inner.width as usize, title_x);
-        f.render_widget(
-            Paragraph::new(Span::styled(line, rule_style)),
-            Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: 1,
-            },
-        );
+        match row {
+            crate::app::TaskListRow::Separator { title } => {
+                // Align the name with task titles (after `[ ]` + column gap).
+                let title_x = (DONE_MARK_WIDTH + 1) as usize;
+                let line = category_rule(title, inner.width as usize, title_x);
+                f.render_widget(
+                    Paragraph::new(Span::styled(line, rule_style)),
+                    Rect {
+                        x: inner.x,
+                        y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                );
+            }
+            crate::app::TaskListRow::Task(view_index) if panels_accept_mouse(app) => {
+                app.areas.hover_fill(
+                    HoverTarget::Task(*view_index),
+                    Rect {
+                        x: inner.x,
+                        y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                );
+            }
+            crate::app::TaskListRow::Task(_) => {}
+        }
     }
 
     scrollbar(
@@ -2075,6 +2236,13 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         app.task_state.offset(),
         chrome_focus,
     );
+}
+
+fn panels_accept_mouse(app: &App) -> bool {
+    matches!(
+        app.mode,
+        Mode::Normal | Mode::Search | Mode::TaskForm | Mode::CategoryForm
+    ) && !app.form.as_ref().is_some_and(|form| form.preview)
 }
 
 /// If `vis` is the first task under a section header, do not let the table
@@ -2555,6 +2723,23 @@ fn draw_slash_palette(f: &mut Frame, app: &mut App, theme: &Theme, status: Rect)
         ));
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+    app.areas.occlude_hover(rect);
+    let inner = rect.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    for index in start..commands.len().min(start.saturating_add(visible_rows)) {
+        app.areas.hover_fill(
+            HoverTarget::SlashCommand(index),
+            Rect {
+                y: inner
+                    .y
+                    .saturating_add(u16::try_from(index - start).unwrap_or(u16::MAX)),
+                height: 1,
+                ..inner
+            },
+        );
+    }
 }
 
 /// One row of a small dropdown: no leading arrow; selection wash runs
@@ -2761,6 +2946,7 @@ fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, layout: &LabelManage
         flow_rows,
     } = layout;
     let rect = *rect;
+    app.areas.occlude_hover(rect);
     let width = rect.width;
     let hint = if let Some(error) = &app.label_error {
         Line::styled(
@@ -2825,6 +3011,11 @@ fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, layout: &LabelManage
                 height: 1,
             };
             app.areas.label_hits.push((index, screen));
+            if index == selected {
+                app.areas.hover_fill(HoverTarget::Label(index), screen);
+            } else {
+                app.areas.hover_badge(HoverTarget::Label(index), screen);
+            }
             let style = if index == selected {
                 theme.label_focus()
             } else {

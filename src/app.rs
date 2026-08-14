@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
-use ratatui::layout::Rect;
+use chrono::{NaiveDate, Utc};
+use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{ListState, TableState};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -233,6 +233,37 @@ pub(crate) enum UpdateActivity {
     Downloading(crate::update::DownloadProgress),
 }
 
+/// Semantic mouse targets. Identity is deliberately independent of screen
+/// coordinates so moving within one control does not request another frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoverTarget {
+    Occluded,
+    Sidebar(usize),
+    Task(usize),
+    SlashCommand(usize),
+    TaskLabel(usize),
+    TaskDescriptionCommand(usize),
+    CategoryDescriptionCommand(usize),
+    Label(usize),
+    DueDay(NaiveDate),
+}
+
+/// Hover paint is kept separate from hit geometry so modal chrome can block
+/// rows beneath it without becoming a painted target itself.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum HoverPaint {
+    Fill(Rect),
+    Badge,
+    None,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HoverHit {
+    pub target: HoverTarget,
+    pub hit: Rect,
+    pub paint: HoverPaint,
+}
+
 /// Rects from the last frame, used to hit-test mouse events.
 #[derive(Debug, Default, Clone)]
 pub struct Areas {
@@ -259,6 +290,60 @@ pub struct Areas {
     /// Name field and selectable color swatches in the label editor.
     pub label_name_input: Rect,
     pub label_color_hits: Vec<(LabelColor, Rect)>,
+    pub(crate) hover_hits: Vec<HoverHit>,
+}
+
+impl Areas {
+    /// Clear frame-local geometry without reallocating the variable-sized hit
+    /// lists. This also keeps GIF-driven redraws cheap when the pointer is idle.
+    pub(crate) fn reset(&mut self) {
+        let mut label_hits = std::mem::take(&mut self.label_hits);
+        let mut label_color_hits = std::mem::take(&mut self.label_color_hits);
+        let mut hover_hits = std::mem::take(&mut self.hover_hits);
+        label_hits.clear();
+        label_color_hits.clear();
+        hover_hits.clear();
+        *self = Self {
+            label_hits,
+            label_color_hits,
+            hover_hits,
+            ..Self::default()
+        };
+    }
+
+    pub(crate) fn hover_fill(&mut self, target: HoverTarget, rect: Rect) {
+        self.hover(target, rect, HoverPaint::Fill(rect));
+    }
+
+    pub(crate) fn hover_fill_with_paint(&mut self, target: HoverTarget, hit: Rect, paint: Rect) {
+        self.hover(target, hit, HoverPaint::Fill(paint));
+    }
+
+    pub(crate) fn hover_badge(&mut self, target: HoverTarget, rect: Rect) {
+        self.hover(target, rect, HoverPaint::Badge);
+    }
+
+    pub(crate) fn occlude_hover(&mut self, rect: Rect) {
+        self.hover(HoverTarget::Occluded, rect, HoverPaint::None);
+    }
+
+    pub(crate) fn hover_no_paint(&mut self, target: HoverTarget, rect: Rect) {
+        self.hover(target, rect, HoverPaint::None);
+    }
+
+    fn hover(&mut self, target: HoverTarget, hit: Rect, paint: HoverPaint) {
+        if !hit.is_empty() {
+            self.hover_hits.push(HoverHit { target, hit, paint });
+        }
+    }
+
+    pub(crate) fn hover_hit_at(&self, position: Position) -> Option<HoverHit> {
+        self.hover_hits
+            .iter()
+            .rev()
+            .find(|hit| hit.hit.contains(position))
+            .copied()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -361,6 +446,8 @@ pub struct App {
     pub(crate) last_click: Option<(Instant, ClickTarget, usize)>,
     pub should_quit: bool,
     pub areas: Areas,
+    mouse_position: Option<Position>,
+    hover_target: Option<HoverTarget>,
     /// Description/preview image store.
     pub images: ImageStore,
     pub(crate) attachments: Vec<Attachment>,
@@ -492,6 +579,8 @@ impl App {
             last_click: None,
             should_quit: false,
             areas: Areas::default(),
+            mouse_position: None,
+            hover_target: None,
             images,
             attachments,
             typeahead: String::new(),
@@ -1201,6 +1290,29 @@ impl App {
 
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    /// Remember the pointer and report only semantic hover transitions.
+    pub(crate) fn track_mouse(&mut self, column: u16, row: u16) -> bool {
+        let position = Position { x: column, y: row };
+        self.mouse_position = Some(position);
+        let target = self.areas.hover_hit_at(position).map(|hit| hit.target);
+        let changed = target != self.hover_target;
+        self.hover_target = target;
+        changed
+    }
+
+    pub(crate) fn mouse_position(&self) -> Option<Position> {
+        self.mouse_position
+    }
+
+    /// Re-resolve against the geometry just drawn. This keeps a stationary
+    /// pointer correct after scrolling, resizing, or changing overlays.
+    pub(crate) fn finish_hover_frame(&mut self) {
+        self.hover_target = self
+            .mouse_position
+            .and_then(|position| self.areas.hover_hit_at(position))
+            .map(|hit| hit.target);
     }
 
     pub fn invalidate_preview(&mut self) {

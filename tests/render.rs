@@ -5,12 +5,15 @@
 //! render each mode at a few sizes — including ones barely big enough —
 //! and assert the frame comes out with something recognisable on it.
 
+use chrono::{Datelike, Duration};
 use ratatui::buffer::Buffer;
+use ratatui::crossterm::event::{Event, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::style::Modifier;
 
 use mach::app::{App, Focus, Mode};
 use mach::form::CategoryForm;
-use mach::model::{Block, Category, LabelColor, Task};
+use mach::input::handle_event;
+use mach::model::{Block, Category, Label, LabelColor, Task};
 use mach::store::Store;
 use mach::ui;
 
@@ -58,6 +61,18 @@ fn buffer_text(buffer: &Buffer) -> String {
         .map(|y| row_text(buffer, y))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn move_mouse(app: &mut App, column: u16, row: u16) -> bool {
+    handle_event(
+        app,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    )
 }
 
 /// An app with two categories and a few tasks, backed by an independent
@@ -121,6 +136,233 @@ fn draws_the_main_screen() {
     // Flags, tick marks and the due date all share the row.
     assert!(screen.contains("[✓]") && screen.contains("[ ]"), "{screen}");
     assert!(screen.contains("⚑"), "{screen}");
+}
+
+#[test]
+fn hover_adds_background_only_to_an_unselected_task_row() {
+    let mut app = sample_app();
+    let label = Label::new("tag", LabelColor::Orange);
+    let label_id = label.id.clone();
+    app.labels.push(label);
+    app.tasks
+        .iter_mut()
+        .find(|task| task.title == "no category")
+        .unwrap()
+        .label_ids
+        .push(label_id);
+    let initial = draw(&mut app, 100, 30);
+    let (selected_x, selected_y) = find_cells(&initial, "ship the release");
+    let selected_style = initial[(selected_x, selected_y)].style();
+    let (other_x, other_y) = find_cells(&initial, "no category");
+    let other_style = initial[(other_x, other_y)].style();
+    let (label_x, label_y) = find_cells(&initial, "tag");
+    let label_style = initial[(label_x, label_y)].style();
+    let selected = app.task_index;
+
+    assert!(move_mouse(&mut app, selected_x, selected_y));
+    let selected_hover = draw(&mut app, 100, 30);
+    let hovered_style = selected_hover[(selected_x, selected_y)].style();
+    assert_eq!(
+        hovered_style, selected_style,
+        "the selected row must keep its stronger active style"
+    );
+
+    assert!(move_mouse(&mut app, other_x, other_y));
+    let other_hover = draw(&mut app, 100, 30);
+    let hovered_style = other_hover[(other_x, other_y)].style();
+    assert!(
+        hovered_style.bg != other_style.bg
+            || (hovered_style
+                .add_modifier
+                .contains(Modifier::DIM | Modifier::REVERSED)
+                && !other_style
+                    .add_modifier
+                    .contains(Modifier::DIM | Modifier::REVERSED)),
+        "an unselected task row should gain a background-style hover state"
+    );
+    assert!(
+        !hovered_style.add_modifier.contains(Modifier::UNDERLINED),
+        "hover is a background, not an underline"
+    );
+    assert_eq!(
+        other_hover[(label_x, label_y)].style(),
+        label_style,
+        "task-row hover must preserve a label badge's identity color"
+    );
+    assert_eq!(
+        other_hover[(selected_x, selected_y)].style(),
+        selected_style,
+        "the previous selected row must retain only its active style"
+    );
+    assert_eq!(
+        app.task_index, selected,
+        "drawing hover cannot select a task"
+    );
+}
+
+#[test]
+fn category_command_and_label_items_receive_background_hover() {
+    let assert_hover_changed = |before: &Buffer, after: &Buffer, x, y, kind: &str| {
+        let before = before[(x, y)].style();
+        let after = after[(x, y)].style();
+        assert_ne!(after, before, "{kind} should receive hover styling");
+        assert!(
+            !after.add_modifier.contains(Modifier::UNDERLINED),
+            "{kind} hover must not add an underline"
+        );
+    };
+
+    let mut categories = sample_app();
+    let initial = draw(&mut categories, 100, 30);
+    let (x, y) = find_cells(&initial, "Home");
+    assert!(move_mouse(&mut categories, x, y));
+    let hovered = draw(&mut categories, 100, 30);
+    assert_hover_changed(&initial, &hovered, x, y, "category row");
+
+    let mut commands = sample_app();
+    commands.mode = Mode::Slash;
+    let initial = draw(&mut commands, 100, 30);
+    let (x, y) = find_cells(&initial, "/settings");
+    assert!(move_mouse(&mut commands, x, y));
+    let hovered = draw(&mut commands, 100, 30);
+    assert_hover_changed(&initial, &hovered, x, y, "command row");
+
+    let mut labels = sample_app();
+    labels.create_label("bug").unwrap();
+    labels.create_label("feat").unwrap();
+    labels.open_labels();
+    let initial = draw(&mut labels, 100, 30);
+    let (selected_x, selected_y) = find_cells(&initial, "bug");
+    let selected_style = initial[(selected_x, selected_y)].style();
+    let (x, y) = find_cells(&initial, "feat");
+    assert!(move_mouse(&mut labels, x, y));
+    let hovered = draw(&mut labels, 100, 30);
+    assert_hover_changed(&initial, &hovered, x, y, "label item");
+
+    assert!(move_mouse(&mut labels, selected_x, selected_y));
+    let selected_hover = draw(&mut labels, 100, 30);
+    assert_eq!(
+        selected_hover[(selected_x, selected_y)].style(),
+        selected_style,
+        "the selected label must keep its active style"
+    );
+}
+
+#[test]
+fn form_fields_do_not_receive_hover_styling() {
+    let mut app = sample_app();
+    app.open_edit_task();
+    let initial = draw(&mut app, 100, 30);
+    let title = app.form.as_ref().unwrap().areas.title;
+    let category = app.form.as_ref().unwrap().areas.category;
+    let (title_x, title_y) = find_cells(&initial, " Title ");
+    let (category_x, category_y) = find_cells(&initial, " Category ");
+    let title_style = initial[(title_x, title_y)].style();
+    let category_style = initial[(category_x, category_y)].style();
+    let field = app.form.as_ref().unwrap().field;
+
+    assert!(handle_event(
+        &mut app,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: title.x,
+            row: title.y,
+            modifiers: KeyModifiers::NONE,
+        }),
+    ));
+    let title_hover = draw(&mut app, 100, 30);
+    assert_eq!(
+        title_hover[(title_x, title_y)].style(),
+        title_style,
+        "field chrome must not receive hover styling"
+    );
+
+    assert!(!handle_event(
+        &mut app,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: category.x,
+            row: category.y,
+            modifiers: KeyModifiers::NONE,
+        }),
+    ));
+    let category_hover = draw(&mut app, 100, 30);
+    assert_eq!(
+        category_hover[(category_x, category_y)].style(),
+        category_style,
+        "moving between form fields must not introduce hover styling"
+    );
+    assert_eq!(app.form.as_ref().unwrap().field, field);
+}
+
+#[test]
+fn due_calendar_hover_marks_one_date_without_overriding_the_active_date() {
+    let mut app = sample_app();
+    app.open_edit_task();
+    app.form.as_mut().unwrap().open_due_picker();
+    let initial = draw(&mut app, 100, 40);
+    let picker = app.form.as_ref().unwrap().picker.as_ref().unwrap();
+    let days = picker.layout.days;
+    let selected = picker.day;
+    let first = selected.with_day(1).unwrap();
+    let start = first
+        .checked_sub_signed(Duration::days(
+            first.weekday().num_days_from_sunday().into(),
+        ))
+        .unwrap();
+    let cell_for = |date: chrono::NaiveDate| {
+        let offset = date.signed_duration_since(start).num_days() as u16;
+        (
+            days.x.saturating_add((offset % 7).saturating_mul(3)),
+            days.y.saturating_add(offset / 7),
+        )
+    };
+
+    let (selected_x, selected_y) = cell_for(selected);
+    let selected_text_x = selected_x.saturating_add(2);
+    let selected_style = initial[(selected_text_x, selected_y)].style();
+    assert!(move_mouse(&mut app, selected_x, selected_y));
+    let active_hover = draw(&mut app, 100, 40);
+    assert_eq!(
+        active_hover[(selected_text_x, selected_y)].style(),
+        selected_style,
+        "the active date must keep its stronger selection style"
+    );
+
+    let next = selected.succ_opt().unwrap();
+    let (next_x, next_y) = cell_for(next);
+    let next_first_digit_x = next_x.saturating_add(1);
+    let next_text_x = next_x.saturating_add(2);
+    let gutter_style = initial[(next_x, next_y)].style();
+    let first_digit_style = initial[(next_first_digit_x, next_y)].style();
+    let before = initial[(next_text_x, next_y)].style();
+    assert!(move_mouse(&mut app, next_x, next_y));
+    let hovered = draw(&mut app, 100, 40);
+    assert_eq!(
+        hovered[(next_x, next_y)].style(),
+        gutter_style,
+        "the one-cell date gutter must remain unpainted"
+    );
+    assert_ne!(
+        hovered[(next_first_digit_x, next_y)].style(),
+        first_digit_style,
+        "the two-character day field should include its leading digit cell"
+    );
+    let after = hovered[(next_text_x, next_y)].style();
+    assert!(
+        after.bg != before.bg
+            || (after
+                .add_modifier
+                .contains(Modifier::DIM | Modifier::REVERSED)
+                && !before
+                    .add_modifier
+                    .contains(Modifier::DIM | Modifier::REVERSED)),
+        "an unselected calendar date should gain a background hover"
+    );
+    assert!(
+        !after.add_modifier.contains(Modifier::UNDERLINED),
+        "date hover is a background, not an underline"
+    );
 }
 
 #[test]

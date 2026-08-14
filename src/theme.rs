@@ -59,6 +59,31 @@ pub fn tint(color: Color) -> Color {
     Color::Rgb(wash(r), wash(g), wash(b))
 }
 
+/// A lower-emphasis accent surface for pointer hover. On dark terminals it
+/// softens the selection wash toward a neutral dark surface; on light
+/// terminals it produces a pale accent tint.
+fn hover_tint(color: Color, light_background: bool) -> Color {
+    let (r, g, b) = rgb_of(color);
+    if light_background {
+        let pale = |channel: u8| ((u16::from(channel) + 5 * 255) / 6) as u8;
+        Color::Rgb(pale(r), pale(g), pale(b))
+    } else {
+        let (r, g, b) = rgb_of(tint(color));
+        let soften = |channel: u8| ((u16::from(channel) + 32) / 2) as u8;
+        Color::Rgb(soften(r), soften(g), soften(b))
+    }
+}
+
+fn contrasting_text(background: Color) -> Color {
+    let (r, g, b) = rgb_of(background);
+    let luminance = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1_000;
+    if luminance >= 128 {
+        Color::Indexed(16)
+    } else {
+        Color::Indexed(231)
+    }
+}
+
 /// The RGB behind a palette index.
 fn rgb_of(color: Color) -> (u8, u8, u8) {
     let code = match color {
@@ -239,15 +264,8 @@ impl Theme {
         } else {
             self.label_color(color)
         };
-        let (r, g, b) = rgb_of(background);
-        let luminance = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1_000;
-        let foreground = if luminance >= 128 {
-            Color::Indexed(16)
-        } else {
-            Color::Indexed(231)
-        };
         Style::new()
-            .fg(foreground)
+            .fg(contrasting_text(background))
             .bg(background)
             .remove_modifier(Modifier::REVERSED)
     }
@@ -276,6 +294,31 @@ impl Theme {
                     240
                 }))
                 .add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Lower-emphasis background for an unselected row. NO_COLOR cannot emit
+    /// RGB, so reverse video supplies the background and DIM keeps it below
+    /// the selected/focused state.
+    pub fn hover(&self) -> Style {
+        if self.colors_disabled {
+            Style::new().add_modifier(Modifier::DIM | Modifier::REVERSED)
+        } else {
+            Style::new().bg(hover_tint(self.accent, self.light_background))
+        }
+    }
+
+    /// Label-manager badges already own their background, so their hover
+    /// state also supplies a readable foreground.
+    pub fn label_hover(&self) -> Style {
+        if self.colors_disabled {
+            self.hover()
+        } else {
+            let background = hover_tint(self.accent, self.light_background);
+            Style::new()
+                .fg(contrasting_text(background))
+                .bg(background)
+                .remove_modifier(Modifier::REVERSED)
         }
     }
 
@@ -329,6 +372,16 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::REVERSED)
         );
+        assert!(
+            no_color
+                .hover()
+                .add_modifier
+                .contains(Modifier::DIM | Modifier::REVERSED),
+            "NO_COLOR still needs a background-like hover state"
+        );
+        assert!(!no_color.hover().add_modifier.contains(Modifier::BOLD));
+        assert!(!no_color.hover().add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(no_color.hover().bg, None);
 
         let light = Theme::with_environment("white", false, true);
         assert_eq!(light.accent, Color::Indexed(238));
@@ -345,7 +398,16 @@ mod tests {
             light.label_badge(LabelColor::Red, true).bg,
             Some(Color::Indexed(238))
         );
+        assert!(light.hover().bg.is_some());
+        assert!(!light.hover().add_modifier.contains(Modifier::UNDERLINED));
         let dark_yellow = Theme::with_environment("yellow", false, false);
+        assert!(dark_yellow.hover().bg.is_some());
+        assert!(
+            !dark_yellow
+                .hover()
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
         assert_eq!(
             dark_yellow.label_badge(LabelColor::Yellow, false).bg,
             Some(Color::Indexed(226))

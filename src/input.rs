@@ -24,6 +24,7 @@ pub fn handle_event(app: &mut App, event: Event) -> bool {
             handle_key(app, key);
             true
         }
+        Event::Mouse(m) if m.kind == MouseEventKind::Moved => app.track_mouse(m.column, m.row),
         Event::Mouse(m)
             if matches!(
                 m.kind,
@@ -32,6 +33,7 @@ pub fn handle_event(app: &mut App, event: Event) -> bool {
                     | MouseEventKind::ScrollDown
             ) =>
         {
+            let _ = app.track_mouse(m.column, m.row);
             handle_mouse(app, m);
             true
         }

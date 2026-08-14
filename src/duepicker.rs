@@ -86,6 +86,12 @@ impl DuePicker {
         hit(self.layout.frame, x, y)
     }
 
+    /// Calendar date under a painted day cell, including surrounding-month
+    /// days. Shared by click handling and hover registration.
+    pub(crate) fn day_at(&self, x: u16, y: u16) -> Option<NaiveDate> {
+        date_at_click(self.day, self.layout.days, x, y)
+    }
+
     /// Apply a left-click. Returns true when the click was handled.
     pub fn click(&mut self, x: u16, y: u16) -> bool {
         let layout = self.layout;
@@ -97,7 +103,7 @@ impl DuePicker {
             self.set_focus(PickerFocus::Minute);
             return true;
         }
-        if let Some(day) = date_at_click(self.day, layout.days, x, y) {
+        if let Some(day) = self.day_at(x, y) {
             self.set_day(day);
             self.set_focus(PickerFocus::Calendar);
             return true;

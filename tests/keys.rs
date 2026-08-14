@@ -107,6 +107,18 @@ fn click(app: &mut App, column: u16, row: u16) {
     );
 }
 
+fn move_mouse(app: &mut App, column: u16, row: u16) -> bool {
+    handle_event(
+        app,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    )
+}
+
 fn release_click(app: &mut App, column: u16, row: u16) {
     handle_event(
         app,
@@ -176,6 +188,110 @@ fn stateful_terminal_events_request_a_redraw() {
         &mut app,
         Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
     ));
+}
+
+#[test]
+fn mouse_motion_redraws_only_when_the_hover_target_changes() {
+    let mut app = app();
+    let buffer = draw(&mut app, 100, 30);
+    let (title_x, row) = find_cells(&buffer, "first");
+    assert!(
+        app.areas.tasks.contains((title_x, row).into()),
+        "the test task must be in the clickable task list"
+    );
+    let selected = app.task_index;
+    let focus = app.focus;
+    let done = app.selected_task().unwrap().done;
+
+    assert!(
+        move_mouse(&mut app, title_x, row),
+        "entering a task redraws"
+    );
+    assert!(
+        !move_mouse(&mut app, title_x + 1, row),
+        "motion within the same task target is free"
+    );
+
+    let done_x = app.areas.done_x.unwrap();
+    assert!(
+        !move_mouse(&mut app, done_x + 1, row),
+        "one task row is one visual hover target"
+    );
+    assert!(move_mouse(&mut app, 0, 0), "leaving every target redraws");
+    assert!(!move_mouse(&mut app, 0, 1), "empty-space motion is free");
+
+    assert!(move_mouse(&mut app, title_x, row));
+    app.mode = Mode::Help;
+    let _ = draw(&mut app, 100, 30);
+    assert!(
+        !move_mouse(&mut app, title_x + 1, row),
+        "a new frame must re-resolve a stationary pointer against its final targets"
+    );
+
+    assert_eq!(app.task_index, selected, "hover cannot change selection");
+    assert_eq!(app.focus, focus, "hover cannot take keyboard focus");
+    assert_eq!(
+        app.selected_task().unwrap().done,
+        done,
+        "hover cannot invoke the target"
+    );
+}
+
+#[test]
+fn form_chrome_stays_unpainted_while_due_dates_are_individual_targets() {
+    let mut app = app();
+    app.select_category(1);
+    app.tasks
+        .iter_mut()
+        .find(|task| task.title == "first")
+        .unwrap()
+        .due = "2030-01-02".into();
+    app.open_edit_task();
+    let _ = draw(&mut app, 100, 40);
+    let title = app.form.as_ref().unwrap().areas.title;
+    let category = app.form.as_ref().unwrap().areas.category;
+    let field = app.form.as_ref().unwrap().field;
+
+    assert!(move_mouse(&mut app, title.x, title.y));
+    assert!(!move_mouse(&mut app, title.x.saturating_add(1), title.y));
+    assert!(
+        !move_mouse(&mut app, category.x, category.y),
+        "form fields share one non-painting occlusion target"
+    );
+    assert_eq!(app.form.as_ref().unwrap().field, field);
+
+    app.form.as_mut().unwrap().open_due_picker();
+    let _ = draw(&mut app, 100, 40);
+    let picker = app.form.as_ref().unwrap().picker.as_ref().unwrap();
+    let days = picker.layout.days;
+    let hour = picker.layout.hour;
+    let minute = picker.layout.minute;
+    let day = picker.day;
+    let focus = picker.focus;
+
+    assert!(
+        move_mouse(&mut app, days.x, days.y),
+        "entering a calendar date redraws"
+    );
+    assert!(
+        !move_mouse(&mut app, days.x.saturating_add(1), days.y),
+        "moving within picker chrome does not redraw"
+    );
+    assert!(
+        move_mouse(&mut app, days.x.saturating_add(3), days.y),
+        "each calendar date is a distinct hover target"
+    );
+    assert!(
+        move_mouse(&mut app, hour.x, hour.y),
+        "leaving a date for picker chrome removes its hover"
+    );
+    assert!(
+        !move_mouse(&mut app, minute.x, minute.y),
+        "hour and minute remain part of the non-painting picker chrome"
+    );
+    let picker = app.form.as_ref().unwrap().picker.as_ref().unwrap();
+    assert_eq!(picker.day, day);
+    assert_eq!(picker.focus, focus);
 }
 
 // ------------------------------------------------------------------ quit
