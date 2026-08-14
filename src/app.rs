@@ -2665,16 +2665,17 @@ mod tests {
     }
 
     fn update_result(newer: bool) -> crate::update::CheckResult {
+        let tag = if newer { "v0.3.0" } else { "v0.2.0" };
         crate::update::CheckResult {
             current: "0.2.0".into(),
             latest: if newer { "0.3.0" } else { "0.2.0" }.into(),
-            tag: if newer { "v0.3.0" } else { "v0.2.0" }.into(),
+            tag: tag.into(),
             newer,
             prerelease: false,
             release_url: "https://example.test/release".into(),
-            asset_name: "mach-aarch64-apple-darwin".into(),
-            asset_url: "https://example.test/binary".into(),
-            checksums_url: "https://example.test/SHA256SUMS".into(),
+            asset_name: "mach-aarch64-apple-darwin.tar.gz".into(),
+            asset_url: "https://example.test/archive".into(),
+            checksums_url: format!("https://example.test/mach-{tag}-checksums.txt"),
         }
     }
 

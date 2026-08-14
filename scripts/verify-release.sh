@@ -11,8 +11,10 @@ need() {
 }
 
 need awk
+need cmp
 need grep
 need jq
+need tar
 need tr
 need wc
 
@@ -36,7 +38,7 @@ file_size() {
   printf '%s\n' "$size"
 }
 
-is_binary_asset() {
+is_raw_asset() {
   case "$1" in
     mach-x86_64-unknown-linux-gnu \
       | mach-aarch64-unknown-linux-gnu \
@@ -46,12 +48,104 @@ is_binary_asset() {
   esac
 }
 
+is_archive_asset() {
+  case "$1" in
+    mach-x86_64-unknown-linux-gnu.tar.gz \
+      | mach-aarch64-unknown-linux-gnu.tar.gz \
+      | mach-x86_64-apple-darwin.tar.gz \
+      | mach-aarch64-apple-darwin.tar.gz) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+set_release_contract() {
+  release_version=$1
+  validate_stable_version "$release_version"
+  checksums_asset=mach-v${release_version}-checksums.txt
+  release_assets="
+mach-x86_64-unknown-linux-gnu.tar.gz
+mach-aarch64-unknown-linux-gnu.tar.gz
+mach-x86_64-apple-darwin.tar.gz
+mach-aarch64-apple-darwin.tar.gz
+mach-x86_64-unknown-linux-gnu
+mach-aarch64-unknown-linux-gnu
+mach-x86_64-apple-darwin
+mach-aarch64-apple-darwin
+${checksums_asset}
+SHA256SUMS"
+}
+
 is_release_asset() {
-  is_binary_asset "$1" || [ "$1" = SHA256SUMS ]
+  is_archive_asset "$1" \
+    || is_raw_asset "$1" \
+    || [ "$1" = "$checksums_asset" ] \
+    || [ "$1" = SHA256SUMS ]
+}
+
+verify_checksum_manifest() {
+  manifest_path=$1
+  asset_kind=$2
+  manifest_name=${manifest_path##*/}
+  manifest_count=0
+  seen_assets=' '
+  while IFS=' ' read -r expected_sha asset extra; do
+    [ -z "${extra:-}" ] \
+      || fail "$manifest_name entries must contain exactly two fields"
+    asset=${asset#\*}
+    case "$asset_kind" in
+      archive) is_archive_asset "$asset" ;;
+      raw) is_raw_asset "$asset" ;;
+      *) fail "unknown checksum asset kind: $asset_kind" ;;
+    esac || fail "$manifest_name contains an unexpected asset: $asset"
+    case "$expected_sha" in
+      '' | *[!0-9A-Fa-f]*) fail "$manifest_name has an invalid digest for $asset" ;;
+    esac
+    [ "${#expected_sha}" -eq 64 ] \
+      || fail "$manifest_name has an invalid digest for $asset"
+    case "$seen_assets" in
+      *" $asset "*) fail "$manifest_name contains duplicate entries for $asset" ;;
+    esac
+    seen_assets="${seen_assets}${asset} "
+    actual_sha=$(sha256_file "${dist}/${asset}")
+    expected_sha=$(printf '%s' "$expected_sha" | tr 'A-F' 'a-f')
+    [ "$actual_sha" = "$expected_sha" ] \
+      || fail "SHA-256 verification failed for $asset"
+    manifest_count=$((manifest_count + 1))
+  done < "$manifest_path"
+  [ "$manifest_count" -eq 4 ] \
+    || fail "$manifest_name must contain exactly four $asset_kind entries"
+}
+
+verify_archive_payloads() {
+  for target in \
+    x86_64-unknown-linux-gnu \
+    aarch64-unknown-linux-gnu \
+    x86_64-apple-darwin \
+    aarch64-apple-darwin
+  do
+    raw_asset=mach-${target}
+    archive_asset=${raw_asset}.tar.gz
+    archive_path=${dist}/${archive_asset}
+    archive_entries=$(tar -tzf "$archive_path") \
+      || fail "could not list release archive: $archive_asset"
+    [ "$archive_entries" = mach ] \
+      || fail "$archive_asset must contain exactly one root entry named mach"
+    archive_listing=$(tar -tvzf "$archive_path") \
+      || fail "could not inspect release archive: $archive_asset"
+    case "$archive_listing" in
+      -rwxr-xr-x*' mach') : ;;
+      *) fail "$archive_asset must contain an executable regular file named mach" ;;
+    esac
+    COPYFILE_DISABLE=1 tar -xOzf "$archive_path" mach \
+      | cmp - "${dist}/${raw_asset}" \
+      || fail "$archive_asset does not contain the smoke-tested $raw_asset bytes"
+  done
 }
 
 verify_local() {
   dist=$1
+  version=$2
+  set_release_contract "$version"
   [ -d "$dist" ] || fail "artifact directory does not exist: $dist"
 
   asset_count=0
@@ -62,44 +156,17 @@ verify_local() {
     is_release_asset "$asset" || fail "unexpected local artifact: $asset"
     asset_count=$((asset_count + 1))
   done
-  [ "$asset_count" -eq 5 ] \
-    || fail "expected five local release assets, found $asset_count"
+  [ "$asset_count" -eq 10 ] \
+    || fail "expected ten bridge release assets, found $asset_count"
 
-  for asset in \
-    mach-x86_64-unknown-linux-gnu \
-    mach-aarch64-unknown-linux-gnu \
-    mach-x86_64-apple-darwin \
-    mach-aarch64-apple-darwin \
-    SHA256SUMS
+  for asset in $release_assets
   do
     [ -f "${dist}/${asset}" ] || fail "missing local release asset: $asset"
   done
 
-  manifest_count=0
-  seen_assets=' '
-  while IFS=' ' read -r expected_sha asset extra; do
-    [ -z "${extra:-}" ] \
-      || fail 'SHA256SUMS entries must contain exactly two fields'
-    asset=${asset#\*}
-    is_binary_asset "$asset" \
-      || fail "SHA256SUMS contains an unexpected asset: $asset"
-    case "$expected_sha" in
-      '' | *[!0-9A-Fa-f]*) fail "SHA256SUMS has an invalid digest for $asset" ;;
-    esac
-    [ "${#expected_sha}" -eq 64 ] \
-      || fail "SHA256SUMS has an invalid digest for $asset"
-    case "$seen_assets" in
-      *" $asset "*) fail "SHA256SUMS contains duplicate entries for $asset" ;;
-    esac
-    seen_assets="${seen_assets}${asset} "
-    actual_sha=$(sha256_file "${dist}/${asset}")
-    expected_sha=$(printf '%s' "$expected_sha" | tr 'A-F' 'a-f')
-    [ "$actual_sha" = "$expected_sha" ] \
-      || fail "SHA-256 verification failed for $asset"
-    manifest_count=$((manifest_count + 1))
-  done < "${dist}/SHA256SUMS"
-  [ "$manifest_count" -eq 4 ] \
-    || fail "SHA256SUMS must contain exactly four binary entries"
+  verify_checksum_manifest "${dist}/${checksums_asset}" archive
+  verify_checksum_manifest "${dist}/SHA256SUMS" raw
+  verify_archive_payloads
 }
 
 verify_github() {
@@ -108,20 +175,28 @@ verify_github() {
   notes_path=$3
   expected_draft=$4
   release_label=$5
-  verify_local "$dist"
+  version=$6
+  verify_local "$dist" "$version"
   [ -f "$release_json" ] || fail "release JSON does not exist: $release_json"
   [ -s "$notes_path" ] || fail "release notes do not exist or are empty: $notes_path"
 
-  jq -e --argjson expected_draft "$expected_draft" '
+  jq -e \
+    --argjson expected_draft "$expected_draft" \
+    --arg checksums_asset "$checksums_asset" '
     .draft == $expected_draft
     and .prerelease == false
-    and ([.assets[].name] | sort == [
+    and ([.assets[].name] | sort == ([
       "SHA256SUMS",
+      $checksums_asset,
       "mach-aarch64-apple-darwin",
+      "mach-aarch64-apple-darwin.tar.gz",
       "mach-aarch64-unknown-linux-gnu",
+      "mach-aarch64-unknown-linux-gnu.tar.gz",
       "mach-x86_64-apple-darwin",
-      "mach-x86_64-unknown-linux-gnu"
-    ])
+      "mach-x86_64-apple-darwin.tar.gz",
+      "mach-x86_64-unknown-linux-gnu",
+      "mach-x86_64-unknown-linux-gnu.tar.gz"
+    ] | sort))
   ' "$release_json" >/dev/null \
     || fail "GitHub $release_label does not contain exactly the expected release assets"
 
@@ -130,12 +205,7 @@ verify_github() {
   [ "$remote_body" = "$expected_body" ] \
     || fail "GitHub $release_label notes do not match $notes_path"
 
-  for asset in \
-    mach-x86_64-unknown-linux-gnu \
-    mach-aarch64-unknown-linux-gnu \
-    mach-x86_64-apple-darwin \
-    mach-aarch64-apple-darwin \
-    SHA256SUMS
+  for asset in $release_assets
   do
     remote_size=$(jq -er --arg name "$asset" \
       '.assets[] | select(.name == $name) | .size' "$release_json")
@@ -230,7 +300,7 @@ verify_notes() {
     || fail 'release notes must contain exactly one Full Changelog line'
 }
 
-usage="usage: $0 local DIST | notes FILE VERSION PREVIOUS | github DIST RELEASE_JSON NOTES_FILE | github-published DIST RELEASE_JSON NOTES_FILE | crate ARCHIVE VERSION VERSION_JSON | newer VERSION PREVIOUS"
+usage="usage: $0 local DIST VERSION | notes FILE VERSION PREVIOUS | github DIST RELEASE_JSON NOTES_FILE VERSION | github-published DIST RELEASE_JSON NOTES_FILE VERSION | crate ARCHIVE VERSION VERSION_JSON | newer VERSION PREVIOUS"
 
 if [ "$#" -lt 2 ]; then
   fail "$usage"
@@ -239,10 +309,10 @@ fi
 mode=$1
 shift
 case "$mode:$#" in
-  local:1) verify_local "$1" ;;
+  local:2) verify_local "$1" "$2" ;;
   notes:3) verify_notes "$1" "$2" "$3" ;;
-  github:3) verify_github "$1" "$2" "$3" true draft ;;
-  github-published:3) verify_github "$1" "$2" "$3" false release ;;
+  github:4) verify_github "$1" "$2" "$3" true draft "$4" ;;
+  github-published:4) verify_github "$1" "$2" "$3" false release "$4" ;;
   crate:3) verify_crate "$1" "$2" "$3" ;;
   newer:2) verify_newer "$1" "$2" ;;
   *) fail "$usage" ;;

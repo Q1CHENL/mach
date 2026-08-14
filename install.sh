@@ -8,13 +8,14 @@ set -eu
 
 REPO=Q1CHENL/mach
 BIN_NAME=mach
-CHECKSUMS_ASSET=SHA256SUMS
 INSTALL_DIR=${MACH_INSTALL_DIR:-${HOME}/.local/bin}
 RELEASE_BASE=${MACH_RELEASE_BASE_URL:-https://github.com/${REPO}/releases/download}
 API_LATEST=${MACH_API_LATEST_URL:-https://api.github.com/repos/${REPO}/releases/latest}
 USER_AGENT=mach-install
 MAX_TEXT_BYTES=1048576
+MAX_ARCHIVE_BYTES=134217728
 MAX_BINARY_BYTES=134217728
+ARCHIVE_MIN_VERSION=0.8.1
 RECEIPT_NAME=.mach-release-install
 LOCK_NAME=.mach-install.lock
 LOCK_OWNER=owner
@@ -47,6 +48,7 @@ version_at_least() {
 
 need awk
 need chmod
+need cp
 need curl
 need date
 need grep
@@ -55,6 +57,7 @@ need mktemp
 need mv
 need sed
 need sleep
+need tar
 need tr
 need uname
 need wc
@@ -272,11 +275,12 @@ case "$os" in
   *) fail "unsupported OS '$os' (Linux and macOS only)" ;;
 esac
 
-asset=${BIN_NAME}-${target}
+raw_asset=${BIN_NAME}-${target}
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/mach-install.XXXXXX")
-manifest=${tmpdir}/${CHECKSUMS_ASSET}
 release_json=${tmpdir}/release.json
+payload=
+manifest=
 dest_tmp=
 
 cleanup() {
@@ -288,7 +292,7 @@ cleanup() {
   if [ -n "$receipt_tmp" ] && [ -e "$receipt_tmp" ]; then
     rm -f "$receipt_tmp"
   fi
-  rm -f "$manifest" "$release_json"
+  rm -f "$payload" "$manifest" "$release_json"
   rmdir "$tmpdir" 2>/dev/null || :
 }
 trap cleanup EXIT
@@ -310,17 +314,29 @@ printf '%s\n' "$tag" \
   | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
   || fail "MACH_VERSION must be an exact stable semver tag (for example v0.2.0)"
 target_version=${tag#v}
+archive_release=true
+asset=${raw_asset}.tar.gz
+checksums_asset=${BIN_NAME}-${tag}-checksums.txt
+payload_limit=$MAX_ARCHIVE_BYTES
+if ! version_is_at_least "$target_version" "$ARCHIVE_MIN_VERSION"; then
+  archive_release=false
+  asset=$raw_asset
+  checksums_asset=SHA256SUMS
+  payload_limit=$MAX_BINARY_BYTES
+fi
+payload=${tmpdir}/${asset}
+manifest=${tmpdir}/${checksums_asset}
 
 asset_url=${RELEASE_BASE}/${tag}/${asset}
-checksums_url=${RELEASE_BASE}/${tag}/${CHECKSUMS_ASSET}
+checksums_url=${RELEASE_BASE}/${tag}/${checksums_asset}
 
 mkdir -p "$INSTALL_DIR"
 dest_tmp=$(mktemp "${INSTALL_DIR}/.mach.XXXXXX")
 
 printf 'Downloading %s\n' "$asset_url"
 download "$checksums_url" "$manifest" "$MAX_TEXT_BYTES" \
-  "$CHECKSUMS_ASSET for $tag"
-download "$asset_url" "$dest_tmp" "$MAX_BINARY_BYTES" "$asset for $tag"
+  "$checksums_asset for $tag"
+download "$asset_url" "$payload" "$payload_limit" "$asset for $tag"
 
 if ! expected_sha=$(
   awk -v asset="$asset" '
@@ -335,19 +351,45 @@ if ! expected_sha=$(
     }
   ' "$manifest"
 ); then
-  fail "$CHECKSUMS_ASSET must contain exactly one two-field entry for $asset"
+  fail "$checksums_asset must contain exactly one two-field entry for $asset"
 fi
 case "$expected_sha" in
-  *[!0-9A-Fa-f]* | '') fail "$CHECKSUMS_ASSET has no valid entry for $asset" ;;
+  *[!0-9A-Fa-f]* | '') fail "$checksums_asset has no valid entry for $asset" ;;
 esac
-[ "${#expected_sha}" -eq 64 ] || fail "$CHECKSUMS_ASSET has an invalid digest for $asset"
+[ "${#expected_sha}" -eq 64 ] || fail "$checksums_asset has an invalid digest for $asset"
 
-actual_sha=$(sha256_file "$dest_tmp")
+actual_payload_sha=$(sha256_file "$payload")
 expected_sha=$(printf '%s' "$expected_sha" | tr 'A-F' 'a-f')
-actual_sha=$(printf '%s' "$actual_sha" | tr 'A-F' 'a-f')
-[ "$actual_sha" = "$expected_sha" ] || fail "SHA-256 verification failed for $asset"
+actual_payload_sha=$(printf '%s' "$actual_payload_sha" | tr 'A-F' 'a-f')
+[ "$actual_payload_sha" = "$expected_sha" ] \
+  || fail "SHA-256 verification failed for $asset"
+
+if [ "$archive_release" = true ]; then
+  archive_entries=$(tar -tzf "$payload") \
+    || fail "could not list release archive $asset"
+  [ "$archive_entries" = "$BIN_NAME" ] \
+    || fail "$asset must contain exactly one root entry named $BIN_NAME"
+  archive_listing=$(tar -tvzf "$payload") \
+    || fail "could not inspect release archive $asset"
+  case "$archive_listing" in
+    -*' mach') : ;;
+    *) fail "$asset must contain a regular file named $BIN_NAME" ;;
+  esac
+  tar -xOzf "$payload" "$BIN_NAME" > "$dest_tmp" \
+    || fail "could not extract $BIN_NAME from $asset"
+else
+  cp "$payload" "$dest_tmp"
+fi
+binary_size=$(wc -c < "$dest_tmp" | tr -d '[:space:]')
+case "$binary_size" in
+  '' | *[!0-9]*) fail "could not measure the extracted $BIN_NAME binary" ;;
+esac
+[ "$binary_size" -gt 0 ] || fail "$asset contains an empty $BIN_NAME binary"
+[ "$binary_size" -le "$MAX_BINARY_BYTES" ] \
+  || fail "extracted $BIN_NAME exceeds the ${MAX_BINARY_BYTES}-byte limit"
 
 chmod 755 "$dest_tmp"
+binary_sha=$(sha256_file "$dest_tmp")
 destination=${INSTALL_DIR}/${BIN_NAME}
 acquire_install_lock
 [ ! -d "$destination" ] \
@@ -359,7 +401,7 @@ if installed_version=$(receipted_destination_version "$destination"); then
     rm -f "$dest_tmp"
     dest_tmp=
   else
-    record_release_version "$actual_sha" "$target_version"
+    record_release_version "$binary_sha" "$target_version"
     replace_installed_binary
     installed_version=$recorded_version
   fi
@@ -367,7 +409,7 @@ else
   receipt_status=$?
   [ "$receipt_status" -eq 1 ] \
     || fail "installed release receipt is invalid"
-  record_release_version "$actual_sha" "$target_version"
+  record_release_version "$binary_sha" "$target_version"
   replace_installed_binary
   installed_version=$recorded_version
 fi

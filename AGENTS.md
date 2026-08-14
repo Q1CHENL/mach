@@ -191,14 +191,16 @@ the following:
   `v<package-version>`.
 
 The tag workflow is the publisher. It verifies ancestry and version, builds
-four platform binaries, smoke-tests them, generates checksums and attestations,
-publishes `mach-tui` through the crates.io trusted publisher, and publishes the
-GitHub Release. Do not manually run `cargo publish` or substitute hand-built
-assets for that workflow.
+and smoke-tests four platform binaries, packages each as a `.tar.gz`, generates
+the versioned checksum manifest and attestations, publishes `mach-tui` through
+the crates.io trusted publisher, and publishes the GitHub Release. Until the
+archive-aware bridge release has been published and verified, it must also ship
+the legacy raw binaries and `SHA256SUMS` required by older self-updaters. Do not
+manually run `cargo publish` or substitute hand-built assets for that workflow.
 
 Do not call a release complete until the exact tag and SHA, CI result, GitHub
-assets and `SHA256SUMS`, attestations, crates.io version, and final Git state
-have all been verified.
+archives and versioned checksum manifest, required bridge assets, attestations,
+crates.io version, and final Git state have all been verified.
 
 ## Documentation and repository hygiene
 

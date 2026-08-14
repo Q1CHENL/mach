@@ -12,7 +12,7 @@ scripts or agents can drive.
 ## Install
 
 ```sh
-# 1. checksum-verified release binary → ~/.local/bin
+# 1. checksum-verified release archive → ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/Q1CHENL/mach/main/install.sh | sh
 
 # 2. crates.io → ~/.cargo/bin  (Rust 1.90+)

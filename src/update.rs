@@ -1,8 +1,8 @@
 //! Check for and install newer builds.
 //!
 //! Source of truth: GitHub Releases on `Q1CHENL/mach`. Fresh installs use the
-//! release installer; self-updates download and verify the exact release asset
-//! directly. The TUI schedules its next background check one day after success;
+//! release installer; self-updates download, verify, and safely extract the exact
+//! release archive. The TUI schedules its next background check one day after success;
 //! failures retry after an hour by default and honor server backoff. Install
 //! remains an explicit action through `/update` or `mach update --install`.
 
@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
+use flate2::read::GzDecoder;
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -25,12 +26,13 @@ pub const REPO: &str = "Q1CHENL/mach";
 pub const GIT_URL: &str = "https://github.com/Q1CHENL/mach";
 const RELEASES_URL: &str = "https://api.github.com/repos/Q1CHENL/mach/releases?per_page=100";
 const RELEASE_DOWNLOAD_BASE: &str = "https://github.com/Q1CHENL/mach/releases/download";
-const CHECKSUMS_ASSET: &str = "SHA256SUMS";
 const USER_AGENT: &str = concat!("mach/", env!("CARGO_PKG_VERSION"));
 const TIMEOUT: Duration = Duration::from_secs(8);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_TEXT_BYTES: u64 = 1024 * 1024;
+const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
+const ARCHIVE_BINARY_NAME: &str = "mach";
 const RELEASE_RECEIPT_DIR: &str = ".mach-release-install";
 const INSTALL_LOCK_DIR: &str = ".mach-install.lock";
 const INSTALL_LOCK_OWNER: &str = "owner";
@@ -46,7 +48,7 @@ pub struct CheckResult {
     pub newer: bool,
     pub prerelease: bool,
     pub release_url: String,
-    /// Exact platform binary and URLs bound to [`tag`](Self::tag).
+    /// Exact platform archive and URLs bound to [`tag`](Self::tag).
     pub asset_name: String,
     pub asset_url: String,
     pub checksums_url: String,
@@ -121,7 +123,7 @@ pub fn current_version() -> &'static str {
 /// Ask GitHub what the latest release is and compare to this binary.
 ///
 /// Picks the highest stable semver release that ships both this platform's
-/// binary and its checksum manifest. Requiring those assets excludes the
+/// archive and its versioned checksum manifest. Requiring those assets excludes the
 /// disconnected legacy Python releases without blocking legitimate majors.
 pub fn check() -> Result<CheckResult, String> {
     match check_with_etag(None).map_err(|error| error.message)? {
@@ -141,10 +143,10 @@ pub(crate) fn check_with_etag(etag: Option<&str>) -> Result<CheckResponse, Check
     };
     let releases: Vec<GhRelease> = serde_json::from_str(&body)
         .map_err(|e| CheckFailure::new(format!("could not parse GitHub release JSON: {e}")))?;
-    let asset_name = current_asset_name().map_err(CheckFailure::new)?;
+    let asset_name = current_archive_name().map_err(CheckFailure::new)?;
     let selected = select_release(&releases, &asset_name).ok_or_else(|| {
         CheckFailure::new(format!(
-            "no stable GitHub release ships both {asset_name} and {CHECKSUMS_ASSET}"
+            "no stable GitHub release ships both {asset_name} and its versioned checksum manifest"
         ))
     })?;
     let latest = selected.version.to_string();
@@ -184,7 +186,7 @@ fn select_release(releases: &[GhRelease], asset_name: &str) -> Option<SelectedRe
         .filter_map(|release| {
             let version = parse_stable_tag(&release.tag_name)?;
             let asset_url = release.asset_url(asset_name)?;
-            let checksums_url = release.asset_url(CHECKSUMS_ASSET)?;
+            let checksums_url = release.asset_url(&checksums_asset_name(&version))?;
             Some(SelectedRelease {
                 version,
                 tag: release.tag_name.clone(),
@@ -200,7 +202,7 @@ fn select_release(releases: &[GhRelease], asset_name: &str) -> Option<SelectedRe
         .max_by(|a, b| a.version.cmp(&b.version))
 }
 
-fn current_asset_name() -> Result<String, String> {
+fn current_archive_name() -> Result<String, String> {
     let arch = match std::env::consts::ARCH {
         "x86_64" => "x86_64",
         "aarch64" => "aarch64",
@@ -212,15 +214,19 @@ fn current_asset_name() -> Result<String, String> {
         "linux" => return Err("this build does not target GNU libc".into()),
         other => return Err(format!("unsupported operating system {other:?}")),
     };
-    Ok(format!("mach-{arch}-{platform}"))
+    Ok(format!("mach-{arch}-{platform}.tar.gz"))
+}
+
+fn checksums_asset_name(version: &Version) -> String {
+    format!("mach-v{version}-checksums.txt")
 }
 
 /// Install the exact release and platform asset returned by [`check`].
 ///
-/// The binary is downloaded and checksum-verified in-process. No downloaded
-/// script is executed. The replacement is written, synced, chmodded, and
-/// atomically renamed within the destination directory before that directory
-/// is synced.
+/// The archive is downloaded and checksum-verified in-process, then an exact
+/// root `mach` regular file is extracted. No downloaded script is executed.
+/// The replacement is written, synced, chmodded, and atomically renamed within
+/// the destination directory before that directory is synced.
 pub fn install(info: &CheckResult) -> Result<InstallResult, String> {
     install_with_progress(info, |_| {})
 }
@@ -234,7 +240,7 @@ pub(crate) fn install_with_progress(
     let manifest = download_checksum_manifest(&info.checksums_url)
         .map_err(|e| format!("could not download checksums for {}: {e}", info.tag))?;
     let expected_sha = checksum_for_asset(&manifest, &info.asset_name)?;
-    let (installed_version, disposition) = download_verified_binary(
+    let (installed_version, disposition) = download_verified_archive(
         &info.asset_url,
         &expected_sha,
         &destination,
@@ -259,7 +265,7 @@ fn validate_install_info(info: &CheckResult) -> Result<Version, String> {
     if !info.newer {
         return Err("refusing to install a release that is not newer than this binary".into());
     }
-    let expected_asset = current_asset_name()?;
+    let expected_asset = current_archive_name()?;
     if info.asset_name != expected_asset {
         return Err(format!(
             "refusing asset {} on this platform (expected {expected_asset})",
@@ -283,11 +289,12 @@ fn validate_install_info(info: &CheckResult) -> Result<Version, String> {
     let expected_asset_url = release_asset_url(&info.tag, &info.asset_name);
     if info.asset_url != expected_asset_url {
         return Err(format!(
-            "selected binary URL is not bound to {} and {}",
+            "selected archive URL is not bound to {} and {}",
             info.tag, info.asset_name
         ));
     }
-    let expected_checksums_url = release_asset_url(&info.tag, CHECKSUMS_ASSET);
+    let expected_checksums_url =
+        release_asset_url(&info.tag, &checksums_asset_name(&selected_version));
     if info.checksums_url != expected_checksums_url {
         return Err(format!(
             "selected checksum URL is not bound to {}",
@@ -406,25 +413,25 @@ fn checksum_for_asset(manifest: &str, asset_name: &str) -> Result<String, String
         }
         if fields.next().is_some() {
             return Err(format!(
-                "{CHECKSUMS_ASSET} contains a malformed entry for {asset_name}"
+                "checksum manifest contains a malformed entry for {asset_name}"
             ));
         }
         if found.is_some() {
             return Err(format!(
-                "{CHECKSUMS_ASSET} contains duplicate entries for {asset_name}"
+                "checksum manifest contains duplicate entries for {asset_name}"
             ));
         }
         if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(format!(
-                "{CHECKSUMS_ASSET} contains an invalid digest for {asset_name}"
+                "checksum manifest contains an invalid digest for {asset_name}"
             ));
         }
         found = Some(digest.to_ascii_lowercase());
     }
-    found.ok_or_else(|| format!("{CHECKSUMS_ASSET} has no entry for {asset_name}"))
+    found.ok_or_else(|| format!("checksum manifest has no entry for {asset_name}"))
 }
 
-fn download_verified_binary(
+fn download_verified_archive(
     url: &str,
     expected_sha: &str,
     destination: &Path,
@@ -433,13 +440,13 @@ fn download_verified_binary(
 ) -> Result<(Version, InstallDisposition), String> {
     let mut response = download_response(url)?;
     let total = response.body().content_length();
-    if total.is_some_and(|total| total > MAX_BINARY_BYTES) {
+    if total.is_some_and(|total| total > MAX_ARCHIVE_BYTES) {
         return Err(format!(
-            "release binary exceeds the {} MiB safety limit",
-            MAX_BINARY_BYTES / 1024 / 1024
+            "release archive exceeds the {} MiB safety limit",
+            MAX_ARCHIVE_BYTES / 1024 / 1024
         ));
     }
-    write_verified_binary(
+    write_verified_archive(
         response.body_mut().as_reader(),
         expected_sha,
         destination,
@@ -462,7 +469,7 @@ fn download_response(url: &str) -> Result<ureq::http::Response<ureq::Body>, Stri
         .map_err(map_download_err)
 }
 
-fn write_verified_binary<R: Read>(
+fn write_verified_archive<R: Read>(
     mut source: R,
     expected_sha: &str,
     destination: &Path,
@@ -491,42 +498,42 @@ fn write_verified_binary<R: Read>(
         })?;
         let parent_dir = File::open(parent)
             .map_err(|e| format!("could not open install directory {}: {e}", parent.display()))?;
-        let temp_path = parent.join(format!(".mach.{}.tmp", uuid::Uuid::new_v4()));
-        let mut temp_file = OpenOptions::new()
+        let archive_path = parent.join(format!(".mach.{}.tar.gz", uuid::Uuid::new_v4()));
+        let mut archive_file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temp_path)
-            .map_err(|e| format!("could not create temporary binary: {e}"))?;
+            .open(&archive_path)
+            .map_err(|e| format!("could not create temporary release archive: {e}"))?;
 
         progress(DownloadProgress {
             downloaded: 0,
             total: expected_total,
         });
 
-        let write_result = (|| -> Result<String, String> {
+        let write_result = (|| -> Result<(), String> {
             let mut hasher = Sha256::new();
             let mut downloaded = 0_u64;
             let mut buffer = [0_u8; 64 * 1024];
             loop {
                 let read = source
                     .read(&mut buffer)
-                    .map_err(|e| format!("could not read release binary: {e}"))?;
+                    .map_err(|e| format!("could not read release archive: {e}"))?;
                 if read == 0 {
                     break;
                 }
                 downloaded = downloaded
                     .checked_add(read as u64)
-                    .ok_or_else(|| "release binary is too large".to_string())?;
-                if downloaded > MAX_BINARY_BYTES {
+                    .ok_or_else(|| "release archive is too large".to_string())?;
+                if downloaded > MAX_ARCHIVE_BYTES {
                     return Err(format!(
-                        "release binary exceeds the {} MiB safety limit",
-                        MAX_BINARY_BYTES / 1024 / 1024
+                        "release archive exceeds the {} MiB safety limit",
+                        MAX_ARCHIVE_BYTES / 1024 / 1024
                     ));
                 }
                 hasher.update(&buffer[..read]);
-                temp_file
+                archive_file
                     .write_all(&buffer[..read])
-                    .map_err(|e| format!("could not write temporary binary: {e}"))?;
+                    .map_err(|e| format!("could not write temporary release archive: {e}"))?;
                 progress(DownloadProgress {
                     downloaded,
                     total: expected_total,
@@ -539,23 +546,28 @@ fn write_verified_binary<R: Read>(
                     "SHA-256 verification failed (expected {expected_sha}, got {actual_sha})"
                 ));
             }
-            temp_file
-                .set_permissions(fs::Permissions::from_mode(0o755))
-                .map_err(|e| format!("could not mark temporary binary executable: {e}"))?;
-            temp_file
+            archive_file
                 .sync_all()
-                .map_err(|e| format!("could not sync temporary binary: {e}"))?;
-            Ok(actual_sha)
+                .map_err(|e| format!("could not sync temporary release archive: {e}"))?;
+            Ok(())
         })();
-        drop(temp_file);
+        drop(archive_file);
 
-        let actual_sha = match write_result {
-            Ok(actual_sha) => actual_sha,
-            Err(error) => {
-                let _ = fs::remove_file(&temp_path);
-                return Err(error);
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&archive_path);
+            return Err(error);
+        }
+
+        let extracted = extract_release_binary(&archive_path, parent);
+        if let Err(error) = fs::remove_file(&archive_path) {
+            if let Ok((temp_path, _)) = &extracted {
+                let _ = fs::remove_file(temp_path);
             }
-        };
+            return Err(format!(
+                "could not remove temporary release archive: {error}"
+            ));
+        }
+        let (temp_path, actual_sha) = extracted?;
 
         let install_result = (|| -> Result<(Version, InstallDisposition), String> {
             let _lock = InstallLock::acquire(parent)?;
@@ -590,6 +602,113 @@ fn write_verified_binary<R: Read>(
             let _ = fs::remove_file(&temp_path);
         }
         install_result
+    }
+}
+
+#[cfg(unix)]
+fn extract_release_binary(archive_path: &Path, parent: &Path) -> Result<(PathBuf, String), String> {
+    let archive_file = File::open(archive_path)
+        .map_err(|e| format!("could not open verified release archive: {e}"))?;
+    let decoder = GzDecoder::new(archive_file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut entries = archive
+        .entries()
+        .map_err(|e| format!("could not read release archive: {e}"))?;
+    let mut entry = entries
+        .next()
+        .ok_or_else(|| "release archive is empty".to_string())?
+        .map_err(|e| format!("could not read release archive entry: {e}"))?;
+    let entry_path = entry
+        .path()
+        .map_err(|e| format!("release archive contains an invalid path: {e}"))?;
+    if entry_path.as_ref() != Path::new(ARCHIVE_BINARY_NAME) {
+        return Err(format!(
+            "release archive must contain exactly one root entry named {ARCHIVE_BINARY_NAME}"
+        ));
+    }
+    if !entry.header().entry_type().is_file() {
+        return Err(format!(
+            "release archive entry {ARCHIVE_BINARY_NAME} is not a regular file"
+        ));
+    }
+    let declared_size = entry
+        .header()
+        .size()
+        .map_err(|e| format!("release archive has an invalid binary size: {e}"))?;
+    if declared_size == 0 {
+        return Err("release archive contains an empty mach binary".into());
+    }
+    if declared_size > MAX_BINARY_BYTES {
+        return Err(format!(
+            "extracted binary exceeds the {} MiB safety limit",
+            MAX_BINARY_BYTES / 1024 / 1024
+        ));
+    }
+
+    let temp_path = parent.join(format!(".mach.{}.tmp", uuid::Uuid::new_v4()));
+    let mut temp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|e| format!("could not create temporary binary: {e}"))?;
+    let extract_result = (|| -> Result<String, String> {
+        let mut hasher = Sha256::new();
+        let mut extracted = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = entry
+                .read(&mut buffer)
+                .map_err(|e| format!("could not extract release binary: {e}"))?;
+            if read == 0 {
+                break;
+            }
+            extracted = extracted
+                .checked_add(read as u64)
+                .ok_or_else(|| "extracted binary is too large".to_string())?;
+            if extracted > MAX_BINARY_BYTES {
+                return Err(format!(
+                    "extracted binary exceeds the {} MiB safety limit",
+                    MAX_BINARY_BYTES / 1024 / 1024
+                ));
+            }
+            hasher.update(&buffer[..read]);
+            temp_file
+                .write_all(&buffer[..read])
+                .map_err(|e| format!("could not write temporary binary: {e}"))?;
+        }
+        if extracted != declared_size {
+            return Err(format!(
+                "release archive declared {declared_size} binary bytes but extracted {extracted}"
+            ));
+        }
+        temp_file
+            .set_permissions(fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("could not mark temporary binary executable: {e}"))?;
+        temp_file
+            .sync_all()
+            .map_err(|e| format!("could not sync temporary binary: {e}"))?;
+        Ok(format!("{:x}", hasher.finalize()))
+    })();
+    drop(temp_file);
+    drop(entry);
+
+    let actual_sha = match extract_result {
+        Ok(actual_sha) => actual_sha,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+    };
+    match entries.next() {
+        None => Ok((temp_path, actual_sha)),
+        Some(Ok(_)) => {
+            let _ = fs::remove_file(&temp_path);
+            Err("release archive must contain exactly one entry".into())
+        }
+        Some(Err(error)) => {
+            let _ = fs::remove_file(&temp_path);
+            Err(format!("could not read release archive entry: {error}"))
+        }
     }
 }
 
@@ -1024,6 +1143,8 @@ pub fn is_newer(latest: &str, current: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::net::TcpListener;
     use std::sync::mpsc;
 
@@ -1073,7 +1194,8 @@ mod tests {
             current.patch.checked_add(1).unwrap(),
         );
         let tag = format!("v{latest}");
-        let asset_name = current_asset_name().unwrap();
+        let asset_name = current_archive_name().unwrap();
+        let checksums_asset = format!("mach-{tag}-checksums.txt");
         CheckResult {
             current: current.to_string(),
             latest: latest.to_string(),
@@ -1082,9 +1204,45 @@ mod tests {
             prerelease: false,
             release_url: format!("https://github.test/releases/tag/{tag}"),
             asset_url: release_asset_url(&tag, &asset_name),
-            checksums_url: release_asset_url(&tag, CHECKSUMS_ASSET),
+            checksums_url: release_asset_url(&tag, &checksums_asset),
             asset_name,
         }
+    }
+
+    fn release_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_ustar();
+            header.set_path(name).unwrap();
+            header.set_mode(0o755);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mtime(0);
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            archive.append(&header, *bytes).unwrap();
+        }
+        archive.finish().unwrap();
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn symlink_release_archive() -> Vec<u8> {
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_ustar();
+        header.set_path("mach").unwrap();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_link_name("outside").unwrap();
+        header.set_mode(0o755);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_size(0);
+        header.set_cksum();
+        archive.append(&header, std::io::empty()).unwrap();
+        archive.finish().unwrap();
+        archive.into_inner().unwrap().finish().unwrap()
     }
 
     #[test]
@@ -1202,9 +1360,9 @@ mod tests {
             newer: false,
             prerelease: false,
             release_url: String::new(),
-            asset_name: "mach-aarch64-apple-darwin".into(),
-            asset_url: "https://example.test/mach".into(),
-            checksums_url: "https://example.test/SHA256SUMS".into(),
+            asset_name: "mach-aarch64-apple-darwin.tar.gz".into(),
+            asset_url: "https://example.test/mach.tar.gz".into(),
+            checksums_url: "https://example.test/mach-v0.1.0-checksums.txt".into(),
         };
         let h = r.install_hint();
         assert!(h.contains("mach update --install"));
@@ -1338,35 +1496,44 @@ mod tests {
                 "v2.0.0-rc.1",
                 false,
                 &[
-                    ("mach-x86_64-unknown-linux-gnu", "https://bad/tagged-rc"),
-                    (CHECKSUMS_ASSET, "https://bad/tagged-rc-sums"),
+                    (
+                        "mach-x86_64-unknown-linux-gnu.tar.gz",
+                        "https://bad/tagged-rc",
+                    ),
+                    (
+                        "mach-v2.0.0-rc.1-checksums.txt",
+                        "https://bad/tagged-rc-sums",
+                    ),
                 ],
             ),
             release(
                 "v0.2.0-rc.1",
                 true,
                 &[
-                    ("mach-x86_64-unknown-linux-gnu", "https://bad/rc"),
-                    (CHECKSUMS_ASSET, "https://bad/rc-sums"),
+                    ("mach-x86_64-unknown-linux-gnu.tar.gz", "https://bad/rc"),
+                    ("mach-v0.2.0-rc.1-checksums.txt", "https://bad/rc-sums"),
                 ],
             ),
             release(
                 "v0.1.2",
                 false,
                 &[
-                    ("mach-x86_64-unknown-linux-gnu", "https://good/mach"),
-                    (CHECKSUMS_ASSET, "https://good/SHA256SUMS"),
+                    (
+                        "mach-x86_64-unknown-linux-gnu.tar.gz",
+                        "https://good/mach.tar.gz",
+                    ),
+                    ("mach-v0.1.2-checksums.txt", "https://good/checksums"),
                 ],
             ),
         ];
 
-        let selected = select_release(&releases, "mach-x86_64-unknown-linux-gnu")
+        let selected = select_release(&releases, "mach-x86_64-unknown-linux-gnu.tar.gz")
             .expect("stable release with both assets");
 
         assert_eq!(selected.version.to_string(), "0.1.2");
         assert_eq!(selected.tag, "v0.1.2");
-        assert_eq!(selected.asset_url, "https://good/mach");
-        assert_eq!(selected.checksums_url, "https://good/SHA256SUMS");
+        assert_eq!(selected.asset_url, "https://good/mach.tar.gz");
+        assert_eq!(selected.checksums_url, "https://good/checksums");
     }
 
     #[test]
@@ -1375,13 +1542,16 @@ mod tests {
             "v1.0.0",
             false,
             &[
-                ("mach-aarch64-apple-darwin", "https://good/mach"),
-                (CHECKSUMS_ASSET, "https://good/SHA256SUMS"),
+                (
+                    "mach-aarch64-apple-darwin.tar.gz",
+                    "https://good/mach.tar.gz",
+                ),
+                ("mach-v1.0.0-checksums.txt", "https://good/checksums"),
             ],
         )];
 
         let selected =
-            select_release(&releases, "mach-aarch64-apple-darwin").expect("major upgrade");
+            select_release(&releases, "mach-aarch64-apple-darwin.tar.gz").expect("major upgrade");
         assert_eq!(selected.version.to_string(), "1.0.0");
     }
 
@@ -1391,12 +1561,15 @@ mod tests {
             "v0.9.0",
             false,
             &[
-                ("mach-aarch64-apple-darwin", "https://good/mach"),
-                (CHECKSUMS_ASSET, "https://good/SHA256SUMS"),
+                (
+                    "mach-aarch64-apple-darwin.tar.gz",
+                    "https://good/mach.tar.gz",
+                ),
+                ("mach-v0.9.0-checksums.txt", "https://good/checksums"),
             ],
         )];
 
-        let selected = select_release(&releases, "mach-aarch64-apple-darwin")
+        let selected = select_release(&releases, "mach-aarch64-apple-darwin.tar.gz")
             .expect("an older eligible release is still the latest published release");
         assert_eq!(selected.version.to_string(), "0.9.0");
         assert_eq!(
@@ -1406,30 +1579,41 @@ mod tests {
     }
 
     #[test]
-    fn selector_rejects_releases_missing_the_binary_or_checksum_manifest() {
+    fn selector_rejects_releases_missing_the_archive_or_checksum_manifest() {
         let releases = vec![
             release(
                 "v0.3.0",
                 false,
-                &[(CHECKSUMS_ASSET, "https://bad/only-sums")],
+                &[("mach-v0.3.0-checksums.txt", "https://bad/only-sums")],
             ),
             release(
                 "v0.2.0",
                 false,
-                &[("mach-x86_64-unknown-linux-gnu", "https://bad/only-bin")],
+                &[(
+                    "mach-x86_64-unknown-linux-gnu.tar.gz",
+                    "https://bad/only-archive",
+                )],
             ),
         ];
 
-        assert!(select_release(&releases, "mach-x86_64-unknown-linux-gnu").is_none());
+        assert!(select_release(&releases, "mach-x86_64-unknown-linux-gnu.tar.gz").is_none());
     }
 
     #[test]
     fn checksum_parser_requires_one_exact_valid_asset_entry() {
         let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        assert_eq!(
+        assert!(
             checksum_for_asset(
                 &format!("{digest}  mach-aarch64-apple-darwin\n"),
-                "mach-aarch64-apple-darwin",
+                "mach-aarch64-apple-darwin.tar.gz",
+            )
+            .unwrap_err()
+            .contains("no entry")
+        );
+        assert_eq!(
+            checksum_for_asset(
+                &format!("{digest}  mach-aarch64-apple-darwin.tar.gz\n"),
+                "mach-aarch64-apple-darwin.tar.gz",
             )
             .unwrap(),
             digest,
@@ -1446,6 +1630,10 @@ mod tests {
 
         result.asset_url.push_str("?wrong-release");
         assert!(validate_install_info(&result).is_err());
+
+        let mut wrong_manifest = valid_install_result();
+        wrong_manifest.checksums_url = release_asset_url(&wrong_manifest.tag, "SHA256SUMS");
+        assert!(validate_install_info(&wrong_manifest).is_err());
     }
 
     #[test]
@@ -1473,7 +1661,10 @@ mod tests {
         reinstall.latest = current_version().into();
         reinstall.tag = format!("v{}", current_version());
         reinstall.asset_url = release_asset_url(&reinstall.tag, &reinstall.asset_name);
-        reinstall.checksums_url = release_asset_url(&reinstall.tag, CHECKSUMS_ASSET);
+        reinstall.checksums_url = release_asset_url(
+            &reinstall.tag,
+            &format!("mach-{}-checksums.txt", reinstall.tag),
+        );
         assert!(
             validate_install_info(&reinstall)
                 .unwrap_err()
@@ -1487,7 +1678,10 @@ mod tests {
         downgrade.latest = lower.to_string();
         downgrade.tag = format!("v{lower}");
         downgrade.asset_url = release_asset_url(&downgrade.tag, &downgrade.asset_name);
-        downgrade.checksums_url = release_asset_url(&downgrade.tag, CHECKSUMS_ASSET);
+        downgrade.checksums_url = release_asset_url(
+            &downgrade.tag,
+            &format!("mach-{}-checksums.txt", downgrade.tag),
+        );
         assert!(
             validate_install_info(&downgrade)
                 .unwrap_err()
@@ -1515,7 +1709,7 @@ mod tests {
         let destination = dir.join("mach");
         fs::write(&destination, b"old binary").unwrap();
 
-        let error = write_verified_binary(
+        let error = write_verified_archive(
             std::io::Cursor::new(b"corrupt download"),
             &"0".repeat(64),
             &destination,
@@ -1536,12 +1730,14 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let destination = dir.join("mach");
         let binary = b"verified binary";
-        let digest = sha256_hex(binary);
+        let archive = release_archive(&[("mach", binary)]);
+        let archive_digest = sha256_hex(&archive);
+        let binary_digest = sha256_hex(binary);
         let version = Version::parse("1.2.3").unwrap();
 
-        let (installed_version, disposition) = write_verified_binary(
-            std::io::Cursor::new(binary),
-            &digest,
+        let (installed_version, disposition) = write_verified_archive(
+            std::io::Cursor::new(&archive),
+            &archive_digest,
             &destination,
             &version,
             None,
@@ -1553,7 +1749,7 @@ mod tests {
         assert_eq!(disposition, InstallDisposition::Installed);
         assert_eq!(fs::read(&destination).unwrap(), binary);
         assert_eq!(
-            fs::read_to_string(dir.join(RELEASE_RECEIPT_DIR).join(&digest)).unwrap(),
+            fs::read_to_string(dir.join(RELEASE_RECEIPT_DIR).join(&binary_digest)).unwrap(),
             "1.2.3\n"
         );
         #[cfg(unix)]
@@ -1579,9 +1775,10 @@ mod tests {
         fs::write(receipt_dir.join(sha256_hex(newer_binary)), b"9.9.9\n").unwrap();
 
         let older_binary = b"older verified binary";
-        let (installed_version, disposition) = write_verified_binary(
-            std::io::Cursor::new(older_binary),
-            &sha256_hex(older_binary),
+        let older_archive = release_archive(&[("mach", older_binary)]);
+        let (installed_version, disposition) = write_verified_archive(
+            std::io::Cursor::new(&older_archive),
+            &sha256_hex(&older_archive),
             &destination,
             &Version::parse("9.8.7").unwrap(),
             None,
@@ -1602,10 +1799,11 @@ mod tests {
         let destination = dir.join("mach");
         fs::create_dir(&destination).unwrap();
         let binary = b"checksum-verified binary";
-        let digest = sha256_hex(binary);
+        let archive = release_archive(&[("mach", binary)]);
+        let digest = sha256_hex(&archive);
 
-        let error = write_verified_binary(
-            std::io::Cursor::new(binary),
+        let error = write_verified_archive(
+            std::io::Cursor::new(&archive),
             &digest,
             &destination,
             &Version::parse("1.2.3").unwrap(),
@@ -1615,7 +1813,69 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("could not replace"));
-        assert!(!dir.join(RELEASE_RECEIPT_DIR).join(digest).exists());
+        assert!(
+            !dir.join(RELEASE_RECEIPT_DIR)
+                .join(sha256_hex(binary))
+                .exists()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn verified_replace_rejects_archives_with_extra_entries() {
+        let dir = std::env::temp_dir().join(format!("mach-update-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let destination = dir.join("mach");
+        fs::write(&destination, b"old binary").unwrap();
+        let archive = release_archive(&[("mach", b"new binary"), ("unexpected", b"data")]);
+
+        let error = write_verified_archive(
+            std::io::Cursor::new(&archive),
+            &sha256_hex(&archive),
+            &destination,
+            &Version::parse("1.2.3").unwrap(),
+            Some(archive.len() as u64),
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(error.contains("exactly one"));
+        assert_eq!(fs::read(&destination).unwrap(), b"old binary");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn verified_replace_rejects_nested_or_linked_binary_entries() {
+        let dir = std::env::temp_dir().join(format!("mach-update-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let destination = dir.join("mach");
+        fs::write(&destination, b"old binary").unwrap();
+
+        let nested = release_archive(&[("bin/mach", b"new binary")]);
+        let nested_error = write_verified_archive(
+            std::io::Cursor::new(&nested),
+            &sha256_hex(&nested),
+            &destination,
+            &Version::parse("1.2.3").unwrap(),
+            Some(nested.len() as u64),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(nested_error.contains("root entry named mach"));
+
+        let linked = symlink_release_archive();
+        let linked_error = write_verified_archive(
+            std::io::Cursor::new(&linked),
+            &sha256_hex(&linked),
+            &destination,
+            &Version::parse("1.2.3").unwrap(),
+            Some(linked.len() as u64),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(linked_error.contains("not a regular file"));
+
+        assert_eq!(fs::read(&destination).unwrap(), b"old binary");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1672,15 +1932,16 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let destination = dir.join("mach");
         let binary = vec![b'x'; 150_000];
-        let digest = sha256_hex(&binary);
+        let archive = release_archive(&[("mach", &binary)]);
+        let digest = sha256_hex(&archive);
         let mut progress = Vec::new();
 
-        write_verified_binary(
-            std::io::Cursor::new(&binary),
+        write_verified_archive(
+            std::io::Cursor::new(&archive),
             &digest,
             &destination,
             &Version::parse("1.2.3").unwrap(),
-            Some(binary.len() as u64),
+            Some(archive.len() as u64),
             |event| progress.push(event),
         )
         .unwrap();
@@ -1689,14 +1950,14 @@ mod tests {
             progress.first(),
             Some(&DownloadProgress {
                 downloaded: 0,
-                total: Some(binary.len() as u64),
+                total: Some(archive.len() as u64),
             })
         );
         assert_eq!(
             progress.last(),
             Some(&DownloadProgress {
-                downloaded: binary.len() as u64,
-                total: Some(binary.len() as u64),
+                downloaded: archive.len() as u64,
+                total: Some(archive.len() as u64),
             })
         );
         assert!(
