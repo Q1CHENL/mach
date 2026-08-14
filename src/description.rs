@@ -753,13 +753,6 @@ impl DescriptionEditor {
         self.lines[i].input_ref().map(|t| t.len()).unwrap_or(0)
     }
 
-    fn line_text_value(&self, i: usize) -> String {
-        self.lines[i]
-            .input_ref()
-            .map(|t| t.value())
-            .unwrap_or_default()
-    }
-
     fn is_image_line(&self, i: usize) -> bool {
         matches!(self.lines.get(i), Some(Line::Image { .. }))
     }
@@ -784,12 +777,13 @@ impl DescriptionEditor {
     fn copy_lines_between(&self, al: usize, ac: usize, bl: usize, bc: usize) -> Vec<CopyLine> {
         let mut out = Vec::new();
         if al == bl {
-            let s = self.line_text_value(al);
-            let chars: Vec<&str> = s.graphemes(true).collect();
-            let lo = ac.min(chars.len());
-            let hi = bc.min(chars.len());
+            let Some(input) = self.lines[al].input_ref() else {
+                return out;
+            };
+            let lo = ac.min(input.len());
+            let hi = bc.min(input.len());
             if lo < hi {
-                out.push(CopyLine::Text(chars[lo..hi].concat()));
+                out.push(CopyLine::Text(input.slice(lo, hi)));
             }
             return out;
         }
@@ -817,27 +811,30 @@ impl DescriptionEditor {
         from: Option<usize>,
         to: Option<usize>,
     ) -> Option<CopyLine> {
-        match &self.lines[i] {
-            Line::Image { path } => Some(CopyLine::Image(resolve_image_reference(
-                path,
-                &self.image_root,
-                &self.attachments,
-            ))),
-            Line::Link(t) => {
-                let s = t.value();
-                let chars: Vec<&str> = s.graphemes(true).collect();
-                let lo = from.unwrap_or(0).min(chars.len());
-                let hi = to.unwrap_or(chars.len()).min(chars.len());
-                (lo < hi).then(|| CopyLine::Link(chars[lo..hi].concat()))
+        let (input, link) = match &self.lines[i] {
+            Line::Image { path } => {
+                return Some(CopyLine::Image(resolve_image_reference(
+                    path,
+                    &self.image_root,
+                    &self.attachments,
+                )));
             }
-            Line::Text(t) | Line::Bullet(t) | Line::Number(t) | Line::Todo { text: t, .. } => {
-                let s = t.value();
-                let chars: Vec<&str> = s.graphemes(true).collect();
-                let lo = from.unwrap_or(0).min(chars.len());
-                let hi = to.unwrap_or(chars.len()).min(chars.len());
-                (lo < hi).then(|| CopyLine::Text(chars[lo..hi].concat()))
+            Line::Link(input) => (input, true),
+            Line::Text(input)
+            | Line::Bullet(input)
+            | Line::Number(input)
+            | Line::Todo { text: input, .. } => (input, false),
+        };
+        let lo = from.unwrap_or(0).min(input.len());
+        let hi = to.unwrap_or(input.len()).min(input.len());
+        (lo < hi).then(|| {
+            let text = input.slice(lo, hi);
+            if link {
+                CopyLine::Link(text)
+            } else {
+                CopyLine::Text(text)
             }
-        }
+        })
     }
 
     /// Char range selected on line `i`, if any (for painting text).
@@ -887,15 +884,11 @@ impl DescriptionEditor {
             if al == bl {
                 // One line: cut the selected range out and rebuild the
                 // line, keeping whatever kind it was.
-                if let Some(input) = self.lines[al].input() {
-                    let value = input.value();
-                    let mut chars: Vec<&str> = value.graphemes(true).collect();
-                    let lo = ac.min(bc).min(chars.len());
-                    let hi = ac.max(bc).min(chars.len());
-                    if lo < hi {
-                        chars.drain(lo..hi);
-                    }
-                    let text = chars.concat();
+                if let Some(input) = self.lines[al].input_ref() {
+                    let len = input.len();
+                    let lo = ac.min(bc).min(len);
+                    let hi = ac.max(bc).min(len);
+                    let text = format!("{}{}", input.slice(0, lo), input.slice(hi, len));
                     let len = self.line_max_len;
                     self.lines[al] = self.line_with_text(al, &text, len);
                     if let Some(input) = self.lines[al].input() {
@@ -905,29 +898,18 @@ impl DescriptionEditor {
             } else {
                 // Keep prefix of start + suffix of end. Pictures contribute no
                 // text — deleting a range that covers one drops the picture.
-                let start_s = if self.is_image_line(al) {
+                let (prefix, ac) = if let Some(input) = self.lines[al].input_ref() {
+                    let ac = ac.min(input.len());
+                    (input.slice(0, ac), ac)
+                } else {
+                    (String::new(), 0)
+                };
+                let suffix = if let Some(input) = self.lines[bl].input_ref() {
+                    input.slice(bc.min(input.len()), input.len())
+                } else {
                     String::new()
-                } else {
-                    self.line_text_value(al)
                 };
-                let end_s = if self.is_image_line(bl) {
-                    String::new()
-                } else {
-                    self.line_text_value(bl)
-                };
-                let sc: Vec<&str> = start_s.graphemes(true).collect();
-                let ec: Vec<&str> = end_s.graphemes(true).collect();
-                let ac = if self.is_image_line(al) {
-                    0
-                } else {
-                    ac.min(sc.len())
-                };
-                let bc = if self.is_image_line(bl) {
-                    0
-                } else {
-                    bc.min(ec.len())
-                };
-                let merged = format!("{}{}", sc[..ac].concat(), ec[bc..].concat());
+                let merged = prefix + &suffix;
                 if !self.line_text_fits(&merged) {
                     return false;
                 }

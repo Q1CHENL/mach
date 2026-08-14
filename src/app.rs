@@ -17,7 +17,7 @@ use crate::image::ImageStore;
 use crate::model::{
     ALL_CATEGORY, Category, Label, LabelColor, MAX_CATEGORY_COUNT, MAX_CATEGORY_NAME_LEN,
     MAX_LABEL_COUNT, MAX_LABEL_NAME_LEN, MAX_TASK_COUNT, MAX_TITLE_LEN, Task, caseless_contains,
-    caseless_key, category_name_key, task_text_contains,
+    caseless_key, category_name_key, labels_for_task, task_text_contains,
 };
 use crate::settings::{LaunchState, Settings};
 use crate::store::{
@@ -1340,6 +1340,7 @@ impl App {
             TaskForm::edit_with_images(&task, self.images.root().to_path_buf(), &self.attachments);
         form.set_categories(&self.categories, task.category_id.as_deref());
         form.set_labels(&self.labels, &task.label_ids);
+        self.images.prefetch(form.description.images());
         self.preview_form = Some(form);
         self.preview_task_id = Some(id);
         self.preview_gen = generation;
@@ -1397,7 +1398,9 @@ impl App {
                 .enumerate()
                 .filter(|(_, t)| {
                     !(hide_done && t.done)
-                        && (task_text_contains(t, &q) || task_labels_contain(t, &self.labels, &q))
+                        && (task_text_contains(t, &q)
+                            || labels_for_task(t, &self.labels)
+                                .any(|label| caseless_contains(&label.name, &q)))
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -2606,15 +2609,6 @@ impl App {
             _ => String::new(),
         }
     }
-}
-
-fn task_labels_contain(task: &Task, labels: &[Label], query: &str) -> bool {
-    task.label_ids.iter().any(|id| {
-        labels
-            .iter()
-            .find(|label| label.id == *id)
-            .is_some_and(|label| caseless_contains(&label.name, query))
-    })
 }
 
 fn edit_error_message(error: &StoreError) -> String {

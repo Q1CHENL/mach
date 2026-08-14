@@ -335,6 +335,13 @@ impl Label {
     }
 }
 
+/// Labels assigned to a task, in the store's canonical label order.
+pub fn labels_for_task<'a>(task: &Task, labels: &'a [Label]) -> impl Iterator<Item = &'a Label> {
+    labels
+        .iter()
+        .filter(|label| task.label_ids.contains(&label.id))
+}
+
 pub fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }

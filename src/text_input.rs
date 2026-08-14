@@ -516,8 +516,12 @@ impl TextInput {
 
     /// Place the caret from a click on a wrapped row.
     pub fn set_cursor_from_wrap(&mut self, width: usize, row: usize, col: usize) {
-        self.clear_selection();
         let breaks = self.wrap_breaks(width);
+        self.set_cursor_from_wrap_breaks(&breaks, row, col);
+    }
+
+    fn set_cursor_from_wrap_breaks(&mut self, breaks: &[(usize, usize)], row: usize, col: usize) {
+        self.clear_selection();
         let row = row.min(breaks.len() - 1);
         let (start, end) = breaks[row];
         let mut used = 0usize;
@@ -534,9 +538,10 @@ impl TextInput {
     }
 
     /// Move the caret up one visual row. Returns false when already on
-    /// the first row (caller may leave the block).
+    /// the first row so the caller may leave the block.
     pub fn wrap_up(&mut self, width: usize, prefer_col: u16) -> bool {
-        let (row, col) = self.wrap_cursor(width);
+        let breaks = self.wrap_breaks(width);
+        let (row, col) = self.wrap_cursor_from_breaks(&breaks);
         let prefer = if prefer_col == u16::MAX {
             col
         } else {
@@ -545,24 +550,24 @@ impl TextInput {
         if row == 0 {
             return false;
         }
-        self.set_cursor_from_wrap(width, row - 1, prefer as usize);
+        self.set_cursor_from_wrap_breaks(&breaks, row - 1, prefer as usize);
         true
     }
 
     /// Move the caret down one visual row. Returns false when already on
-    /// the last row (caller may leave the block).
+    /// the last row so the caller may leave the block.
     pub fn wrap_down(&mut self, width: usize, prefer_col: u16) -> bool {
-        let (row, col) = self.wrap_cursor(width);
+        let breaks = self.wrap_breaks(width);
+        let (row, col) = self.wrap_cursor_from_breaks(&breaks);
         let prefer = if prefer_col == u16::MAX {
             col
         } else {
             prefer_col
         };
-        let height = self.wrap_height(width);
-        if row + 1 >= height {
+        if row + 1 >= breaks.len() {
             return false;
         }
-        self.set_cursor_from_wrap(width, row + 1, prefer as usize);
+        self.set_cursor_from_wrap_breaks(&breaks, row + 1, prefer as usize);
         true
     }
 

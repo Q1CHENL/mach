@@ -21,7 +21,7 @@ use crate::app::{
 use crate::banner;
 use crate::due;
 use crate::form::Field;
-use crate::model::LabelColor;
+use crate::model::{LabelColor, labels_for_task};
 use crate::theme::Theme;
 
 /// Outer width of the sidebar, borders and padding included.
@@ -488,38 +488,26 @@ fn draw_task_preview(
         return;
     }
 
-    let Some(task) = app.selected_task().cloned() else {
+    let Some(task) = app.selected_task() else {
         app.invalidate_preview();
         let style = Style::new().fg(theme.muted_color());
         draw_box(f, inner, "Select a task · Enter to edit", style);
         return;
     };
 
-    // One owned snapshot avoids a second selection lookup and lets the image
-    // cache and preview editor be borrowed independently below.
-    let image_paths: Vec<_> = task
-        .description
-        .iter()
-        .filter_map(|block| match block {
-            crate::model::Block::Image { attachment_id } => Some(app.images.resolve(attachment_id)),
-            _ => None,
-        })
-        .collect();
-    let todo = crate::model::todo_progress(&task);
-    let labels = app
-        .labels
-        .iter()
-        .filter(|label| task.label_ids.contains(&label.id))
+    let todo = crate::model::todo_progress(task);
+    let labels = labels_for_task(task, &app.labels)
         .map(LabelToken::from)
         .collect::<Vec<_>>();
-    let title = task.title;
+    let title = task.title.clone();
     let done = task.done;
     let due_s = due::display(&task.due, &app.settings.date_format);
     let importance = task.importance;
     let description_empty = task.description.is_empty();
 
-    // Prefetch description pictures so they appear on the next frames.
-    app.images.prefetch(image_paths);
+    if !description_empty {
+        app.ensure_preview();
+    }
 
     let flags = crate::model::importance_marks(importance);
     let mut meta = String::new();
@@ -593,7 +581,6 @@ fn draw_task_preview(
         return;
     }
 
-    app.ensure_preview();
     let App {
         images: store,
         preview_form,
@@ -2308,9 +2295,7 @@ impl<'a> TaskPresentation<'a> {
     ) -> Self {
         Self {
             title: &task.title,
-            labels: labels
-                .iter()
-                .filter(|label| task.label_ids.contains(&label.id))
+            labels: labels_for_task(task, labels)
                 .map(LabelToken::from)
                 .collect(),
             extras: extras(task),

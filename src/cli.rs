@@ -14,7 +14,9 @@ use clap::{Parser, Subcommand, ValueEnum, builder::PossibleValue};
 use serde_json::{Value, json};
 
 use crate::VERSION;
-use crate::model::{Block, Category, Label, LabelColor, Task, caseless_key, task_text_contains};
+use crate::model::{
+    Block, Category, Label, LabelColor, Task, caseless_key, labels_for_task, task_text_contains,
+};
 use crate::store::{
     CategoryPatch, LabelPatch, PurgeScope, RelativePosition, Store, StoreData, StoreError,
     TaskPatch,
@@ -1070,34 +1072,38 @@ fn description_to_text(description: &[Block]) -> String {
     let mut numbered = 0usize;
     description
         .iter()
-        .map(|block| match block {
-            Block::Text { text } => {
-                numbered = 0;
-                text.clone()
-            }
-            Block::Todo { text, done } => {
-                numbered = 0;
-                format!("[{}] {text}", if *done { "x" } else { " " })
-            }
-            Block::Bullet { text } => {
-                numbered = 0;
-                format!("- {text}")
-            }
-            Block::Number { text } => {
-                numbered += 1;
-                format!("{numbered}. {text}")
-            }
-            Block::Link { url } => {
-                numbered = 0;
-                url.clone()
-            }
-            Block::Image { attachment_id } => {
-                numbered = 0;
-                format!("[image:{attachment_id}]")
-            }
-        })
+        .map(|block| description_block_text(block, &mut numbered))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn description_block_text(block: &Block, numbered: &mut usize) -> String {
+    match block {
+        Block::Text { text } => {
+            *numbered = 0;
+            text.clone()
+        }
+        Block::Todo { text, done } => {
+            *numbered = 0;
+            format!("[{}] {text}", if *done { "x" } else { " " })
+        }
+        Block::Bullet { text } => {
+            *numbered = 0;
+            format!("- {text}")
+        }
+        Block::Number { text } => {
+            *numbered += 1;
+            format!("{numbered}. {text}")
+        }
+        Block::Link { url } => {
+            *numbered = 0;
+            url.clone()
+        }
+        Block::Image { attachment_id } => {
+            *numbered = 0;
+            format!("[image:{attachment_id}]")
+        }
+    }
 }
 
 fn collect_subtasks(description: &[Block]) -> Vec<(usize, &str, bool)> {
@@ -1112,9 +1118,9 @@ fn collect_subtasks(description: &[Block]) -> Vec<(usize, &str, bool)> {
         .collect()
 }
 
-fn subtask_description_index(description: &[Block], one_based: usize) -> Result<usize, CliError> {
+fn subtask_description_index(description: &[Block], one_based: usize) -> Result<usize, StoreError> {
     if one_based == 0 {
-        return Err(CliError::validation(
+        return Err(StoreError::validation(
             "subtask index is 1-based (use 1 for the first subtask)",
         ));
     }
@@ -1127,7 +1133,7 @@ fn subtask_description_index(description: &[Block], one_based: usize) -> Result<
             }
         }
     }
-    Err(CliError::validation(format!(
+    Err(StoreError::validation(format!(
         "no subtask at index {one_based} (task has {count} subtask(s))"
     )))
 }
@@ -1158,16 +1164,8 @@ fn label_json(label: &Label) -> Value {
     })
 }
 
-fn task_labels<'a>(labels: &'a [Label], task: &Task) -> Vec<&'a Label> {
-    labels
-        .iter()
-        .filter(|label| task.label_ids.contains(&label.id))
-        .collect()
-}
-
 fn task_label_text(labels: &[Label], task: &Task) -> String {
-    task_labels(labels, task)
-        .into_iter()
+    labels_for_task(task, labels)
         .map(|label| terminal_text(&label.name))
         .collect::<Vec<_>>()
         .join(" ")
@@ -1207,8 +1205,7 @@ fn task_json_with_category(labels: &[Label], task: &Task, category_name: Option<
             "id": task.category_id,
             "name": category_name,
         },
-        "labels": task_labels(labels, task)
-            .into_iter()
+        "labels": labels_for_task(task, labels)
             .map(label_json)
             .collect::<Vec<_>>(),
         "created": task.created,
@@ -1914,30 +1911,17 @@ fn description_note_lines(description: &[Block]) -> Vec<String> {
     let mut notes = Vec::new();
     for block in description {
         match block {
-            Block::Todo { .. } => numbered = 0,
-            Block::Text { text } => {
+            Block::Todo { .. } => {
                 numbered = 0;
-                if !text.trim().is_empty() {
-                    notes.push(text.clone());
-                }
+                continue;
             }
-            Block::Bullet { text } => {
+            Block::Text { text } if text.trim().is_empty() => {
                 numbered = 0;
-                notes.push(format!("- {text}"));
+                continue;
             }
-            Block::Number { text } => {
-                numbered += 1;
-                notes.push(format!("{numbered}. {text}"));
-            }
-            Block::Link { url } => {
-                numbered = 0;
-                notes.push(url.clone());
-            }
-            Block::Image { attachment_id } => {
-                numbered = 0;
-                notes.push(format!("[image:{attachment_id}]"));
-            }
+            _ => {}
         }
+        notes.push(description_block_text(block, &mut numbered));
     }
     notes
 }
@@ -2299,8 +2283,7 @@ fn mutate_subtask(
         .update(|data| {
             let id = data.resolve_task_id(query)?;
             let mut description = data.task(&id)?.description.clone();
-            let description_index = subtask_description_index(&description, index)
-                .map_err(|error| StoreError::validation(error.message))?;
+            let description_index = subtask_description_index(&description, index)?;
             let (text, done) = match mutation {
                 SubtaskMutation::SetDone(requested) => {
                     let Block::Todo { text, done } = &mut description[description_index] else {

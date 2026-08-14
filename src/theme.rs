@@ -109,7 +109,6 @@ fn rgb_of(color: Color) -> (u8, u8, u8) {
 
 pub struct Theme {
     pub accent: Color,
-    high_contrast_selection: bool,
     colors_disabled: bool,
     light_background: bool,
 }
@@ -142,7 +141,6 @@ impl Theme {
         };
         Self {
             accent,
-            high_contrast_selection: colors_disabled || light_background,
             colors_disabled,
             light_background,
         }
@@ -188,10 +186,14 @@ impl Theme {
         }
     }
 
+    fn high_contrast_selection(&self) -> bool {
+        self.colors_disabled || self.light_background
+    }
+
     /// Style of the selected row: a wash of the accent behind it, with
     /// the text keeping whatever colour it already had.
     pub fn selection(&self) -> Style {
-        if self.high_contrast_selection {
+        if self.high_contrast_selection() {
             Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
             Style::new()
@@ -204,7 +206,7 @@ impl Theme {
     /// Keeps the accent wash so the active category stays obvious while
     /// the Tasks panel has keyboard focus; bold is reserved for focus.
     pub fn selection_unfocused(&self) -> Style {
-        if self.high_contrast_selection {
+        if self.high_contrast_selection() {
             Style::new().add_modifier(Modifier::REVERSED)
         } else {
             Style::new().bg(self.selection_wash())
