@@ -252,6 +252,106 @@ pub enum RelativePosition {
     After,
 }
 
+trait NamedEntity {
+    const ENTITY: &'static str;
+    const MAX_NAME_LEN: usize;
+
+    fn id(&self) -> &str;
+    fn name(&self) -> &str;
+    fn name_key(value: &str) -> String;
+}
+
+impl NamedEntity for Category {
+    const ENTITY: &'static str = "category";
+    const MAX_NAME_LEN: usize = MAX_CATEGORY_NAME_LEN;
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn name_key(value: &str) -> String {
+        category_name_key(value)
+    }
+}
+
+impl NamedEntity for Label {
+    const ENTITY: &'static str = "label";
+    const MAX_NAME_LEN: usize = MAX_LABEL_NAME_LEN;
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn name_key(value: &str) -> String {
+        label_name_key(value)
+    }
+}
+
+fn resolve_named_id<T: NamedEntity>(items: &[T], query: &str) -> Result<String, StoreError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(StoreError::validation(format!(
+            "{} name cannot be empty",
+            T::ENTITY
+        )));
+    }
+    if let Some(item) = items.iter().find(|item| item.id() == query) {
+        return Ok(item.id().to_string());
+    }
+    validate_byte_limit(
+        query,
+        text_byte_limit(T::MAX_NAME_LEN),
+        &format!("{} query", T::ENTITY),
+    )?;
+    let folded = T::name_key(query);
+    if let Some(item) = items.iter().find(|item| T::name_key(item.name()) == folded) {
+        return Ok(item.id().to_string());
+    }
+    let matches: Vec<_> = items
+        .iter()
+        .filter(|item| name_has_prefix::<T>(item.name(), &folded))
+        .collect();
+    match matches.as_slice() {
+        [item] => Ok(item.id().to_string()),
+        [] => Err(StoreError::NotFound {
+            entity: T::ENTITY,
+            query: query.to_string(),
+        }),
+        _ => Err(StoreError::Ambiguous {
+            entity: T::ENTITY,
+            query: query.to_string(),
+            matches: matches
+                .into_iter()
+                .map(|item| item.name().to_string())
+                .collect(),
+        }),
+    }
+}
+
+fn move_relative<T: Clone>(
+    items: &mut Vec<T>,
+    index: usize,
+    target_index: usize,
+    position: RelativePosition,
+) -> T {
+    let item = items.remove(index);
+    let target_after_removal = target_index - usize::from(index < target_index);
+    let insertion = match position {
+        RelativePosition::Before => target_after_removal,
+        RelativePosition::After => target_after_removal + 1,
+    };
+    items.insert(insertion, item.clone());
+    item
+}
+
 impl StoreData {
     pub fn attachments(&self) -> &[Attachment] {
         &self.attachments
@@ -289,86 +389,12 @@ impl StoreData {
 
     /// Resolve a category by id, Unicode-caseless name, or unique name prefix.
     pub fn resolve_category_id(&self, query: &str) -> Result<String, StoreError> {
-        let query = query.trim();
-        if query.is_empty() {
-            return Err(StoreError::validation("category name cannot be empty"));
-        }
-        if let Some(category) = self.categories.iter().find(|category| category.id == query) {
-            return Ok(category.id.clone());
-        }
-        validate_byte_limit(
-            query,
-            text_byte_limit(MAX_CATEGORY_NAME_LEN),
-            "category query",
-        )?;
-        let folded = category_name_key(query);
-        if let Some(category) = self
-            .categories
-            .iter()
-            .find(|category| category_name_key(&category.name) == folded)
-        {
-            return Ok(category.id.clone());
-        }
-        let matches: Vec<_> = self
-            .categories
-            .iter()
-            .filter(|category| category_name_has_prefix(&category.name, &folded))
-            .collect();
-        match matches.as_slice() {
-            [category] => Ok(category.id.clone()),
-            [] => Err(StoreError::NotFound {
-                entity: "category",
-                query: query.to_string(),
-            }),
-            _ => Err(StoreError::Ambiguous {
-                entity: "category",
-                query: query.to_string(),
-                matches: matches
-                    .into_iter()
-                    .map(|category| category.name.clone())
-                    .collect(),
-            }),
-        }
+        resolve_named_id(&self.categories, query)
     }
 
     /// Resolve a label by id, Unicode-caseless name, or unique name prefix.
     pub fn resolve_label_id(&self, query: &str) -> Result<String, StoreError> {
-        let query = query.trim();
-        if query.is_empty() {
-            return Err(StoreError::validation("label name cannot be empty"));
-        }
-        if let Some(label) = self.labels.iter().find(|label| label.id == query) {
-            return Ok(label.id.clone());
-        }
-        validate_byte_limit(query, text_byte_limit(MAX_LABEL_NAME_LEN), "label query")?;
-        let folded = label_name_key(query);
-        if let Some(label) = self
-            .labels
-            .iter()
-            .find(|label| label_name_key(&label.name) == folded)
-        {
-            return Ok(label.id.clone());
-        }
-        let matches: Vec<_> = self
-            .labels
-            .iter()
-            .filter(|label| label_name_has_prefix(&label.name, &folded))
-            .collect();
-        match matches.as_slice() {
-            [label] => Ok(label.id.clone()),
-            [] => Err(StoreError::NotFound {
-                entity: "label",
-                query: query.to_string(),
-            }),
-            _ => Err(StoreError::Ambiguous {
-                entity: "label",
-                query: query.to_string(),
-                matches: matches
-                    .into_iter()
-                    .map(|label| label.name.clone())
-                    .collect(),
-            }),
-        }
+        resolve_named_id(&self.labels, query)
     }
 
     pub fn task(&self, id: &str) -> Result<&Task, StoreError> {
@@ -618,14 +644,12 @@ impl StoreData {
                 "tasks can only be reordered within the same category",
             ));
         }
-        let task = self.tasks.remove(index);
-        let target_after_removal = target_index - usize::from(index < target_index);
-        let insertion = match position {
-            RelativePosition::Before => target_after_removal,
-            RelativePosition::After => target_after_removal + 1,
-        };
-        self.tasks.insert(insertion, task.clone());
-        Ok(task)
+        Ok(move_relative(
+            &mut self.tasks,
+            index,
+            target_index,
+            position,
+        ))
     }
 
     pub fn purge_completed(&mut self, scope: &PurgeScope) -> Result<Vec<Task>, StoreError> {
@@ -649,15 +673,9 @@ impl StoreData {
     }
 
     fn remove_tasks(&mut self, mut should_remove: impl FnMut(&Task) -> bool) -> Vec<Task> {
-        let mut removed = Vec::new();
-        self.tasks.retain(|task| {
-            let remove = should_remove(task);
-            if remove {
-                removed.push(task.clone());
-            }
-            !remove
-        });
-        removed
+        self.tasks
+            .extract_if(.., |task| should_remove(task))
+            .collect()
     }
 
     pub fn create_category(
@@ -881,14 +899,12 @@ impl StoreData {
         }
         let index = self.category_index(id)?;
         let target_index = self.category_index(target_id)?;
-        let category = self.categories.remove(index);
-        let target_after_removal = target_index - usize::from(index < target_index);
-        let insertion = match position {
-            RelativePosition::Before => target_after_removal,
-            RelativePosition::After => target_after_removal + 1,
-        };
-        self.categories.insert(insertion, category.clone());
-        Ok(category)
+        Ok(move_relative(
+            &mut self.categories,
+            index,
+            target_index,
+            position,
+        ))
     }
 
     pub fn replace_settings(&mut self, settings: Settings) -> Result<Settings, StoreError> {
@@ -1697,7 +1713,7 @@ fn load_snapshot(connection: &Connection) -> Result<StoreData, StoreError> {
         .enumerate()
         .map(|(index, task)| (task.id.clone(), index))
         .collect();
-    let mut expected_label_positions: HashMap<String, usize> = HashMap::new();
+    let mut expected_label_positions = vec![0usize; tasks.len()];
     let mut task_labels_statement = connection.prepare(
         "SELECT task_id, position, label_id FROM task_labels ORDER BY task_id, position",
     )?;
@@ -1715,7 +1731,7 @@ fn load_snapshot(connection: &Connection) -> Result<StoreData, StoreError> {
                 "task label assignment refers to unknown task {task_id:?}"
             ))
         })?;
-        let expected_position = expected_label_positions.entry(task_id.clone()).or_default();
+        let expected_position = &mut expected_label_positions[task_index];
         validate_stored_position(stored_position, *expected_position, "task label")?;
         *expected_position += 1;
         tasks[task_index].label_ids.push(label_id);
@@ -1740,7 +1756,7 @@ fn validate_task_attachment_rows(
     connection: &Connection,
     tasks: &[Task],
 ) -> Result<(), StoreError> {
-    let expected: HashSet<(String, usize, String)> = tasks
+    let expected: HashSet<(&str, usize, &str)> = tasks
         .iter()
         .flat_map(|task| {
             task.description
@@ -1748,7 +1764,7 @@ fn validate_task_attachment_rows(
                 .enumerate()
                 .filter_map(|(block_index, block)| match block {
                     Block::Image { attachment_id } => {
-                        Some((task.id.clone(), block_index, attachment_id.clone()))
+                        Some((task.id.as_str(), block_index, attachment_id.as_str()))
                     }
                     _ => None,
                 })
@@ -1775,7 +1791,11 @@ fn validate_task_attachment_rows(
         })?;
         stored.insert((task_id, block_index, attachment_id));
     }
-    if stored != expected {
+    if stored.len() != expected.len()
+        || stored.iter().any(|(task_id, block_index, attachment_id)| {
+            !expected.contains(&(task_id.as_str(), *block_index, attachment_id.as_str()))
+        })
+    {
         return Err(StoreError::Corrupt(
             "task attachment reference rows do not match task description JSON".into(),
         ));
@@ -3080,31 +3100,37 @@ fn normalize_and_validate(
             )));
         }
         let mut assigned = HashSet::new();
+        let mut previous_label_position = None;
+        let mut labels_are_canonical = true;
         for label_id in &task.label_ids {
             validate_single_line(label_id, "task label id")?;
             validate_byte_limit(label_id, ID_MAX_BYTES, "task label id")?;
-            if !assigned.insert(label_id.clone()) {
+            if !assigned.insert(label_id.as_str()) {
                 return Err(StoreError::Validation(format!(
                     "task {:?} assigns label {label_id:?} more than once",
                     task.id
                 )));
             }
-            if !label_positions.contains_key(label_id) {
+            let Some(&position) = label_positions.get(label_id) else {
                 return Err(StoreError::Validation(format!(
                     "task {:?} refers to unknown label {label_id:?}",
                     task.id
                 )));
-            }
+            };
+            labels_are_canonical &=
+                previous_label_position.is_none_or(|previous| previous < position);
+            previous_label_position = Some(position);
         }
-        let mut canonical_label_ids = task.label_ids.clone();
-        canonical_label_ids.sort_by_key(|label_id| label_positions[label_id]);
-        if matches!(due_mode, DueMode::Stored) && canonical_label_ids != task.label_ids {
+        if matches!(due_mode, DueMode::Stored) && !labels_are_canonical {
             return Err(StoreError::Validation(format!(
                 "task {:?} labels are not in canonical store order",
                 task.id
             )));
         }
-        task.label_ids = canonical_label_ids;
+        if !matches!(due_mode, DueMode::Stored) {
+            task.label_ids
+                .sort_by_key(|label_id| label_positions[label_id]);
+        }
         validate_single_line(&task.due, "task due")?;
         validate_byte_limit(&task.due, DUE_MAX_BYTES, "task due")?;
         let normalized_due = match due_mode {
@@ -3251,24 +3277,14 @@ fn validate_byte_limit(value: &str, max_bytes: usize, label: &str) -> Result<(),
     Ok(())
 }
 
-fn category_name_has_prefix(name: &str, folded_query: &str) -> bool {
+fn name_has_prefix<T: NamedEntity>(name: &str, folded_query: &str) -> bool {
     let normalized: String = name.trim().nfkc().collect();
     normalized
         .char_indices()
         .skip(1)
         .map(|(index, _)| index)
         .chain(std::iter::once(normalized.len()))
-        .any(|end| category_name_key(&normalized[..end]) == folded_query)
-}
-
-fn label_name_has_prefix(name: &str, folded_query: &str) -> bool {
-    let normalized: String = name.trim().nfkc().collect();
-    normalized
-        .char_indices()
-        .skip(1)
-        .map(|(index, _)| index)
-        .chain(std::iter::once(normalized.len()))
-        .any(|end| label_name_key(&normalized[..end]) == folded_query)
+        .any(|end| T::name_key(&normalized[..end]) == folded_query)
 }
 
 fn validate_settings(settings: &Settings) -> Result<(), StoreError> {
