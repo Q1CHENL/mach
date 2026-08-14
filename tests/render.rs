@@ -19,17 +19,11 @@ use mach::ui;
 
 #[path = "common/render.rs"]
 mod render_common;
-use render_common::draw;
+use render_common::{buffer_text, draw, find_cells, move_mouse};
 
 /// The screen as text, one line per row.
 fn render(app: &mut App, width: u16, height: u16) -> String {
     buffer_text(&draw(app, width, height))
-}
-
-fn row_text(buffer: &Buffer, y: u16) -> String {
-    (0..buffer.area.width)
-        .map(|x| buffer[(x, y)].symbol())
-        .collect()
 }
 
 /// Whether the cells spelling out `needle` are all bold — how the help
@@ -40,39 +34,6 @@ fn is_bold(buffer: &Buffer, needle: &str) -> bool {
         .map(|x| &buffer[(x, y)])
         .filter(|cell| !cell.symbol().trim().is_empty())
         .all(|cell| cell.modifier.contains(Modifier::BOLD))
-}
-
-/// Top-left cell of the run spelling out `needle`.
-fn find_cells(buffer: &Buffer, needle: &str) -> (u16, u16) {
-    let width = needle.chars().count() as u16;
-    for y in 0..buffer.area.height {
-        for x in 0..buffer.area.width.saturating_sub(width) {
-            let run: String = (x..x + width).map(|x| buffer[(x, y)].symbol()).collect();
-            if run == needle {
-                return (x, y);
-            }
-        }
-    }
-    panic!("{needle:?} is not on screen:\n{}", buffer_text(buffer));
-}
-
-fn buffer_text(buffer: &Buffer) -> String {
-    (0..buffer.area.height)
-        .map(|y| row_text(buffer, y))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn move_mouse(app: &mut App, column: u16, row: u16) -> bool {
-    handle_event(
-        app,
-        Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Moved,
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        }),
-    )
 }
 
 /// An app with two categories and a few tasks, backed by an independent
