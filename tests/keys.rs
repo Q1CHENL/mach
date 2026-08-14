@@ -11,7 +11,7 @@ use ratatui::layout::Rect;
 use mach::app::{App, Confirm, Focus, Mode};
 use mach::form::{TaskDraft, TaskForm};
 use mach::input::handle_event;
-use mach::model::{Category, LabelColor, Task};
+use mach::model::{Block, Category, LabelColor, Task};
 use mach::store::Store;
 
 mod common;
@@ -1443,6 +1443,88 @@ fn scroll(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
             modifiers: KeyModifiers::NONE,
         }),
     );
+}
+
+fn long_description() -> Vec<Block> {
+    (0..24)
+        .map(|index| Block::text(&format!("description line {index}")))
+        .collect()
+}
+
+#[test]
+fn wheel_over_task_preview_scrolls_the_description_not_the_task_list() {
+    let mut app = app();
+    app.tasks[0].description = long_description();
+    draw(&mut app, 120, 30);
+    let area = app.areas.preview_description;
+    assert!(
+        area.width > 0 && area.height > 0,
+        "preview body must be visible"
+    );
+    let selected = app.task_index;
+
+    scroll(&mut app, MouseEventKind::ScrollDown, area.x + 1, area.y + 1);
+
+    assert_eq!(
+        app.task_index, selected,
+        "preview scrolling keeps selection"
+    );
+    assert!(
+        app.preview_form.as_ref().unwrap().description.scroll() > 0,
+        "the preview description moves"
+    );
+
+    for _ in 0..20 {
+        scroll(&mut app, MouseEventKind::ScrollDown, area.x + 1, area.y + 1);
+    }
+    let screen = draw(&mut app, 120, 30);
+    find_cells(&screen, "description line 23");
+}
+
+#[test]
+fn wheel_over_task_form_description_preserves_field_and_caret() {
+    let mut app = app();
+    app.tasks[0].description = long_description();
+    app.open_edit_task();
+    draw(&mut app, 120, 30);
+    let area = app.form.as_ref().unwrap().areas.description;
+    let field = app.form.as_ref().unwrap().field;
+    let caret = app.form.as_ref().unwrap().description.cursor_line();
+
+    scroll(&mut app, MouseEventKind::ScrollDown, area.x + 1, area.y + 1);
+
+    let form = app.form.as_ref().unwrap();
+    assert_eq!(form.field, field, "wheel scrolling does not steal focus");
+    assert_eq!(
+        form.description.cursor_line(),
+        caret,
+        "wheel scrolling does not move the caret"
+    );
+    assert!(form.description.scroll() > 0);
+}
+
+#[test]
+fn wheel_over_category_description_scrolls_without_stealing_focus() {
+    let mut app = app();
+    app.categories
+        .iter_mut()
+        .find(|category| category.id == "c-work")
+        .unwrap()
+        .description = (0..24)
+        .map(|index| format!("category line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.select_category(1);
+    app.open_edit_category();
+    draw(&mut app, 100, 24);
+    let area = app.category_form.as_ref().unwrap().description_area;
+    assert!(!app.category_form.as_ref().unwrap().on_description);
+
+    scroll(&mut app, MouseEventKind::ScrollDown, area.x + 1, area.y + 1);
+
+    let form = app.category_form.as_ref().unwrap();
+    assert!(!form.on_description, "wheel scrolling does not steal focus");
+    assert!(form.description.scroll() > 0);
 }
 
 #[test]

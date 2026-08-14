@@ -13,6 +13,9 @@ use crate::undo::EditKind;
 
 /// Two clicks on the same task within this long open it.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// One wheel notch moves a few soft-wrapped rows. Trackpads remain precise
+/// because they emit repeated wheel events.
+const DESCRIPTION_WHEEL_ROWS: isize = 3;
 
 /// Handle one terminal event and report whether the screen may have changed.
 pub fn handle_event(app: &mut App, event: Event) -> bool {
@@ -1938,6 +1941,30 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                 return;
             }
         } else {
+            if matches!(
+                m.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) {
+                let up = matches!(m.kind, MouseEventKind::ScrollUp);
+                if let Some(form) = &mut app.category_form {
+                    if form.description.menu.is_some() {
+                        if up {
+                            form.description.menu_prev();
+                        } else {
+                            form.description.menu_next();
+                        }
+                    } else if contains(form.description_area, m.column, m.row) {
+                        let rows = if up {
+                            -DESCRIPTION_WHEEL_ROWS
+                        } else {
+                            DESCRIPTION_WHEEL_ROWS
+                        };
+                        form.description
+                            .scroll_by(rows, usize::from(form.description_area.height));
+                    }
+                }
+                return;
+            }
             if m.kind == MouseEventKind::Down(MouseButton::Left)
                 && app
                     .category_form
@@ -1988,7 +2015,13 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             } else {
                 1
             };
-            if contains(app.areas.tasks, m.column, m.row) {
+            if contains(app.areas.preview_description, m.column, m.row) {
+                let rows = delta * DESCRIPTION_WHEEL_ROWS;
+                if let Some(form) = &mut app.preview_form {
+                    form.description
+                        .scroll_by(rows, usize::from(app.areas.preview_description.height));
+                }
+            } else if contains(app.areas.tasks, m.column, m.row) {
                 app.move_task_selection(delta);
             } else if contains(app.areas.sidebar, m.column, m.row) && !app.searching {
                 // Same reason clicking a category is blocked mid-search:
@@ -2258,6 +2291,28 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
             } else {
                 form.description.menu_next();
             }
+        }
+        return;
+    }
+
+    // The description body owns wheel movement without changing the active
+    // field or text caret. Menu and picker overlays above keep precedence.
+    if matches!(
+        m.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) && app
+        .form
+        .as_ref()
+        .is_some_and(|form| !form.preview && contains(form.areas.description, m.column, m.row))
+    {
+        let rows = if m.kind == MouseEventKind::ScrollUp {
+            -DESCRIPTION_WHEEL_ROWS
+        } else {
+            DESCRIPTION_WHEEL_ROWS
+        };
+        if let Some(form) = &mut app.form {
+            form.description
+                .scroll_by(rows, usize::from(form.areas.description.height));
         }
         return;
     }

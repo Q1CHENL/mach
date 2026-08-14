@@ -428,6 +428,9 @@ pub struct DescriptionEditor {
     lines: Vec<Line>,
     cursor: usize,
     scroll: usize,
+    /// Mouse-wheel scrolling may temporarily move the viewport away from the
+    /// caret. Editing, keyboard navigation, and body clicks resume following.
+    follow_cursor: bool,
     pub menu: Option<SlashMenu>,
     /// Restricted command set. Category descriptions use this.
     plain: bool,
@@ -503,6 +506,7 @@ impl DescriptionEditor {
             lines,
             cursor: 0,
             scroll: 0,
+            follow_cursor: true,
             menu: None,
             plain,
             max_lines,
@@ -878,6 +882,7 @@ impl DescriptionEditor {
     /// Delete description-level or in-line selection. Returns true if anything
     /// was removed.
     pub fn delete_description_selection(&mut self) -> bool {
+        self.follow_cursor = true;
         if let Some(((al, ac), (bl, bc))) = self.ordered_selection() {
             if al == bl {
                 // One line: cut the selected range out and rebuild the
@@ -1036,6 +1041,7 @@ impl DescriptionEditor {
     /// If there is no editable neighbour, the cursor stays on the picture
     /// (←/→ still create a caret).
     pub fn abandon_image_selection(&mut self) {
+        self.follow_cursor = true;
         if !matches!(self.lines.get(self.cursor), Some(Line::Image { .. })) {
             return;
         }
@@ -1065,6 +1071,7 @@ impl DescriptionEditor {
     // -------------------------------------------------------------- typing
 
     pub fn insert(&mut self, c: char) {
+        self.follow_cursor = true;
         // Typing over a selection replaces it.
         if self.has_selection() && !self.delete_description_selection() {
             return;
@@ -1117,6 +1124,7 @@ impl DescriptionEditor {
     }
 
     pub fn insert_str(&mut self, text: &str) {
+        self.follow_cursor = true;
         self.close_menu();
         if self.has_selection() && !self.delete_description_selection() {
             return;
@@ -1154,6 +1162,7 @@ impl DescriptionEditor {
     /// returns to plain text; prose, links and pictures still start prose.
     /// Returns false only when adding a line would exceed the line cap.
     pub fn newline(&mut self) -> bool {
+        self.follow_cursor = true;
         self.close_menu();
 
         let exits_list = match &self.lines[self.cursor] {
@@ -1189,6 +1198,7 @@ impl DescriptionEditor {
     }
 
     pub fn backspace(&mut self) {
+        self.follow_cursor = true;
         if let Some(start) = self.menu.as_ref().map(|m| m.start) {
             let at = self.input().map(|i| i.cursor()).unwrap_or(0);
             if at <= start {
@@ -1256,6 +1266,7 @@ impl DescriptionEditor {
     }
 
     pub fn delete(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         let had_selection = self.has_selection();
         if self.delete_description_selection() {
@@ -1292,6 +1303,7 @@ impl DescriptionEditor {
 
     /// Drops the block under the cursor, keeping at least one line.
     pub fn remove_block(&mut self) {
+        self.follow_cursor = true;
         if self.lines.len() == 1 {
             self.lines[0] = self.empty_line();
             return;
@@ -1301,6 +1313,7 @@ impl DescriptionEditor {
     }
 
     pub fn toggle(&mut self) {
+        self.follow_cursor = true;
         if let Line::Todo { done, .. } = self.line() {
             *done = !*done;
         }
@@ -1321,6 +1334,7 @@ impl DescriptionEditor {
     }
 
     pub fn up(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.clear_description_selection();
         // Already on a picture: leave it upward (may insert a blank above).
@@ -1363,6 +1377,7 @@ impl DescriptionEditor {
     }
 
     pub fn down(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.clear_description_selection();
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
@@ -1403,6 +1418,7 @@ impl DescriptionEditor {
     }
 
     pub fn left(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.prefer_col = u16::MAX;
         self.clear_description_selection();
@@ -1430,6 +1446,7 @@ impl DescriptionEditor {
     }
 
     pub fn right(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.prefer_col = u16::MAX;
         self.clear_description_selection();
@@ -1498,6 +1515,7 @@ impl DescriptionEditor {
     }
 
     pub fn home(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.clear_description_selection();
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
@@ -1510,6 +1528,7 @@ impl DescriptionEditor {
     }
 
     pub fn end(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.clear_description_selection();
         if matches!(self.lines[self.cursor], Line::Image { .. }) {
@@ -1522,6 +1541,7 @@ impl DescriptionEditor {
     }
 
     pub fn word_left(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.clear_description_selection();
         self.prefer_col = u16::MAX;
@@ -1547,6 +1567,7 @@ impl DescriptionEditor {
     }
 
     pub fn word_right(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.clear_description_selection();
         self.prefer_col = u16::MAX;
@@ -1581,6 +1602,7 @@ impl DescriptionEditor {
     }
 
     pub fn select_word(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.sel_anchor = None;
         if let Some(input) = self.input() {
@@ -1589,6 +1611,7 @@ impl DescriptionEditor {
     }
 
     pub fn select_left(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.prefer_col = u16::MAX;
         self.ensure_sel_anchor();
@@ -1612,6 +1635,7 @@ impl DescriptionEditor {
     }
 
     pub fn select_right(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.prefer_col = u16::MAX;
         self.ensure_sel_anchor();
@@ -1635,6 +1659,7 @@ impl DescriptionEditor {
 
     /// Shift+Option+← — extend selection by a word, crossing lines and pictures.
     pub fn select_word_left(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.prefer_col = u16::MAX;
         self.ensure_sel_anchor();
@@ -1674,6 +1699,7 @@ impl DescriptionEditor {
 
     /// Shift+Option+→ — extend selection by a word, crossing lines and pictures.
     pub fn select_word_right(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.prefer_col = u16::MAX;
         self.ensure_sel_anchor();
@@ -1734,6 +1760,7 @@ impl DescriptionEditor {
     }
 
     pub fn select_home(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.ensure_sel_anchor();
         if let Some(input) = self.input() {
@@ -1743,6 +1770,7 @@ impl DescriptionEditor {
     }
 
     pub fn select_end(&mut self) {
+        self.follow_cursor = true;
         self.close_menu();
         self.ensure_sel_anchor();
         if let Some(input) = self.input() {
@@ -1753,18 +1781,21 @@ impl DescriptionEditor {
     }
 
     pub fn delete_to_start(&mut self) {
+        self.follow_cursor = true;
         if let Some(input) = self.input() {
             input.delete_to_start();
         }
     }
 
     pub fn delete_to_end(&mut self) {
+        self.follow_cursor = true;
         if let Some(input) = self.input() {
             input.delete_to_end();
         }
     }
 
     pub fn delete_word_left(&mut self) {
+        self.follow_cursor = true;
         if let Some(input) = self.input() {
             input.delete_word_left();
         }
@@ -1864,6 +1895,7 @@ impl DescriptionEditor {
     /// Removes the typed `/command` and applies it. Returns work that needs
     /// access to the platform clipboard.
     pub fn apply(&mut self, command: Command) -> Option<CommandRequest> {
+        self.follow_cursor = true;
         if !self.allowed_commands().contains(&command) {
             self.close_menu();
             return None;
@@ -1926,6 +1958,7 @@ impl DescriptionEditor {
     /// Puts a block in at the cursor, replacing the line when it is an
     /// empty one and pushing it down otherwise.
     pub fn insert_block(&mut self, block: Block) -> bool {
+        self.follow_cursor = true;
         if self.plain && matches!(block, Block::Todo { .. } | Block::Image { .. }) {
             return false;
         }
@@ -2084,10 +2117,12 @@ impl DescriptionEditor {
                 .unwrap_or(0);
             layout.start.saturating_add(row_in_block)
         };
-        if cursor_visual < self.scroll {
-            self.scroll = cursor_visual;
-        } else if cursor_visual >= self.scroll.saturating_add(usize::from(height)) {
-            self.scroll = cursor_visual + 1 - usize::from(height);
+        if self.follow_cursor {
+            if cursor_visual < self.scroll {
+                self.scroll = cursor_visual;
+            } else if cursor_visual >= self.scroll.saturating_add(usize::from(height)) {
+                self.scroll = cursor_visual + 1 - usize::from(height);
+            }
         }
         self.scroll = self.scroll.min(total.saturating_sub(usize::from(height)));
 
@@ -2164,10 +2199,32 @@ impl DescriptionEditor {
         self.content_height
     }
 
+    /// Scrolls the laid-out viewport by visual rows without moving the caret.
+    /// Returns whether the viewport changed. The next caret interaction
+    /// resumes normal cursor-follow behavior.
+    pub fn scroll_by(&mut self, rows: isize, viewport_height: usize) -> bool {
+        if rows == 0 || viewport_height == 0 {
+            return false;
+        }
+        let max_scroll = self.content_height.saturating_sub(viewport_height);
+        let next = if rows.is_negative() {
+            self.scroll.saturating_sub(rows.unsigned_abs())
+        } else {
+            self.scroll.saturating_add(rows as usize).min(max_scroll)
+        };
+        if next == self.scroll {
+            return false;
+        }
+        self.scroll = next;
+        self.follow_cursor = false;
+        true
+    }
+
     /// Moves the cursor to a clicked cell of the description box.
     /// Returns `true` when the click landed on a real block (not empty
     /// padding below the content).
     pub fn click(&mut self, row: u16, col: usize) -> bool {
+        self.follow_cursor = true;
         let width = self.layout_width.max(1);
         let numbers = number_runs(&self.lines);
         let target = self.scroll.saturating_add(usize::from(row));
@@ -2909,6 +2966,37 @@ mod tests {
         assert_eq!((imgs[1].y, imgs[1].rows), (1, 10));
         // No overlap: first ends at y+rows = 1, second starts at 1.
         assert_eq!(imgs[0].y + imgs[0].rows, imgs[1].y);
+    }
+
+    #[test]
+    fn manual_scroll_is_bounded_without_moving_the_caret() {
+        let blocks = (0..10)
+            .map(|index| Block::text(&format!("line {index}")))
+            .collect::<Vec<_>>();
+        let mut e = editor(&blocks);
+        let (_, cursor) = e.layout(20, 3);
+        assert_eq!(cursor.map(|(row, _)| row), Some(0));
+
+        assert!(e.scroll_by(isize::MAX, 3));
+        let (_, cursor) = e.layout(20, 3);
+        assert_eq!(e.scroll(), 7, "wheel scrolling clamps at the last page");
+        assert_eq!(
+            e.cursor_line(),
+            0,
+            "wheel scrolling does not move the caret"
+        );
+        assert_eq!(cursor, None, "an off-screen caret is hidden");
+
+        assert!(e.scroll_by(-6, 3));
+        assert_eq!(e.scroll(), 1);
+        e.down();
+        let (_, cursor) = e.layout(20, 3);
+        assert_eq!(e.scroll(), 1);
+        assert_eq!(
+            cursor.map(|(row, _)| row),
+            Some(0),
+            "keyboard navigation resumes caret follow"
+        );
     }
 
     #[test]

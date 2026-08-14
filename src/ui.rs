@@ -519,6 +519,7 @@ fn draw_task_preview(
         Constraint::Min(0),
     ])
     .areas(inner);
+    app.areas.preview_description = description_area;
 
     f.render_widget(
         Paragraph::new(Line::styled(
@@ -570,9 +571,9 @@ fn draw_task_preview(
             false,
             image_occlusion,
         );
-        if paint.description.content_height() > usize::from(description_area.height)
-            && description_area.height > 0
-        {
+        let visible = usize::from(description_area.height);
+        let max_scroll = paint.description.content_height().saturating_sub(visible);
+        if paint.description.scroll() < max_scroll && description_area.height > 0 {
             let indicator = Rect {
                 y: description_area.bottom() - 1,
                 height: 1,

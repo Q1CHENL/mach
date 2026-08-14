@@ -242,6 +242,8 @@ pub struct Areas {
     pub command_bar: Rect,
     /// Bottom-right task preview / docked editor, when the window is tall enough.
     pub preview: Rect,
+    /// Visible description body inside the read-only task preview.
+    pub preview_description: Rect,
     /// Screen columns of the flag and done markers, as the table laid
     /// them out. `done_x` is the left edge of the `[ ]`/`[✓]` column
     /// (see `ui::DONE_MARK_WIDTH`). The flag column is always reserved
