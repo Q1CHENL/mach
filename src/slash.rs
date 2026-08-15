@@ -166,17 +166,11 @@ pub fn args_for(command: SlashCommand, query: &str) -> String {
     if q.is_empty() {
         return String::new();
     }
-    let lower = q.to_lowercase();
-    for key in command.keywords() {
-        if lower == *key {
-            return String::new();
-        }
-        if let Some(rest) = lower.strip_prefix(key)
-            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
-        {
-            let n = key.len().min(q.len());
-            return q[n..].trim().to_string();
-        }
+    let head_end = q.find(char::is_whitespace).unwrap_or(q.len());
+    let (head, args) = q.split_at(head_end);
+    let head = head.to_lowercase();
+    if command.keywords().contains(&head.as_str()) {
+        return args.trim().to_string();
     }
     String::new()
 }
@@ -281,5 +275,14 @@ mod tests {
             args_for(SlashCommand::Import, "import ~/My Tasks.mach"),
             "~/My Tasks.mach"
         );
+    }
+
+    #[test]
+    fn non_ascii_command_heads_preserve_argument_boundaries() {
+        assert_eq!(
+            args_for(SlashCommand::Export, "bacKup /tmp/a.mach"),
+            "/tmp/a.mach"
+        );
+        assert_eq!(args_for(SlashCommand::CopyTask, "copytasK value"), "value");
     }
 }
