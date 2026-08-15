@@ -15,16 +15,16 @@ pub const BANNER_WIDTH: u16 = 35;
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
     (
-        "Faster label navigation",
-        "Type to jump in the Labels manager or task label picker without filtering or changing assignments.",
+        "Faster category assignment",
+        "Open a scrolling Category menu in the task editor, then type to jump and choose with the keyboard or mouse.",
     ),
     (
-        "Scroll descriptions",
-        "Use the mouse wheel over long task previews and task or category description editors.",
+        "Choose how many hints you see",
+        "Set Hints to All or Essential in Settings, or toggle it with /hints. Essential keeps action guidance while reclaiming space.",
     ),
     (
-        "Clearer mouse feedback",
-        "Interactive rows and calendar dates now respond to hover, with more balanced label and due pickers.",
+        "Jump through long descriptions",
+        "Choose Bottom ↓ in an overflowing preview or task editor to move straight to the end without disturbing your edit.",
     ),
 ];
 

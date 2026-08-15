@@ -451,7 +451,7 @@ fn whats_new_shows_complete_highlight_descriptions() {
         app.mode = Mode::WhatsNew;
         let screen = render(&mut app, width, height);
 
-        for ending in ["assignments.", "editors.", "pickers."] {
+        for ending in ["mouse.", "space.", "edit."] {
             assert!(
                 screen.contains(ending),
                 "{ending:?} was clipped at {width}x{height}:\n{screen}"
