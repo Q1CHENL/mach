@@ -2468,13 +2468,20 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
             }
             return;
         }
+        let owner_field = app
+            .form
+            .as_ref()
+            .is_some_and(|form| form.areas.field_at(m.column, m.row) == Some(Field::Category));
         if let Some(form) = &mut app.form {
             form.close_category_picker();
         }
+        if owner_field {
+            return;
+        }
     }
 
-    // Consume picker chrome so re-clicking Labels cannot dismiss and
-    // immediately reopen the overlay.
+    // Picker content owns its clicks. Re-clicking Labels closes the picker
+    // and consumes the click so field handling below cannot reopen it.
     if app
         .form
         .as_ref()
@@ -2509,8 +2516,15 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
             }
             return;
         }
+        let owner_field = app
+            .form
+            .as_ref()
+            .is_some_and(|form| form.areas.field_at(m.column, m.row) == Some(Field::Labels));
         if let Some(form) = &mut app.form {
             form.close_label_picker();
+        }
+        if owner_field {
+            return;
         }
     }
 
@@ -2524,12 +2538,10 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
         if handled {
             return;
         }
-        // Click outside the picker closes it (unless reopening Due).
-        if !form.areas.due.contains(ratatui::layout::Position {
-            x: m.column,
-            y: m.row,
-        }) {
-            form.picker = None;
+        let owner_field = form.areas.field_at(m.column, m.row) == Some(Field::Due);
+        form.picker = None;
+        if owner_field {
+            return;
         }
     }
 

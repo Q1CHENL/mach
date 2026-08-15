@@ -1174,6 +1174,35 @@ fn task_form_category_dropdown_supports_click_commit_and_outside_cancel() {
 }
 
 #[test]
+fn task_form_picker_fields_collapse_their_open_overlays() {
+    let mut app = app();
+    app.select_category(1);
+    app.open_edit_task();
+    draw(&mut app, 100, 30);
+
+    let category = app.form.as_ref().unwrap().areas.category;
+    click(&mut app, category.x + 1, category.y + 1);
+    assert!(app.form.as_ref().unwrap().category_picker_open());
+    draw(&mut app, 100, 30);
+    click(&mut app, category.x + 1, category.y + 1);
+    assert!(!app.form.as_ref().unwrap().category_picker_open());
+
+    let labels = app.form.as_ref().unwrap().areas.labels;
+    click(&mut app, labels.x + 1, labels.y + 1);
+    assert!(app.form.as_ref().unwrap().label_picker_open());
+    draw(&mut app, 100, 30);
+    click(&mut app, labels.x + 1, labels.y + 1);
+    assert!(!app.form.as_ref().unwrap().label_picker_open());
+
+    let due = app.form.as_ref().unwrap().areas.due;
+    click(&mut app, due.x + 1, due.y + 1);
+    assert!(app.form.as_ref().unwrap().picker.is_some());
+    draw(&mut app, 100, 30);
+    click(&mut app, due.x + 1, due.y + 1);
+    assert!(app.form.as_ref().unwrap().picker.is_none());
+}
+
+#[test]
 fn task_form_label_picker_toggles_multiple_labels_without_closing() {
     let mut app = app();
     let bug = app.create_label("bug").unwrap();
