@@ -21,10 +21,19 @@ const DESCRIPTION_WHEEL_ROWS: isize = 3;
 pub fn handle_event(app: &mut App, event: Event) -> bool {
     match event {
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            app.end_scrollbar_drag();
             handle_key(app, key);
             true
         }
         Event::Mouse(m) if m.kind == MouseEventKind::Moved => app.track_mouse(m.column, m.row),
+        Event::Mouse(m) if m.kind == MouseEventKind::Drag(MouseButton::Left) => {
+            let hover_changed = app.track_mouse(m.column, m.row);
+            app.drag_scrollbar(m.row) || hover_changed
+        }
+        Event::Mouse(m) if m.kind == MouseEventKind::Up(MouseButton::Left) => {
+            let hover_changed = app.track_mouse(m.column, m.row);
+            app.end_scrollbar_drag() || hover_changed
+        }
         Event::Mouse(m)
             if matches!(
                 m.kind,
@@ -45,7 +54,10 @@ pub fn handle_event(app: &mut App, event: Event) -> bool {
         }
         // Crossterm has already resized the terminal; the next draw picks up
         // the new dimensions without any App mutation here.
-        Event::Resize(_, _) => true,
+        Event::Resize(_, _) => {
+            app.end_scrollbar_drag();
+            true
+        }
         _ => false,
     }
 }
@@ -1986,6 +1998,11 @@ fn request_close_form(app: &mut App, form: OpenForm, source: FormCloseSource) ->
 
 fn handle_mouse(app: &mut App, m: MouseEvent) {
     app.cancel_pending();
+    if m.kind == MouseEventKind::Down(MouseButton::Left)
+        && app.begin_scrollbar_drag(m.column, m.row)
+    {
+        return;
+    }
     if app.mode == Mode::Slash {
         handle_slash_mouse(app, m);
         return;

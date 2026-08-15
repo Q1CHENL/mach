@@ -152,6 +152,20 @@ fn release_click(app: &mut App, column: u16, row: u16) {
     );
 }
 
+fn drag(app: &mut App, column: u16, from_row: u16, to_row: u16) {
+    click(app, column, from_row);
+    handle_event(
+        app,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column,
+            row: to_row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    release_click(app, column, to_row);
+}
+
 fn repeat(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     handle_event(
         app,
@@ -1739,6 +1753,178 @@ fn long_description() -> Vec<Block> {
     (0..24)
         .map(|index| Block::text(&format!("description line {index}")))
         .collect()
+}
+
+#[test]
+fn category_scrollbar_thumb_drags_to_the_last_page() {
+    let mut app = overflowing_app();
+    app.focus = Focus::Sidebar;
+    draw(&mut app, 60, 16);
+    let list = app.areas.sidebar;
+
+    drag(
+        &mut app,
+        list.right().saturating_add(1),
+        list.y,
+        list.bottom().saturating_sub(1),
+    );
+    draw(&mut app, 60, 16);
+
+    assert_eq!(app.cat_index, app.categories.len() - 1);
+    assert!(app.cat_state.offset() > 0);
+
+    handle_event(
+        &mut app,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: list.right().saturating_add(1),
+            row: list.y,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    assert_eq!(
+        app.cat_index,
+        app.categories.len() - 1,
+        "release ends the scrollbar gesture"
+    );
+}
+
+#[test]
+fn task_scrollbar_thumb_drags_to_the_last_page() {
+    let mut app = overflowing_app();
+    app.focus = Focus::Tasks;
+    draw(&mut app, 60, 16);
+    let list = app.areas.tasks;
+
+    drag(
+        &mut app,
+        list.right().saturating_add(1),
+        list.y,
+        list.bottom().saturating_sub(1),
+    );
+    draw(&mut app, 60, 16);
+
+    assert_eq!(app.task_index, app.view.len() - 1);
+    assert!(app.task_state.offset() > 0);
+}
+
+#[test]
+fn form_description_scrollbars_drag_to_the_bottom() {
+    let mut task_app = app();
+    task_app.tasks[0].description = long_description();
+    task_app.open_edit_task();
+    draw(&mut task_app, 100, 30);
+    let task_description = task_app.form.as_ref().unwrap().areas.description;
+    drag(
+        &mut task_app,
+        task_description.right().saturating_add(1),
+        task_description.y,
+        task_description.bottom().saturating_sub(1),
+    );
+    assert!(task_app.form.as_ref().unwrap().description.scroll() > 0);
+
+    let mut category_app = app();
+    category_app.categories[1].description = (0..24)
+        .map(|index| format!("category description line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    category_app.select_category(1);
+    category_app.open_edit_category();
+    draw(&mut category_app, 100, 30);
+    let category_description = category_app
+        .category_form
+        .as_ref()
+        .unwrap()
+        .description_area;
+    drag(
+        &mut category_app,
+        category_description.right().saturating_add(1),
+        category_description.y,
+        category_description.bottom().saturating_sub(1),
+    );
+    assert!(
+        category_app
+            .category_form
+            .as_ref()
+            .unwrap()
+            .description
+            .scroll()
+            > 0
+    );
+}
+
+#[test]
+fn task_picker_scrollbars_drag_to_the_last_choice() {
+    let mut category_app = overflowing_app();
+    category_app.open_edit_task();
+    category_app.form.as_mut().unwrap().open_category_picker();
+    draw(&mut category_app, 60, 16);
+    let picker = category_app
+        .form
+        .as_ref()
+        .unwrap()
+        .category_picker_area()
+        .unwrap();
+    drag(
+        &mut category_app,
+        picker.right().saturating_sub(1),
+        picker.y.saturating_add(1),
+        picker.bottom().saturating_sub(2),
+    );
+    let category_picker = category_app.form.as_ref().unwrap().category_picker.unwrap();
+    assert_eq!(
+        category_picker.index,
+        category_app
+            .form
+            .as_ref()
+            .unwrap()
+            .category_choices()
+            .count()
+            - 1
+    );
+
+    let mut label_app = app();
+    for index in 0..20 {
+        label_app
+            .create_label(&format!("label-{index:02}"))
+            .unwrap();
+    }
+    label_app.open_edit_task();
+    label_app.form.as_mut().unwrap().open_label_picker();
+    draw(&mut label_app, 60, 16);
+    let picker = label_app
+        .form
+        .as_ref()
+        .unwrap()
+        .label_picker_area()
+        .unwrap();
+    drag(
+        &mut label_app,
+        picker.right().saturating_sub(1),
+        picker.y.saturating_add(1),
+        picker.bottom().saturating_sub(2),
+    );
+    let form = label_app.form.as_ref().unwrap();
+    assert_eq!(
+        form.label_picker.unwrap().index,
+        form.label_choices().count(),
+        "Manage is the final picker row"
+    );
+}
+
+#[test]
+fn labels_manager_scrollbar_drags_to_the_last_label() {
+    let mut app = app();
+    for index in 0..20 {
+        app.create_label(&format!("label-{index:02}-very-long-name"))
+            .unwrap();
+    }
+    app.open_labels();
+    draw(&mut app, 60, 16);
+
+    drag(&mut app, 53, 3, 12);
+
+    assert_eq!(app.label_index, app.labels.len() - 1);
 }
 
 #[test]

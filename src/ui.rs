@@ -16,7 +16,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, Focus, HoverPaint, HoverTarget, MessageKind, Mode, SETTINGS_ITEMS, UpdateActivity,
+    App, Focus, HoverPaint, HoverTarget, MessageKind, Mode, SETTINGS_ITEMS, ScrollbarHit,
+    ScrollbarTarget, UpdateActivity,
 };
 use crate::banner;
 use crate::due;
@@ -468,7 +469,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
         form.areas.description_bottom,
     );
     register_task_description_hover(areas, form);
-    scrollbar(
+    if let Some(scrollbar) = paint_scrollbar(
         f,
         theme,
         description_box,
@@ -476,7 +477,11 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
         box_inner.height as usize,
         form.description.scroll(),
         focused,
-    );
+        1,
+        ScrollbarTarget::TaskDescription,
+    ) {
+        areas.register_scrollbar(scrollbar);
+    }
 
     // --- error or key hints ---------------------------------------------
     let footer = match &form.error {
@@ -791,7 +796,7 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             );
         }
     }
-    scrollbar(
+    if let Some(scrollbar) = paint_scrollbar(
         f,
         theme,
         text_box,
@@ -799,7 +804,11 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         box_inner.height as usize,
         form.description.scroll(),
         focused,
-    );
+        1,
+        ScrollbarTarget::CategoryDescription,
+    ) {
+        areas.register_scrollbar(scrollbar);
+    }
 
     let footer = match &form.error {
         Some(error) => Line::styled(
@@ -1602,7 +1611,19 @@ fn draw_category_picker(
             },
         );
     }
-    paint_scrollbar(f, theme, rect, total_rows, visible, start, true, 1);
+    if let Some(scrollbar) = paint_scrollbar(
+        f,
+        theme,
+        rect,
+        total_rows,
+        visible,
+        start,
+        true,
+        1,
+        ScrollbarTarget::TaskCategoryPicker,
+    ) {
+        areas.register_scrollbar(scrollbar);
+    }
 }
 
 /// Bounded, scrolling task-label selector. Selection changes remain in the
@@ -1730,7 +1751,19 @@ fn draw_label_picker(
             );
         }
     }
-    paint_scrollbar(f, theme, rect, total_rows, visible, start, true, 1);
+    if let Some(scrollbar) = paint_scrollbar(
+        f,
+        theme,
+        rect,
+        total_rows,
+        visible,
+        start,
+        true,
+        1,
+        ScrollbarTarget::TaskLabelPicker,
+    ) {
+        areas.register_scrollbar(scrollbar);
+    }
 }
 
 /// A description image at whatever size the screen allows.
@@ -2132,19 +2165,6 @@ fn panel<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
     field_block(title, focused, None, theme)
 }
 
-/// Panel scrollbar (right border). Accent when focused, grey otherwise.
-fn scrollbar(
-    f: &mut Frame,
-    theme: &Theme,
-    area: Rect,
-    total: usize,
-    visible: usize,
-    offset: usize,
-    focused: bool,
-) {
-    paint_scrollbar(f, theme, area, total, visible, offset, focused, 1);
-}
-
 #[allow(clippy::too_many_arguments)]
 fn paint_scrollbar(
     f: &mut Frame,
@@ -2155,16 +2175,14 @@ fn paint_scrollbar(
     offset: usize,
     focused: bool,
     vertical_margin: u16,
-) {
+    target: ScrollbarTarget,
+) -> Option<ScrollbarHit> {
     // Ratatui's thumb hits the end only when `position == content_length - 1`.
     // List/table `offset` runs 0..=(total - visible), so content_length must
     // be that range's size (max_offset + 1), not the raw row count — otherwise
     // the thumb stops short when you are already on the last row.
-    let max_offset = total.saturating_sub(visible);
-    if max_offset == 0 || area.height <= vertical_margin.saturating_mul(2) {
-        return;
-    }
-    let mut state = ScrollbarState::new(max_offset + 1).position(offset.min(max_offset));
+    let scrollbar = ScrollbarHit::new(target, area, total, visible, offset, vertical_margin)?;
+    let mut state = ScrollbarState::new(scrollbar.max_offset + 1).position(scrollbar.offset);
     let style = if focused {
         theme.accent_text()
     } else {
@@ -2183,6 +2201,7 @@ fn paint_scrollbar(
         }),
         &mut state,
     );
+    Some(scrollbar)
 }
 
 // --------------------------------------------------------------- sidebar
@@ -2291,7 +2310,7 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         height: list_area.height.saturating_add(2).min(area.height),
         ..area
     };
-    scrollbar(
+    if let Some(scrollbar) = paint_scrollbar(
         f,
         theme,
         scrollbar_area,
@@ -2299,7 +2318,11 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         list_area.height as usize,
         app.cat_state.offset(),
         chrome_focus,
-    );
+        1,
+        ScrollbarTarget::Sidebar,
+    ) {
+        app.areas.register_scrollbar(scrollbar);
+    }
 }
 
 // ----------------------------------------------------------------- tasks
@@ -2476,7 +2499,7 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         app.areas.hover_control(HoverTarget::TasksBottom, control);
     }
 
-    scrollbar(
+    if let Some(scrollbar) = paint_scrollbar(
         f,
         theme,
         area,
@@ -2484,7 +2507,11 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         inner.height as usize,
         app.task_state.offset(),
         chrome_focus,
-    );
+        1,
+        ScrollbarTarget::Tasks,
+    ) {
+        app.areas.register_scrollbar(scrollbar);
+    }
 }
 
 fn panels_accept_mouse(app: &App) -> bool {
@@ -3254,6 +3281,9 @@ fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, layout: &LabelManage
             list_area,
         );
     } else {
+        app.areas
+            .label_flow_rows
+            .extend(flow.iter().map(|(_, badge)| badge.y));
         let selected = app.label_index.min(app.labels.len() - 1);
         let visible_rows = list_area.height;
         let selected_row = flow.get(selected).map_or(0, |(_, badge)| badge.y);
@@ -3287,7 +3317,7 @@ fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, layout: &LabelManage
                 screen,
             );
         }
-        paint_scrollbar(
+        if let Some(scrollbar) = paint_scrollbar(
             f,
             theme,
             rect,
@@ -3296,7 +3326,10 @@ fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, layout: &LabelManage
             start_row as usize,
             true,
             1,
-        );
+            ScrollbarTarget::Labels,
+        ) {
+            app.areas.register_scrollbar(scrollbar);
+        }
     }
 
     if let Some(input_area) = input_area

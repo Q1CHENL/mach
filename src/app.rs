@@ -233,6 +233,102 @@ pub(crate) enum UpdateActivity {
     Downloading(crate::update::DownloadProgress),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScrollbarTarget {
+    Sidebar,
+    Tasks,
+    TaskDescription,
+    CategoryDescription,
+    TaskCategoryPicker,
+    TaskLabelPicker,
+    Labels,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScrollbarHit {
+    pub target: ScrollbarTarget,
+    pub track: Rect,
+    pub thumb: Rect,
+    pub offset: usize,
+    pub max_offset: usize,
+    pub visible: usize,
+}
+
+impl ScrollbarHit {
+    pub(crate) fn new(
+        target: ScrollbarTarget,
+        area: Rect,
+        total: usize,
+        visible: usize,
+        offset: usize,
+        vertical_margin: u16,
+    ) -> Option<Self> {
+        let max_offset = total.saturating_sub(visible);
+        let track_height = area
+            .height
+            .saturating_sub(vertical_margin.saturating_mul(2));
+        if max_offset == 0 || area.width == 0 || track_height == 0 {
+            return None;
+        }
+
+        let track = Rect::new(
+            area.right().saturating_sub(1),
+            area.y.saturating_add(vertical_margin),
+            1,
+            track_height,
+        );
+        let track_height = usize::from(track_height);
+        let scale = max_offset.saturating_add(track_height);
+        let rounded_divide = |numerator: usize, denominator: usize| {
+            numerator.saturating_add(denominator / 2) / denominator
+        };
+        let thumb_height =
+            rounded_divide(track_height.saturating_mul(track_height), scale).clamp(1, track_height);
+        let thumb_start =
+            rounded_divide(offset.min(max_offset).saturating_mul(track_height), scale)
+                .min(track_height.saturating_sub(thumb_height));
+        let thumb = Rect::new(
+            track.x,
+            track
+                .y
+                .saturating_add(u16::try_from(thumb_start).unwrap_or(u16::MAX)),
+            1,
+            u16::try_from(thumb_height).unwrap_or(u16::MAX),
+        );
+        Some(Self {
+            target,
+            track,
+            thumb,
+            offset: offset.min(max_offset),
+            max_offset,
+            visible,
+        })
+    }
+
+    fn offset_at(self, row: u16, grab_row: u16) -> usize {
+        let travel = self.track.height.saturating_sub(self.thumb.height);
+        if travel == 0 {
+            return 0;
+        }
+        let thumb_top = row.saturating_sub(grab_row).clamp(
+            self.track.y,
+            self.track.bottom().saturating_sub(self.thumb.height),
+        );
+        let position = usize::from(thumb_top.saturating_sub(self.track.y));
+        let travel = usize::from(travel);
+        position
+            .saturating_mul(self.max_offset)
+            .saturating_add(travel / 2)
+            / travel
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScrollbarDrag {
+    target: ScrollbarTarget,
+    grab_row: u16,
+}
+
 /// Semantic mouse targets. Identity is deliberately independent of screen
 /// coordinates so moving within one control does not request another frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +349,7 @@ pub(crate) enum HoverTarget {
     PreviewBottom,
     Label(usize),
     DueDay(NaiveDate),
+    Scrollbar(ScrollbarTarget),
 }
 
 /// Hover paint is kept separate from hit geometry so modal chrome can block
@@ -304,6 +401,8 @@ pub struct Areas {
     /// Name field and selectable color swatches in the label editor.
     pub label_name_input: Rect,
     pub label_color_hits: Vec<(LabelColor, Rect)>,
+    pub(crate) scrollbars: Vec<ScrollbarHit>,
+    pub(crate) label_flow_rows: Vec<u16>,
     pub(crate) hover_hits: Vec<HoverHit>,
 }
 
@@ -313,13 +412,19 @@ impl Areas {
     pub(crate) fn reset(&mut self) {
         let mut label_hits = std::mem::take(&mut self.label_hits);
         let mut label_color_hits = std::mem::take(&mut self.label_color_hits);
+        let mut scrollbars = std::mem::take(&mut self.scrollbars);
+        let mut label_flow_rows = std::mem::take(&mut self.label_flow_rows);
         let mut hover_hits = std::mem::take(&mut self.hover_hits);
         label_hits.clear();
         label_color_hits.clear();
+        scrollbars.clear();
+        label_flow_rows.clear();
         hover_hits.clear();
         *self = Self {
             label_hits,
             label_color_hits,
+            scrollbars,
+            label_flow_rows,
             hover_hits,
             ..Self::default()
         };
@@ -347,6 +452,11 @@ impl Areas {
 
     pub(crate) fn hover_no_paint(&mut self, target: HoverTarget, rect: Rect) {
         self.hover(target, rect, HoverPaint::None);
+    }
+
+    pub(crate) fn register_scrollbar(&mut self, scrollbar: ScrollbarHit) {
+        self.hover_no_paint(HoverTarget::Scrollbar(scrollbar.target), scrollbar.track);
+        self.scrollbars.push(scrollbar);
     }
 
     fn hover(&mut self, target: HoverTarget, hit: Rect, paint: HoverPaint) {
@@ -466,6 +576,7 @@ pub struct App {
     pub areas: Areas,
     mouse_position: Option<Position>,
     hover_target: Option<HoverTarget>,
+    scrollbar_drag: Option<ScrollbarDrag>,
     /// Description/preview image store.
     pub images: ImageStore,
     pub(crate) attachments: Vec<Attachment>,
@@ -511,6 +622,20 @@ pub struct App {
     /// Repeated failures are quiet so they cannot continuously replace messages
     /// or disarm destructive confirmations; success rearms reporting.
     external_poll_failed: bool,
+}
+
+fn scroll_description_to(
+    description: &mut crate::description::DescriptionEditor,
+    offset: usize,
+    viewport_height: usize,
+) {
+    let current = description.scroll();
+    let rows = if offset >= current {
+        isize::try_from(offset - current).unwrap_or(isize::MAX)
+    } else {
+        -isize::try_from(current - offset).unwrap_or(isize::MAX)
+    };
+    description.scroll_by(rows, viewport_height);
 }
 
 impl App {
@@ -599,6 +724,7 @@ impl App {
             areas: Areas::default(),
             mouse_position: None,
             hover_target: None,
+            scrollbar_drag: None,
             images,
             attachments,
             typeahead: String::new(),
@@ -1322,6 +1448,161 @@ impl App {
 
     pub(crate) fn mouse_position(&self) -> Option<Position> {
         self.mouse_position
+    }
+
+    pub(crate) fn begin_scrollbar_drag(&mut self, column: u16, row: u16) -> bool {
+        let position = Position { x: column, y: row };
+        let Some(HoverTarget::Scrollbar(target)) =
+            self.areas.hover_hit_at(position).map(|hit| hit.target)
+        else {
+            return false;
+        };
+        if !self.scrollbar_target_active(target) {
+            return false;
+        }
+        let Some(scrollbar) = self
+            .areas
+            .scrollbars
+            .iter()
+            .rev()
+            .find(|scrollbar| scrollbar.target == target && scrollbar.track.contains(position))
+            .copied()
+        else {
+            return false;
+        };
+        let on_thumb = scrollbar.thumb.contains(position);
+        let grab_row = if on_thumb {
+            row.saturating_sub(scrollbar.thumb.y)
+        } else {
+            scrollbar.thumb.height / 2
+        };
+        self.scrollbar_drag = Some(ScrollbarDrag { target, grab_row });
+        if !on_thumb {
+            let offset = scrollbar.offset_at(row, grab_row);
+            self.apply_scrollbar_offset(target, offset, scrollbar.visible);
+        }
+        true
+    }
+
+    pub(crate) fn drag_scrollbar(&mut self, row: u16) -> bool {
+        let Some(drag) = self.scrollbar_drag else {
+            return false;
+        };
+        if !self.scrollbar_target_active(drag.target) {
+            self.scrollbar_drag = None;
+            return false;
+        }
+        let Some(scrollbar) = self
+            .areas
+            .scrollbars
+            .iter()
+            .rev()
+            .find(|scrollbar| scrollbar.target == drag.target)
+            .copied()
+        else {
+            self.scrollbar_drag = None;
+            return false;
+        };
+        let grab_row = drag.grab_row.min(scrollbar.thumb.height.saturating_sub(1));
+        let offset = scrollbar.offset_at(row, grab_row);
+        self.apply_scrollbar_offset(drag.target, offset, scrollbar.visible);
+        true
+    }
+
+    pub(crate) fn end_scrollbar_drag(&mut self) -> bool {
+        self.scrollbar_drag.take().is_some()
+    }
+
+    fn scrollbar_target_active(&self, target: ScrollbarTarget) -> bool {
+        matches!(
+            (self.mode, target),
+            (
+                Mode::Normal,
+                ScrollbarTarget::Sidebar | ScrollbarTarget::Tasks
+            ) | (Mode::Search, ScrollbarTarget::Tasks)
+                | (
+                    Mode::TaskForm,
+                    ScrollbarTarget::TaskDescription
+                        | ScrollbarTarget::TaskCategoryPicker
+                        | ScrollbarTarget::TaskLabelPicker
+                )
+                | (Mode::CategoryForm, ScrollbarTarget::CategoryDescription)
+                | (Mode::Labels, ScrollbarTarget::Labels)
+        )
+    }
+
+    fn apply_scrollbar_offset(&mut self, target: ScrollbarTarget, offset: usize, visible: usize) {
+        let selection = |last: usize| {
+            if offset == 0 {
+                0
+            } else {
+                offset.saturating_add(visible.saturating_sub(1)).min(last)
+            }
+        };
+        match target {
+            ScrollbarTarget::Sidebar => {
+                if self.categories.is_empty() {
+                    return;
+                }
+                self.select_category(selection(self.categories.len() - 1));
+                *self.cat_state.offset_mut() = offset;
+            }
+            ScrollbarTarget::Tasks => {
+                if self.list_rows.is_empty() {
+                    return;
+                }
+                let visual = selection(self.list_rows.len() - 1);
+                let task = (0..=visual)
+                    .rev()
+                    .find_map(|row| self.task_at_visual_row(row))
+                    .or_else(|| {
+                        (visual + 1..self.list_rows.len())
+                            .find_map(|row| self.task_at_visual_row(row))
+                    });
+                if let Some(task) = task {
+                    self.select_task(task);
+                    *self.task_state.offset_mut() = offset;
+                }
+            }
+            ScrollbarTarget::TaskDescription => {
+                if let Some(form) = &mut self.form {
+                    scroll_description_to(&mut form.description, offset, visible);
+                }
+            }
+            ScrollbarTarget::CategoryDescription => {
+                if let Some(form) = &mut self.category_form {
+                    scroll_description_to(&mut form.description, offset, visible);
+                }
+            }
+            ScrollbarTarget::TaskCategoryPicker => {
+                if let Some(form) = &mut self.form {
+                    let count = form.category_choices().count();
+                    if count > 0 {
+                        form.select_category_picker(selection(count - 1));
+                    }
+                }
+            }
+            ScrollbarTarget::TaskLabelPicker => {
+                if let Some(form) = &mut self.form {
+                    let count = form.label_choices().count().saturating_add(1);
+                    if count > 0 {
+                        form.select_label_picker(selection(count - 1));
+                    }
+                }
+            }
+            ScrollbarTarget::Labels => {
+                let target_row = selection(u16::MAX as usize);
+                let index = self
+                    .areas
+                    .label_flow_rows
+                    .iter()
+                    .position(|row| usize::from(*row) >= target_row)
+                    .or_else(|| self.labels.len().checked_sub(1));
+                if let Some(index) = index {
+                    self.select_label(index);
+                }
+            }
+        }
     }
 
     /// Re-resolve against the geometry just drawn. This keeps a stationary
