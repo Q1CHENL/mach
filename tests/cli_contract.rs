@@ -794,7 +794,7 @@ fn repeatable_label_filters_are_conjunctive_and_compose_with_task_filters() {
 }
 
 #[test]
-fn list_query_searches_task_text_and_composes_with_existing_filters() {
+fn list_query_searches_task_text_and_labels_and_composes_with_existing_filters() {
     let dir = TempDir::new("cli-list-query");
     for label in ["Bug", "Backend"] {
         assert!(mach(dir.path(), &["labels", "add", label]).status.success());
@@ -866,23 +866,22 @@ fn list_query_searches_task_text_and_composes_with_existing_filters() {
         .status
         .success()
     );
-    assert!(
-        mach(
-            dir.path(),
-            &[
-                "add",
-                "No text match",
-                "--category",
-                "Work",
-                "--label",
-                "Bug",
-                "--label",
-                "Backend",
-            ],
-        )
-        .status
-        .success()
+    let label_only = mach(
+        dir.path(),
+        &[
+            "--json",
+            "add",
+            "No text match",
+            "--category",
+            "Work",
+            "--label",
+            "Bug",
+            "--label",
+            "Backend",
+        ],
     );
+    assert!(label_only.status.success());
+    let label_only: serde_json::Value = serde_json::from_slice(&label_only.stdout).unwrap();
 
     let filtered = mach(
         dir.path(),
@@ -917,7 +916,13 @@ fn list_query_searches_task_text_and_composes_with_existing_filters() {
     let label_name_only = mach(dir.path(), &["--json", "list", "--query", "Backend"]);
     let label_name_only: serde_json::Value =
         serde_json::from_slice(&label_name_only.stdout).unwrap();
-    assert_eq!(label_name_only, serde_json::json!([]));
+    assert!(
+        label_name_only
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == label_only["id"])
+    );
 
     let empty = mach(dir.path(), &["--json", "list", "--query", "   "]);
     assert!(!empty.status.success());

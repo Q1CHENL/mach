@@ -197,6 +197,12 @@ pub fn task_text_contains(task: &Task, folded_query: &str) -> bool {
         })
 }
 
+/// Whether a task's searchable text or assigned label names contain a caseless key.
+pub(crate) fn task_matches_query(task: &Task, labels: &[Label], folded_query: &str) -> bool {
+    task_text_contains(task, folded_query)
+        || labels_for_task(task, labels).any(|label| caseless_contains(&label.name, folded_query))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Category {
     pub id: String,

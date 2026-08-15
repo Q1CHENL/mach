@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use crate::VERSION;
 use crate::model::{
-    Block, Category, Label, LabelColor, Task, caseless_key, labels_for_task, task_text_contains,
+    Block, Category, Label, LabelColor, Task, caseless_key, labels_for_task, task_matches_query,
 };
 use crate::store::{
     CategoryPatch, LabelPatch, PurgeScope, RelativePosition, Store, StoreData, StoreError,
@@ -25,7 +25,7 @@ use crate::store::{
 /// Full CLI reference under `mach --help`.
 const HELP: &str = "\
   list
-    --query QUERY        search titles and descriptions
+    --query QUERY        search task text and label names
     -c, --category NAME  only this category
     --label NAME         require label (repeatable; all must match)
     --open               only incomplete
@@ -155,7 +155,7 @@ struct Cli {
 enum Command {
     /// List tasks
     List {
-        /// Search titles and descriptions
+        /// Search task text and label names
         #[arg(long = "query", value_name = "QUERY")]
         query: Option<String>,
         /// Category name / prefix
@@ -1398,7 +1398,7 @@ fn cmd_list(
         .filter(|task| {
             query_key
                 .as_deref()
-                .is_none_or(|query| task_text_contains(task, query))
+                .is_none_or(|query| task_matches_query(task, &data.labels, query))
         })
         .collect();
     let category_names: HashMap<_, _> = data

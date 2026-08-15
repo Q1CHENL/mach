@@ -37,11 +37,12 @@ mach --help
 Agents work well against the same CLI — stable flags, unique ID prefixes,
 and JSON output when you need it.
 
-Use `mach list --query TEXT` to search task titles and descriptions alongside
-the existing category, label, and open/done filters. Automation can establish
-shared names idempotently with `mach categories ensure NAME` and
-`mach labels ensure NAME`; explicitly supplied descriptions or colors must
-match an existing record or the command reports a conflict.
+Use `mach list --query TEXT` to search task titles, descriptions, and assigned
+label names alongside the existing category, label, and open/done filters.
+Automation can establish shared names idempotently with
+`mach categories ensure NAME` and `mach labels ensure NAME`; explicitly
+supplied descriptions or colors must match an existing record or the command
+reports a conflict.
 
 Export the task store to a portable archive and restore it into another data
 directory:

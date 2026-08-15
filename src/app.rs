@@ -16,8 +16,8 @@ use crate::form::{CategoryForm, TaskDraft, TaskForm};
 use crate::image::ImageStore;
 use crate::model::{
     ALL_CATEGORY, Category, Label, LabelColor, MAX_CATEGORY_COUNT, MAX_CATEGORY_NAME_LEN,
-    MAX_LABEL_COUNT, MAX_LABEL_NAME_LEN, MAX_TASK_COUNT, MAX_TITLE_LEN, Task, caseless_contains,
-    caseless_key, category_name_key, labels_for_task, task_text_contains,
+    MAX_LABEL_COUNT, MAX_LABEL_NAME_LEN, MAX_TASK_COUNT, MAX_TITLE_LEN, Task, caseless_key,
+    category_name_key, task_matches_query,
 };
 use crate::settings::{LaunchState, Settings};
 use crate::store::{
@@ -1695,12 +1695,7 @@ impl App {
             self.tasks
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| {
-                    !(hide_done && t.done)
-                        && (task_text_contains(t, &q)
-                            || labels_for_task(t, &self.labels)
-                                .any(|label| caseless_contains(&label.name, &q)))
-                })
+                .filter(|(_, t)| !(hide_done && t.done) && task_matches_query(t, &self.labels, &q))
                 .map(|(i, _)| i)
                 .collect()
         } else {
