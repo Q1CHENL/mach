@@ -235,8 +235,16 @@ fn mouse_motion_redraws_only_when_the_hover_target_changes() {
 
     let done_x = app.areas.done_x.unwrap();
     assert!(
-        !move_mouse(&mut app, done_x + 1, row),
-        "one task row is one visual hover target"
+        move_mouse(&mut app, done_x + 1, row),
+        "entering the unfinished box redraws its check preview"
+    );
+    assert!(
+        !move_mouse(&mut app, done_x + 2, row),
+        "motion within the same task box target is free"
+    );
+    assert!(
+        move_mouse(&mut app, title_x, row),
+        "leaving the task box redraws the empty marker"
     );
     assert!(move_mouse(&mut app, 0, 0), "leaving every target redraws");
     assert!(!move_mouse(&mut app, 0, 1), "empty-space motion is free");

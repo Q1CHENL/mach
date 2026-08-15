@@ -7,7 +7,7 @@
 
 use chrono::{Datelike, Duration};
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{Event, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::style::Modifier;
 
 use mach::app::{App, Focus, Mode};
@@ -258,6 +258,96 @@ fn hover_adds_background_only_to_an_unselected_task_row() {
         app.task_index, selected,
         "drawing hover cannot select a task"
     );
+}
+
+#[test]
+fn hovering_an_unfinished_task_box_previews_a_muted_check_without_toggling() {
+    let mut app = sample_app();
+    let initial = draw(&mut app, 100, 30);
+    let (title_x, row) = find_cells(&initial, "ship the release");
+    let marker_x = app.areas.done_x.unwrap();
+
+    assert!(move_mouse(&mut app, marker_x + 1, row));
+    let hovered = draw(&mut app, 100, 30);
+    let marker = (marker_x..marker_x + 3)
+        .map(|x| hovered[(x, row)].symbol())
+        .collect::<String>();
+    assert_eq!(marker, "[✓]");
+    assert_eq!(hovered[(marker_x + 1, row)].fg, app.theme().muted_color());
+    assert!(
+        !app.selected_task().unwrap().done,
+        "hover is only a preview"
+    );
+
+    assert!(move_mouse(&mut app, title_x, row));
+    let restored = draw(&mut app, 100, 30);
+    let marker = (marker_x..marker_x + 3)
+        .map(|x| restored[(x, row)].symbol())
+        .collect::<String>();
+    assert_eq!(marker, "[ ]");
+}
+
+#[test]
+fn hovering_an_unselected_label_box_previews_a_muted_check_without_toggling() {
+    let mut app = sample_app();
+    let bug = app.create_label("bug").unwrap();
+    app.create_label("backend").unwrap();
+    app.open_edit_task();
+    app.form
+        .as_mut()
+        .unwrap()
+        .set_field(mach::form::Field::Labels);
+    app.form.as_mut().unwrap().open_label_picker();
+
+    let initial = draw(&mut app, 100, 30);
+    let (name_x, row) = find_cells(&initial, "bug");
+    let marker_x = app.form.as_ref().unwrap().label_picker_area().unwrap().x + 1;
+    let marker = (marker_x..marker_x + 3)
+        .map(|x| initial[(x, row)].symbol())
+        .collect::<String>();
+    assert_eq!(marker, "[ ]");
+    assert_eq!(initial[(marker_x + 1, row)].fg, app.theme().muted_color());
+
+    assert!(move_mouse(&mut app, marker_x + 1, row));
+    let hovered = draw(&mut app, 100, 30);
+    let marker = (marker_x..marker_x + 3)
+        .map(|x| hovered[(x, row)].symbol())
+        .collect::<String>();
+    assert_eq!(marker, "[✓]");
+    assert_eq!(hovered[(marker_x + 1, row)].fg, app.theme().muted_color());
+    assert!(
+        app.form.as_ref().unwrap().label_ids().is_empty(),
+        "hover is only a preview"
+    );
+
+    assert!(move_mouse(&mut app, name_x, row));
+    let restored = draw(&mut app, 100, 30);
+    let marker = (marker_x..marker_x + 3)
+        .map(|x| restored[(x, row)].symbol())
+        .collect::<String>();
+    assert_eq!(marker, "[ ]");
+    assert_eq!(restored[(marker_x + 1, row)].fg, app.theme().muted_color());
+
+    assert!(move_mouse(&mut app, marker_x + 1, row));
+    handle_event(
+        &mut app,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: marker_x + 1,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    let checked = draw(&mut app, 100, 30);
+    let marker = (marker_x..marker_x + 3)
+        .map(|x| checked[(x, row)].symbol())
+        .collect::<String>();
+    assert_eq!(marker, "[✓]");
+    assert_eq!(
+        checked[(marker_x + 1, row)].fg,
+        ratatui::style::Color::Reset
+    );
+    assert_eq!(app.form.as_ref().unwrap().label_ids(), &[bug]);
 }
 
 #[test]

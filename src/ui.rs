@@ -3,7 +3,7 @@
 //! block whose border lights up when it holds focus.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Margin, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Text;
 use ratatui::text::{Line, Span};
@@ -28,6 +28,16 @@ use crate::theme::Theme;
 pub const SIDEBAR_WIDTH: u16 = 26;
 /// `[ ]` / `[✓]` in the task list and description subtasks.
 pub const DONE_MARK_WIDTH: u16 = 3;
+const CHECKED_BOX: &str = "[✓]";
+const EMPTY_BOX: &str = "[ ]";
+
+fn checkbox_rect(row: Rect) -> Rect {
+    Rect {
+        width: DONE_MARK_WIDTH.min(row.width),
+        height: 1,
+        ..row
+    }
+}
 /// Right column shorter than this → no bottom preview (list only).
 const PREVIEW_SPLIT_MIN: u16 = 16;
 /// Minimum height of the list half when the preview is below.
@@ -267,6 +277,7 @@ fn docked_task_form_layout(area: Rect) -> Option<TaskFormLayout> {
 /// centered over `area` when that pane cannot expose every field honestly.
 fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layout: TaskFormLayout) {
     let show_passive_hints = app.settings.show_passive_hints();
+    let mouse_position = app.mouse_position();
     // Disjoint borrows: the form owns the fields, the store owns the
     // decoded images.
     let App {
@@ -503,7 +514,15 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
         draw_category_picker(f, theme, form, form.areas.category, overlay, areas);
     }
     if form.label_picker_open() {
-        draw_label_picker(f, theme, form, form.areas.labels, overlay, areas);
+        draw_label_picker(
+            f,
+            theme,
+            form,
+            form.areas.labels,
+            overlay,
+            areas,
+            mouse_position,
+        );
     }
 
     // Preview the picture the cursor is on, or the first one otherwise.
@@ -1595,6 +1614,7 @@ fn draw_label_picker(
     field: Rect,
     area: Rect,
     areas: &mut crate::app::Areas,
+    mouse_position: Option<Position>,
 ) {
     let choices = form
         .label_choices()
@@ -1642,11 +1662,30 @@ fn draw_label_picker(
         .take(visible)
         .map(|index| {
             let mut line = if let Some((name, color, checked)) = choices.get(index) {
-                let marker = if *checked { "[✓]" } else { "[ ]" };
+                let row = Rect {
+                    y: inner
+                        .y
+                        .saturating_add(u16::try_from(index - start).unwrap_or(u16::MAX)),
+                    height: 1,
+                    ..inner
+                };
+                let marker_rect = checkbox_rect(row);
+                let preview = !checked
+                    && mouse_position.is_some_and(|position| marker_rect.contains(position));
+                let marker = if *checked || preview {
+                    CHECKED_BOX
+                } else {
+                    EMPTY_BOX
+                };
+                let marker_style = if *checked {
+                    Style::new()
+                } else {
+                    Style::new().fg(theme.muted_color())
+                };
                 let name = truncate(name, row_width.saturating_sub(6));
                 let used = marker.width().saturating_add(3 + name.width());
                 Line::from(vec![
-                    Span::raw(format!("{marker} ")),
+                    Span::styled(format!("{marker} "), marker_style),
                     Span::styled("■", theme.label_swatch(*color)),
                     Span::raw(" "),
                     Span::raw(name),
@@ -1675,16 +1714,21 @@ fn draw_label_picker(
         .collect::<Vec<_>>();
     f.render_widget(Paragraph::new(lines), inner);
     for index in start..total_rows.min(start.saturating_add(visible)) {
-        areas.hover_fill(
-            HoverTarget::TaskLabel(index),
-            Rect {
-                y: inner
-                    .y
-                    .saturating_add(u16::try_from(index - start).unwrap_or(u16::MAX)),
-                height: 1,
-                ..inner
-            },
-        );
+        let row = Rect {
+            y: inner
+                .y
+                .saturating_add(u16::try_from(index - start).unwrap_or(u16::MAX)),
+            height: 1,
+            ..inner
+        };
+        areas.hover_fill(HoverTarget::TaskLabel(index), row);
+        if choices.get(index).is_some_and(|(_, _, checked)| !checked) {
+            areas.hover_fill_with_paint(
+                HoverTarget::TaskLabelCheck(index),
+                checkbox_rect(row),
+                row,
+            );
+        }
     }
     paint_scrollbar(f, theme, rect, total_rows, visible, start, true, 1);
 }
@@ -2261,6 +2305,7 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
 // ----------------------------------------------------------------- tasks
 
 fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let mouse_position = app.mouse_position();
     let focused = app.focus == Focus::Tasks;
     // While the task editor is open, dim panel chrome (border / scrollbar)
     // but keep the selected-row wash so the edited task stays visible.
@@ -2393,15 +2438,31 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                 );
             }
             crate::app::TaskListRow::Task(view_index) if panels_accept_mouse(app) => {
-                app.areas.hover_fill(
-                    HoverTarget::Task(*view_index),
-                    Rect {
-                        x: inner.x,
-                        y,
-                        width: inner.width,
-                        height: 1,
-                    },
-                );
+                let row = Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                };
+                app.areas.hover_fill(HoverTarget::Task(*view_index), row);
+                let task = &app.tasks[app.view[*view_index]];
+                if !task.done {
+                    let marker = checkbox_rect(row);
+                    app.areas.hover_fill_with_paint(
+                        HoverTarget::TaskDone(*view_index),
+                        marker,
+                        row,
+                    );
+                    if mouse_position.is_some_and(|position| marker.contains(position)) {
+                        f.render_widget(
+                            Paragraph::new(Span::styled(
+                                CHECKED_BOX,
+                                Style::new().fg(theme.muted_color()),
+                            )),
+                            marker,
+                        );
+                    }
+                }
             }
             crate::app::TaskListRow::Task(_) => {}
         }
@@ -2551,9 +2612,9 @@ fn task_row(
 
     let mut cells = Vec::with_capacity(5);
     let (mark, mark_style) = if done {
-        ("[✓]", Style::new().fg(theme.success_color()))
+        (CHECKED_BOX, Style::new().fg(theme.success_color()))
     } else {
-        ("[ ]", Style::new().fg(theme.muted_color()))
+        (EMPTY_BOX, Style::new().fg(theme.muted_color()))
     };
     cells.push(Cell::new(mark).style(mark_style));
     let metadata_style = if done {
