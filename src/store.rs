@@ -242,7 +242,6 @@ pub struct LabelPatch {
 pub enum PurgeScope {
     All,
     Category(String),
-    Uncategorized,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -608,23 +607,6 @@ impl StoreData {
         )
     }
 
-    pub fn move_task(&mut self, id: &str, target: usize) -> Result<(), StoreError> {
-        let index = self.task_index(id)?;
-        if target >= self.tasks.len() {
-            return Err(StoreError::validation(format!(
-                "task target index {target} is out of range"
-            )));
-        }
-        if self.tasks[index].category_id != self.tasks[target].category_id {
-            return Err(StoreError::validation(
-                "tasks can only be reordered within the same category",
-            ));
-        }
-        let task = self.tasks.remove(index);
-        self.tasks.insert(target, task);
-        Ok(())
-    }
-
     pub fn move_task_relative(
         &mut self,
         id: &str,
@@ -659,7 +641,6 @@ impl StoreData {
             let in_scope = match scope {
                 PurgeScope::All => true,
                 PurgeScope::Category(id) => task.category_id.as_deref() == Some(id),
-                PurgeScope::Uncategorized => task.category_id.is_none(),
             };
             task.done && in_scope
         }))
@@ -871,18 +852,6 @@ impl StoreData {
             task.label_ids.retain(|label_id| label_id != id);
         }
         Ok(label)
-    }
-
-    pub fn move_category(&mut self, id: &str, target: usize) -> Result<(), StoreError> {
-        let index = self.category_index(id)?;
-        if target >= self.categories.len() {
-            return Err(StoreError::validation(format!(
-                "category target index {target} is out of range"
-            )));
-        }
-        let category = self.categories.remove(index);
-        self.categories.insert(target, category);
-        Ok(())
     }
 
     pub fn move_category_relative(

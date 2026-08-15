@@ -768,8 +768,9 @@ fn category_reorder_keeps_its_entity_target_across_an_external_insertion() {
 
     external
         .update(|data| {
+            let first_id = data.categories[0].id.clone();
             let inserted = data.create_category("Inserted", "")?;
-            data.move_category(&inserted.id, 0)?;
+            data.move_category_relative(&inserted.id, &first_id, RelativePosition::Before)?;
             Ok(())
         })
         .unwrap();

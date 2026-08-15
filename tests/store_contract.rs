@@ -1645,7 +1645,7 @@ fn shared_reorder_and_purge_enforce_category_boundaries() {
         .expect("same-category reorder");
     assert_eq!(store.snapshot().unwrap().tasks[0].id, second.id);
     let error = store
-        .update(|data| data.move_task(&first.id, 2))
+        .update(|data| data.move_task_relative(&first.id, &other.id, RelativePosition::Before))
         .expect_err("cross-category reorder must fail");
     assert!(matches!(error, StoreError::Validation(_)));
 
