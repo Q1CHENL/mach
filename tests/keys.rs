@@ -7,6 +7,7 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier};
 
 use mach::app::{App, Confirm, Focus, Mode};
 use mach::form::{TaskDraft, TaskForm};
@@ -18,7 +19,7 @@ mod common;
 use common::TempDir;
 #[path = "common/render.rs"]
 mod render_common;
-use render_common::{draw, find_cells, move_mouse};
+use render_common::{buffer_text, draw, find_cells, move_mouse};
 
 fn app() -> App {
     let mut store = Store::open_in_memory_with_paths(
@@ -1699,6 +1700,84 @@ fn wheel_over_task_preview_scrolls_the_description_not_the_task_list() {
     }
     let screen = draw(&mut app, 120, 30);
     find_cells(&screen, "description line 23");
+}
+
+#[test]
+fn bottom_control_scrolls_overflowing_preview_without_opening_the_editor() {
+    let mut app = app();
+    app.tasks[0].description = long_description();
+    app.settings.hint_level = "essential".into();
+
+    let initial = draw(&mut app, 120, 30);
+    let (x, y) = find_cells(&initial, "Bottom ↓");
+    assert!(!app.areas.preview_bottom.is_empty());
+    let initial_style = initial[(x, y)].style();
+    assert!(
+        matches!(initial_style.bg, Some(Color::Indexed(240 | 250)))
+            || initial_style.add_modifier.contains(Modifier::REVERSED)
+    );
+    assert!(move_mouse(&mut app, x, y));
+    let hovered = draw(&mut app, 120, 30);
+    assert_ne!(hovered[(x, y)].style(), initial_style);
+
+    let viewport_height = usize::from(app.areas.preview_description.height);
+    click(&mut app, x, y);
+
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(
+        app.form.is_none(),
+        "the control must not open the task editor"
+    );
+    let description = &app.preview_form.as_ref().unwrap().description;
+    assert_eq!(
+        description.scroll(),
+        description.content_height().saturating_sub(viewport_height)
+    );
+
+    let at_bottom = buffer_text(&draw(&mut app, 120, 30));
+    assert!(!at_bottom.contains("Bottom ↓"), "{at_bottom}");
+    assert!(app.areas.preview_bottom.is_empty());
+}
+
+#[test]
+fn bottom_control_scrolls_the_task_editor_without_moving_its_caret() {
+    let mut app = app();
+    app.tasks[0].description = long_description();
+    app.open_edit_task();
+
+    let initial = draw(&mut app, 120, 30);
+    let (x, y) = find_cells(&initial, "Bottom ↓");
+    let form = app.form.as_ref().unwrap();
+    assert!(!form.areas.description_bottom.is_empty());
+    let field = form.field;
+    let cursor = form.description.cursor_line();
+    let dirty = form.is_dirty();
+    let viewport_height = usize::from(form.areas.description.height);
+
+    click(&mut app, x, y);
+
+    let form = app.form.as_ref().unwrap();
+    assert_eq!(app.mode, Mode::TaskForm);
+    assert_eq!(form.field, field);
+    assert_eq!(form.description.cursor_line(), cursor);
+    assert_eq!(form.is_dirty(), dirty);
+    assert_eq!(
+        form.description.scroll(),
+        form.description
+            .content_height()
+            .saturating_sub(viewport_height)
+    );
+
+    let at_bottom = buffer_text(&draw(&mut app, 120, 30));
+    assert!(!at_bottom.contains("Bottom ↓"), "{at_bottom}");
+    assert!(
+        app.form
+            .as_ref()
+            .unwrap()
+            .areas
+            .description_bottom
+            .is_empty()
+    );
 }
 
 #[test]

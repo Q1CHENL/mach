@@ -244,7 +244,9 @@ pub(crate) enum HoverTarget {
     TaskCategory(usize),
     TaskLabel(usize),
     TaskDescriptionCommand(usize),
+    TaskDescriptionBottom,
     CategoryDescriptionCommand(usize),
+    PreviewBottom,
     Label(usize),
     DueDay(NaiveDate),
 }
@@ -255,6 +257,7 @@ pub(crate) enum HoverTarget {
 pub(crate) enum HoverPaint {
     Fill(Rect),
     Badge,
+    Control,
     None,
 }
 
@@ -276,6 +279,8 @@ pub struct Areas {
     pub preview: Rect,
     /// Visible description body inside the read-only task preview.
     pub preview_description: Rect,
+    /// Centered Bottom control shown over an overflowing read-only description.
+    pub preview_bottom: Rect,
     /// Screen columns of the flag and done markers, as the table laid
     /// them out. `done_x` is the left edge of the `[ ]`/`[✓]` column
     /// (see `ui::DONE_MARK_WIDTH`). The flag column is always reserved
@@ -322,6 +327,10 @@ impl Areas {
 
     pub(crate) fn hover_badge(&mut self, target: HoverTarget, rect: Rect) {
         self.hover(target, rect, HoverPaint::Badge);
+    }
+
+    pub(crate) fn hover_control(&mut self, target: HoverTarget, rect: Rect) {
+        self.hover(target, rect, HoverPaint::Control);
     }
 
     pub(crate) fn occlude_hover(&mut self, rect: Rect) {

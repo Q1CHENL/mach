@@ -2112,6 +2112,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             let tasks = app.areas.tasks;
             if contains(app.areas.command_bar, x, y) {
                 focus_command_bar(app, x);
+            } else if contains(app.areas.preview_bottom, x, y) {
+                let viewport_height = usize::from(app.areas.preview_description.height);
+                if let Some(form) = &mut app.preview_form {
+                    form.description.scroll_by(isize::MAX, viewport_height);
+                }
             } else if contains(sidebar, x, y) {
                 if app.searching {
                     return;
@@ -2535,6 +2540,18 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
                 // closes via description.click or set_field.
             }
         }
+    }
+
+    if app
+        .form
+        .as_ref()
+        .is_some_and(|form| contains(form.areas.description_bottom, m.column, m.row))
+    {
+        if let Some(form) = &mut app.form {
+            let viewport_height = usize::from(form.areas.description.height);
+            form.description.scroll_by(isize::MAX, viewport_height);
+        }
+        return;
     }
 
     enum AfterClick {

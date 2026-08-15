@@ -284,6 +284,33 @@ impl Theme {
         }
     }
 
+    /// Neutral resting surface for a compact clickable control.
+    pub fn control(&self) -> Style {
+        if self.colors_disabled {
+            Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            let background = Color::Indexed(if self.light_background { 250 } else { 240 });
+            Style::new()
+                .fg(contrasting_text(background))
+                .bg(background)
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Accent hover surface for a compact clickable control.
+    pub fn control_hover(&self) -> Style {
+        if self.colors_disabled {
+            self.hover().add_modifier(Modifier::BOLD)
+        } else {
+            let background = hover_tint(self.accent, self.light_background);
+            Style::new()
+                .fg(contrasting_text(background))
+                .bg(background)
+                .add_modifier(Modifier::BOLD)
+                .remove_modifier(Modifier::REVERSED)
+        }
+    }
+
     /// Manager focus is neutral so it cannot be mistaken for label color.
     pub fn label_focus(&self) -> Style {
         if self.colors_disabled {
@@ -384,6 +411,7 @@ mod tests {
         assert!(!no_color.hover().add_modifier.contains(Modifier::BOLD));
         assert!(!no_color.hover().add_modifier.contains(Modifier::UNDERLINED));
         assert_eq!(no_color.hover().bg, None);
+        assert!(no_color.control().add_modifier.contains(Modifier::REVERSED));
 
         let light = Theme::with_environment("white", false, true);
         assert_eq!(light.accent, Color::Indexed(238));
@@ -402,6 +430,7 @@ mod tests {
         );
         assert!(light.hover().bg.is_some());
         assert!(!light.hover().add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(light.control().bg, Some(Color::Indexed(250)));
         let dark_yellow = Theme::with_environment("yellow", false, false);
         assert!(dark_yellow.hover().bg.is_some());
         assert!(
@@ -428,5 +457,6 @@ mod tests {
             "completed task labels share one neutral background"
         );
         assert_eq!(dark_yellow.label_focus().bg, Some(Color::Indexed(240)));
+        assert_eq!(dark_yellow.control().bg, Some(Color::Indexed(240)));
     }
 }

@@ -157,6 +157,7 @@ fn draw_hover(f: &mut Frame, app: &mut App, theme: &Theme) {
         match hit.paint {
             HoverPaint::Fill(rect) => paint_hover_background(f, rect, theme.hover()),
             HoverPaint::Badge => f.buffer_mut().set_style(hit.hit, theme.label_hover()),
+            HoverPaint::Control => f.buffer_mut().set_style(hit.hit, theme.control_hover()),
             HoverPaint::None => {}
         }
     }
@@ -438,7 +439,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
     form.areas.description = box_inner;
     let overlay = f.area();
     let image_occlusion = task_form_image_occlusion(form, overlay);
-    draw_description(
+    let description_bottom = draw_description(
         f,
         form,
         store,
@@ -449,6 +450,11 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
             show_empty_hint: show_passive_hints,
             external_occlusion: image_occlusion,
         },
+    );
+    form.areas.description_bottom = description_bottom.unwrap_or_default();
+    areas.hover_control(
+        HoverTarget::TaskDescriptionBottom,
+        form.areas.description_bottom,
     );
     register_task_description_hover(areas, form);
     scrollbar(
@@ -627,10 +633,11 @@ fn draw_task_preview(
     let App {
         images: store,
         preview_form,
+        areas,
         ..
     } = app;
     if let Some(paint) = preview_form.as_mut() {
-        draw_description(
+        areas.preview_bottom = draw_description(
             f,
             paint,
             store,
@@ -641,28 +648,9 @@ fn draw_task_preview(
                 show_empty_hint: false,
                 external_occlusion: image_occlusion,
             },
-        );
-        let visible = usize::from(description_area.height);
-        let max_scroll = paint.description.content_height().saturating_sub(visible);
-        if show_passive_hints
-            && paint.description.scroll() < max_scroll
-            && description_area.height > 0
-        {
-            let indicator = Rect {
-                y: description_area.bottom() - 1,
-                height: 1,
-                ..description_area
-            };
-            f.render_widget(
-                Paragraph::new(Line::styled(
-                    "↓ more · Enter to edit",
-                    Style::new()
-                        .fg(theme.muted_color())
-                        .add_modifier(Modifier::BOLD),
-                )),
-                indicator,
-            );
-        }
+        )
+        .unwrap_or_default();
+        areas.hover_control(HoverTarget::PreviewBottom, areas.preview_bottom);
     }
 }
 
@@ -828,7 +816,7 @@ fn draw_description(
     theme: &Theme,
     area: Rect,
     options: DescriptionRenderOptions,
-) {
+) -> Option<Rect> {
     let crate::form::TaskForm {
         description,
         description_scroll,
@@ -850,7 +838,7 @@ fn draw_description(
         image_hits,
         image_occlusions,
         image_layout,
-    );
+    )
 }
 
 fn register_task_description_hover(areas: &mut crate::app::Areas, form: &crate::form::TaskForm) {
@@ -902,7 +890,7 @@ fn draw_block_editor(
     image_hits: &mut Vec<(usize, Rect)>,
     previous_image_occlusions: &mut Vec<Rect>,
     previous_image_layout: &mut Vec<(std::path::PathBuf, u16, u16)>,
-) {
+) -> Option<Rect> {
     if options.show_empty_hint && editor.is_empty() && editor.menu.is_none() {
         render_or_placeholder(f, area, "", "Press / for commands", theme);
     }
@@ -917,7 +905,10 @@ fn draw_block_editor(
         .collect();
     let menu_rect = slash_menu_rect(editor, area, cursor);
     *menu_area = menu_rect;
-    let image_occlusions = [menu_rect, options.external_occlusion]
+    let bottom_control = (editor.menu.is_none())
+        .then(|| bottom_control_rect(editor, area))
+        .flatten();
+    let image_occlusions = [menu_rect, options.external_occlusion, bottom_control]
         .into_iter()
         .flatten()
         .filter(|rect| rect.width > 0 && rect.height > 0 && rects_overlap(*rect, area))
@@ -973,7 +964,41 @@ fn draw_block_editor(
         f.set_cursor_position((area.x.saturating_add(col), area.y.saturating_add(row)));
     }
 
+    if let Some(button) = bottom_control {
+        draw_bottom_control(f, theme, button);
+    }
     draw_slash_menu(f, editor, theme, area, cursor);
+    bottom_control
+}
+
+const BOTTOM_CONTROL_LABEL: &str = " Bottom ↓ ";
+
+fn bottom_control_rect(editor: &crate::description::DescriptionEditor, area: Rect) -> Option<Rect> {
+    let visible = usize::from(area.height);
+    let max_scroll = editor.content_height().saturating_sub(visible);
+    if area.height == 0 || editor.scroll() >= max_scroll {
+        return None;
+    }
+    let width = u16::try_from(BOTTOM_CONTROL_LABEL.width()).unwrap_or(u16::MAX);
+    if area.width < width {
+        return None;
+    }
+    Some(centered(
+        Rect {
+            y: area.bottom() - 1,
+            height: 1,
+            ..area
+        },
+        width,
+        1,
+    ))
+}
+
+fn draw_bottom_control(f: &mut Frame, theme: &Theme, area: Rect) {
+    f.render_widget(
+        Paragraph::new(Line::styled(BOTTOM_CONTROL_LABEL, theme.control())),
+        area,
+    );
 }
 
 fn rects_overlap(a: Rect, b: Rect) -> bool {

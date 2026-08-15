@@ -912,17 +912,19 @@ fn a_clipped_read_only_preview_says_that_more_content_exists() {
     app.rebuild_view();
 
     let screen = render(&mut app, 80, 24);
-    assert!(screen.contains("↓ more · Enter to edit"), "{screen}");
+    assert!(screen.contains("Bottom ↓"), "{screen}");
+    assert!(!screen.contains("Enter to edit"), "{screen}");
 
     app.settings.hint_level = "essential".into();
     let essential = render(&mut app, 80, 24);
-    assert!(!essential.contains("↓ more"), "{essential}");
+    assert!(essential.contains("Bottom ↓"), "{essential}");
     assert!(!essential.contains("Enter to edit"), "{essential}");
 
     app.tasks[0].description.clear();
     app.invalidate_preview();
     app.rebuild_view();
     let empty = render(&mut app, 80, 24);
+    assert!(!empty.contains("Bottom ↓"), "{empty}");
     assert!(!empty.contains("Enter to edit"), "{empty}");
 }
 
