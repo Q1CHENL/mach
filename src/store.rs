@@ -19,7 +19,6 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
-use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::due;
@@ -317,7 +316,7 @@ fn resolve_named_id<T: NamedEntity>(items: &[T], query: &str) -> Result<String, 
     }
     let matches: Vec<_> = items
         .iter()
-        .filter(|item| name_has_prefix::<T>(item.name(), &folded))
+        .filter(|item| T::name_key(item.name()).starts_with(&folded))
         .collect();
     match matches.as_slice() {
         [item] => Ok(item.id().to_string()),
@@ -3275,16 +3274,6 @@ fn validate_byte_limit(value: &str, max_bytes: usize, label: &str) -> Result<(),
         )));
     }
     Ok(())
-}
-
-fn name_has_prefix<T: NamedEntity>(name: &str, folded_query: &str) -> bool {
-    let normalized: String = name.trim().nfkc().collect();
-    normalized
-        .char_indices()
-        .skip(1)
-        .map(|(index, _)| index)
-        .chain(std::iter::once(normalized.len()))
-        .any(|end| T::name_key(&normalized[..end]) == folded_query)
 }
 
 fn validate_settings(settings: &Settings) -> Result<(), StoreError> {
