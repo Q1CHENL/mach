@@ -4,6 +4,7 @@
 pub enum SlashCommand {
     Search,
     Settings,
+    Hints,
     Labels,
     Help,
     WhatsNew,
@@ -26,9 +27,10 @@ pub enum SlashCommand {
 
 impl SlashCommand {
     /// Fixed palette order. Search is first when the menu opens empty.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Search,
         Self::Settings,
+        Self::Hints,
         Self::Labels,
         Self::Help,
         Self::WhatsNew,
@@ -46,6 +48,7 @@ impl SlashCommand {
         match self {
             Self::Search => "search",
             Self::Settings => "settings",
+            Self::Hints => "hints",
             Self::Labels => "labels",
             Self::Help => "help",
             Self::WhatsNew => "whatsnew",
@@ -71,6 +74,7 @@ impl SlashCommand {
         match self {
             Self::Search => "Search",
             Self::Settings => "Settings",
+            Self::Hints => "Toggle hints",
             Self::Labels => "Labels",
             Self::Help => "Help",
             Self::WhatsNew => "What's new",
@@ -88,7 +92,8 @@ impl SlashCommand {
     pub fn hint(self) -> &'static str {
         match self {
             Self::Search => "search tasks by text or label",
-            Self::Settings => "sort, theme, date, preview",
+            Self::Settings => "sort, theme, date, preview, hints",
+            Self::Hints => "toggle all or essential hints",
             Self::Labels => "create, color, rename, delete labels",
             Self::Help => "key reference",
             Self::WhatsNew => "release highlights",
@@ -107,6 +112,7 @@ impl SlashCommand {
         match self {
             Self::Search => &["search"],
             Self::Settings => &["settings"],
+            Self::Hints => &["hints"],
             Self::Labels => &["labels", "tags"],
             Self::Help => &["help"],
             Self::WhatsNew => &["whatsnew"],
@@ -199,6 +205,12 @@ mod tests {
     fn typing_set_is_only_settings() {
         let m = matching("set");
         assert_eq!(m, vec![SlashCommand::Settings]);
+    }
+
+    #[test]
+    fn typing_hints_and_its_unique_prefix_match_hints() {
+        assert_eq!(matching("hints"), vec![SlashCommand::Hints]);
+        assert_eq!(matching("hint"), vec![SlashCommand::Hints]);
     }
 
     #[test]

@@ -802,6 +802,15 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
             app.settings_index = 0;
             app.mode = Mode::Settings;
         }
+        SlashCommand::Hints => {
+            if !args_for(cmd, query).is_empty() {
+                app.error("Usage: /hints");
+                return;
+            }
+            if let Some(level) = app.toggle_hint_level() {
+                app.info(format!("Hints: {level}"));
+            }
+        }
         SlashCommand::Labels => app.open_labels(),
         SlashCommand::Help => {
             app.help_scroll = 0;

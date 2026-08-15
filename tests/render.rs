@@ -100,6 +100,105 @@ fn draws_the_main_screen() {
 }
 
 #[test]
+fn essential_hints_hide_passive_main_screen_guidance_and_reclaim_its_row() {
+    let mut all = sample_app();
+    all.focus = Focus::Sidebar;
+    let all_screen = render(&mut all, 100, 30);
+    let all_sidebar_height = all.areas.sidebar.height;
+    assert!(all_screen.contains("⌥↑↓ reorder"), "{all_screen}");
+    assert!(all_screen.contains("/ commands"), "{all_screen}");
+
+    let mut essential = sample_app();
+    essential.focus = Focus::Sidebar;
+    essential.settings.hint_level = "essential".into();
+    let essential_screen = render(&mut essential, 100, 30);
+
+    assert!(
+        !essential_screen.contains("⌥↑↓ reorder"),
+        "{essential_screen}"
+    );
+    assert!(
+        !essential_screen.contains("/ commands"),
+        "{essential_screen}"
+    );
+    assert!(
+        essential_screen
+            .lines()
+            .any(|line| line.starts_with("┃ / ")),
+        "{essential_screen}"
+    );
+    assert_eq!(
+        essential.areas.sidebar.height,
+        all_sidebar_height + 1,
+        "the hidden hint row should return to the category list"
+    );
+
+    essential.open_labels();
+    let labels = render(&mut essential, 100, 30);
+    assert!(labels.contains("Ctrl+A new"), "{labels}");
+    assert!(!labels.contains("Backspace delete"), "{labels}");
+}
+
+#[test]
+fn essential_hints_keep_form_actions_and_errors_without_shortcut_teaching() {
+    let mut app = sample_app();
+    app.settings.hint_level = "essential".into();
+    app.open_new_task();
+
+    let task_screen = render(&mut app, 120, 48);
+    assert!(
+        task_screen.contains("Ctrl+S save · Esc list"),
+        "{task_screen}"
+    );
+    assert!(!task_screen.contains("Ctrl+Z undo"), "{task_screen}");
+    assert!(
+        !task_screen.contains("Press / for commands"),
+        "{task_screen}"
+    );
+
+    app.form.as_mut().unwrap().error = Some("Required task detail".into());
+    let error_screen = render(&mut app, 120, 48);
+    assert!(
+        error_screen.contains("Required task detail"),
+        "{error_screen}"
+    );
+
+    let mut category_app = sample_app();
+    category_app.settings.hint_level = "essential".into();
+    category_app.focus = Focus::Sidebar;
+    category_app.open_new_category();
+    let category_screen = render(&mut category_app, 100, 30);
+    assert!(
+        category_screen.contains("Ctrl+S save · Esc cancel"),
+        "{category_screen}"
+    );
+    assert!(
+        !category_screen.contains("Ctrl+Z undo"),
+        "{category_screen}"
+    );
+    assert!(
+        !category_screen.contains("Press / for commands"),
+        "{category_screen}"
+    );
+}
+
+#[test]
+fn essential_hints_leave_settings_and_the_complete_help_available() {
+    let mut app = sample_app();
+    app.settings.hint_level = "essential".into();
+    app.mode = Mode::Settings;
+    let settings = render(&mut app, 100, 30);
+    assert!(settings.contains("Hints"), "{settings}");
+    assert!(settings.contains("Essential"), "{settings}");
+
+    app.mode = Mode::Help;
+    let help = render(&mut app, 120, 40);
+    assert!(help.contains("⌥↑ ⌥↓"), "{help}");
+    assert!(help.contains("/hints"), "{help}");
+    assert!(help.contains("/purge  /update  /quit"), "{help}");
+}
+
+#[test]
 fn hover_adds_background_only_to_an_unselected_task_row() {
     let mut app = sample_app();
     let label = Label::new("tag", LabelColor::Orange);
@@ -814,6 +913,17 @@ fn a_clipped_read_only_preview_says_that_more_content_exists() {
 
     let screen = render(&mut app, 80, 24);
     assert!(screen.contains("↓ more · Enter to edit"), "{screen}");
+
+    app.settings.hint_level = "essential".into();
+    let essential = render(&mut app, 80, 24);
+    assert!(!essential.contains("↓ more"), "{essential}");
+    assert!(!essential.contains("Enter to edit"), "{essential}");
+
+    app.tasks[0].description.clear();
+    app.invalidate_preview();
+    app.rebuild_view();
+    let empty = render(&mut app, 80, 24);
+    assert!(!empty.contains("Enter to edit"), "{empty}");
 }
 
 #[test]

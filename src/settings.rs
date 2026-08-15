@@ -7,6 +7,7 @@ pub const THEMES: [&str; 7] = ["purple", "cyan", "blue", "red", "yellow", "green
 pub const DATE_FORMATS: [&str; 3] = ["Y-M-D", "D-M-Y", "M-D-Y"];
 /// Where the task preview / docked editor sits relative to the list.
 pub const PREVIEW_POSITIONS: [&str; 2] = ["bottom", "right"];
+pub const HINT_LEVELS: [&str; 2] = ["all", "essential"];
 
 /// How tasks are ordered **inside** each category. All Tasks always stacks
 /// categories in sidebar order; this only rearranges rows within a group.
@@ -47,6 +48,14 @@ pub fn preview_position_label(pos: &str) -> &'static str {
     }
 }
 
+/// Settings label for the amount of passive shortcut guidance shown.
+pub fn hint_level_label(level: &str) -> &'static str {
+    match level {
+        "essential" => "Essential",
+        _ => "All",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "default_date_format")]
@@ -58,6 +67,10 @@ pub struct Settings {
     /// `"bottom"` under the task list, or `"right"` beside it (wide terminals).
     #[serde(default = "default_preview_position")]
     pub preview_position: String,
+    /// `"all"` includes passive shortcut teaching; `"essential"` keeps only
+    /// guidance needed for the current action or state.
+    #[serde(default = "default_hint_level")]
+    pub hint_level: String,
     /// When true, completed tasks stay on disk but leave the list until
     /// `/done` shows them again.
     #[serde(default)]
@@ -78,6 +91,7 @@ impl Default for Settings {
             selected_color: default_color(),
             sort: default_sort(),
             preview_position: default_preview_position(),
+            hint_level: default_hint_level(),
             hide_done: false,
             last_run_version: None,
             last_update_check_at: None,
@@ -105,6 +119,9 @@ impl Settings {
         if !PREVIEW_POSITIONS.contains(&self.preview_position.as_str()) {
             self.preview_position = default_preview_position();
         }
+        if !HINT_LEVELS.contains(&self.hint_level.as_str()) {
+            self.hint_level = default_hint_level();
+        }
         self.last_update_check_at = None;
         self
     }
@@ -124,6 +141,14 @@ impl Settings {
         self.last_run_version = Some(version.to_string());
         state
     }
+
+    pub(crate) fn show_passive_hints(&self) -> bool {
+        self.hint_level == "all"
+    }
+
+    pub(crate) fn cycle_hint_level(&mut self, delta: isize) {
+        self.hint_level = cycle_by(&HINT_LEVELS, &self.hint_level, delta);
+    }
 }
 
 fn default_date_format() -> String {
@@ -140,6 +165,10 @@ fn default_sort() -> String {
 
 fn default_preview_position() -> String {
     "bottom".to_string()
+}
+
+fn default_hint_level() -> String {
+    "all".to_string()
 }
 
 /// Step a string setting by `delta` (±1) in a list, wrapping around.
@@ -197,5 +226,27 @@ mod tests {
         assert_eq!(settings.last_update_check_at, Some(1_800_000_000));
         let encoded = serde_json::to_value(settings).unwrap();
         assert!(encoded.get("last_update_check_at").is_none());
+    }
+
+    #[test]
+    fn hint_level_defaults_to_all_and_persists_essential() {
+        let existing: Settings = serde_json::from_str(
+            r#"{
+                "date_format":"Y-M-D",
+                "selected_color":"white",
+                "sort":"manual",
+                "preview_position":"bottom"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(existing.hint_level, "all");
+
+        let essential = Settings {
+            hint_level: "essential".into(),
+            ..Settings::default()
+        };
+        let decoded: Settings = serde_json::from_value(serde_json::to_value(essential).unwrap())
+            .expect("essential hint level should round-trip");
+        assert_eq!(decoded.hint_level, "essential");
     }
 }

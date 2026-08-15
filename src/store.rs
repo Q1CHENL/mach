@@ -29,7 +29,7 @@ use crate::model::{
     MAX_LABEL_COUNT, MAX_LABEL_NAME_LEN, MAX_LABELS_PER_TASK, MAX_NOTES_LINE_LEN, MAX_TASK_COUNT,
     MAX_TITLE_LEN, SCHEMA_VERSION, Task, category_name_key, label_name_key, text_byte_limit,
 };
-use crate::settings::{DATE_FORMATS, PREVIEW_POSITIONS, SORTS, Settings, THEMES};
+use crate::settings::{DATE_FORMATS, HINT_LEVELS, PREVIEW_POSITIONS, SORTS, Settings, THEMES};
 
 const DATABASE_FILE: &str = "mach.db";
 const DATABASE_SCHEMA_VERSION: i64 = 3;
@@ -3304,6 +3304,8 @@ fn validate_settings(settings: &Settings) -> Result<(), StoreError> {
         SETTINGS_VALUE_MAX_BYTES,
         "preview position",
     )?;
+    validate_single_line(&settings.hint_level, "hint level")?;
+    validate_byte_limit(&settings.hint_level, SETTINGS_VALUE_MAX_BYTES, "hint level")?;
     if let Some(version) = settings.last_run_version.as_deref() {
         validate_single_line(version, "last-run version")?;
         validate_byte_limit(version, SETTINGS_VALUE_MAX_BYTES, "last-run version")?;
@@ -3330,6 +3332,12 @@ fn validate_settings(settings: &Settings) -> Result<(), StoreError> {
         return Err(StoreError::Validation(format!(
             "unknown preview position {:?}",
             settings.preview_position
+        )));
+    }
+    if !HINT_LEVELS.contains(&settings.hint_level.as_str()) {
+        return Err(StoreError::Validation(format!(
+            "unknown hint level {:?}",
+            settings.hint_level
         )));
     }
     Ok(())

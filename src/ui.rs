@@ -264,6 +264,7 @@ fn docked_task_form_layout(area: Rect) -> Option<TaskFormLayout> {
 /// Docked layouts fill the permanent task preview pane. The modal layout is
 /// centered over `area` when that pane cannot expose every field honestly.
 fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layout: TaskFormLayout) {
+    let show_passive_hints = app.settings.show_passive_hints();
     // Disjoint borrows: the form owns the fields, the store owns the
     // decoded images.
     let App {
@@ -436,7 +437,18 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
     form.areas.description = box_inner;
     let overlay = f.area();
     let image_occlusion = task_form_image_occlusion(form, overlay);
-    draw_description(f, form, store, theme, box_inner, focused, image_occlusion);
+    draw_description(
+        f,
+        form,
+        store,
+        theme,
+        box_inner,
+        DescriptionRenderOptions {
+            focused,
+            show_empty_hint: show_passive_hints,
+            external_occlusion: image_occlusion,
+        },
+    );
     register_task_description_hover(areas, form);
     scrollbar(
         f,
@@ -457,10 +469,18 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
                 .add_modifier(Modifier::BOLD),
         ),
         None => Line::styled(
-            match layout {
-                TaskFormLayout::DockedWide => "/ commands · Ctrl+Z undo · Ctrl+S save · Esc list",
-                TaskFormLayout::DockedCompact => "/ · Ctrl+S save · Esc list",
-                TaskFormLayout::Modal => "/ commands · Ctrl+Z undo · Ctrl+S save · Esc cancel",
+            match (show_passive_hints, layout) {
+                (true, TaskFormLayout::DockedWide) => {
+                    "/ commands · Ctrl+Z undo · Ctrl+S save · Esc list"
+                }
+                (true, TaskFormLayout::DockedCompact) => "/ · Ctrl+S save · Esc list",
+                (true, TaskFormLayout::Modal) => {
+                    "/ commands · Ctrl+Z undo · Ctrl+S save · Esc cancel"
+                }
+                (false, TaskFormLayout::DockedWide | TaskFormLayout::DockedCompact) => {
+                    "Ctrl+S save · Esc list"
+                }
+                (false, TaskFormLayout::Modal) => "Ctrl+S save · Esc cancel",
             },
             Style::new().fg(theme.muted_color()),
         ),
@@ -500,6 +520,7 @@ fn draw_task_preview(
     image_occlusion: Option<Rect>,
 ) {
     let focused = false;
+    let show_passive_hints = app.settings.show_passive_hints();
     let block = panel("Task preview", focused, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -590,13 +611,15 @@ fn draw_task_preview(
         return;
     }
     if description_empty {
-        f.render_widget(
-            Paragraph::new(Line::styled(
-                "Enter to edit",
-                Style::new().fg(theme.muted_color()),
-            )),
-            description_area,
-        );
+        if show_passive_hints {
+            f.render_widget(
+                Paragraph::new(Line::styled(
+                    "Enter to edit",
+                    Style::new().fg(theme.muted_color()),
+                )),
+                description_area,
+            );
+        }
         return;
     }
 
@@ -612,12 +635,18 @@ fn draw_task_preview(
             store,
             theme,
             description_area,
-            false,
-            image_occlusion,
+            DescriptionRenderOptions {
+                focused: false,
+                show_empty_hint: false,
+                external_occlusion: image_occlusion,
+            },
         );
         let visible = usize::from(description_area.height);
         let max_scroll = paint.description.content_height().saturating_sub(visible);
-        if paint.description.scroll() < max_scroll && description_area.height > 0 {
+        if show_passive_hints
+            && paint.description.scroll() < max_scroll
+            && description_area.height > 0
+        {
             let indicator = Rect {
                 y: description_area.bottom() - 1,
                 height: 1,
@@ -670,6 +699,7 @@ fn field_block<'a>(
 /// The category dialog: the same shape as a task's, with a name and a
 /// note about what the category is for.
 fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
+    let show_passive_hints = app.settings.show_passive_hints();
     let App {
         category_form,
         areas,
@@ -727,7 +757,7 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let (lines, cursor) = form
         .description
         .layout(box_inner.width as usize, box_inner.height);
-    if form.description.is_empty() && form.description.menu.is_none() {
+    if show_passive_hints && form.description.is_empty() && form.description.menu.is_none() {
         render_or_placeholder(f, box_inner, "", "Press / for commands", theme);
     }
     for placed in lines {
@@ -771,11 +801,22 @@ fn draw_category_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         None => Line::styled(
-            "/ commands · Ctrl+Z undo · Ctrl+S save · Esc cancel",
+            if show_passive_hints {
+                "/ commands · Ctrl+Z undo · Ctrl+S save · Esc cancel"
+            } else {
+                "Ctrl+S save · Esc cancel"
+            },
             Style::new().fg(theme.muted_color()),
         ),
     };
     f.render_widget(Paragraph::new(footer), hint);
+}
+
+#[derive(Clone, Copy)]
+struct DescriptionRenderOptions {
+    focused: bool,
+    show_empty_hint: bool,
+    external_occlusion: Option<Rect>,
 }
 
 /// The stack of blocks, plus the `/` menu when it is open.
@@ -785,8 +826,7 @@ fn draw_description(
     store: &mut crate::image::ImageStore,
     theme: &Theme,
     area: Rect,
-    focused: bool,
-    external_occlusion: Option<Rect>,
+    options: DescriptionRenderOptions,
 ) {
     let crate::form::TaskForm {
         description,
@@ -803,13 +843,12 @@ fn draw_description(
         store,
         theme,
         area,
-        focused,
+        options,
         description_scroll,
         description_menu_area,
         image_hits,
         image_occlusions,
         image_layout,
-        external_occlusion,
     );
 }
 
@@ -856,15 +895,14 @@ fn draw_block_editor(
     store: &mut crate::image::ImageStore,
     theme: &Theme,
     area: Rect,
-    focused: bool,
+    options: DescriptionRenderOptions,
     previous_scroll: &mut usize,
     menu_area: &mut Option<Rect>,
     image_hits: &mut Vec<(usize, Rect)>,
     previous_image_occlusions: &mut Vec<Rect>,
     previous_image_layout: &mut Vec<(std::path::PathBuf, u16, u16)>,
-    external_occlusion: Option<Rect>,
 ) {
-    if editor.is_empty() && editor.menu.is_none() {
+    if options.show_empty_hint && editor.is_empty() && editor.menu.is_none() {
         render_or_placeholder(f, area, "", "Press / for commands", theme);
     }
     let (blocks, cursor) = editor.layout(area.width as usize, area.height);
@@ -878,7 +916,7 @@ fn draw_block_editor(
         .collect();
     let menu_rect = slash_menu_rect(editor, area, cursor);
     *menu_area = menu_rect;
-    let image_occlusions = [menu_rect, external_occlusion]
+    let image_occlusions = [menu_rect, options.external_occlusion]
         .into_iter()
         .flatten()
         .filter(|rect| rect.width > 0 && rect.height > 0 && rects_overlap(*rect, area))
@@ -913,7 +951,7 @@ fn draw_block_editor(
                 // Frame + type label only while the description field owns focus
                 // and the cursor is on this picture — not when the dialog
                 // opens on Title with the cursor still sitting on line 0.
-                let show_frame = focused && placed.selected;
+                let show_frame = options.focused && placed.selected;
                 if covered {
                     f.render_widget(Clear, row);
                     let hit = letterbox_rect(row, 4, 3);
@@ -928,7 +966,9 @@ fn draw_block_editor(
             }
         }
     }
-    if focused && let Some((row, col)) = cursor {
+    if options.focused
+        && let Some((row, col)) = cursor
+    {
         f.set_cursor_position((area.x.saturating_add(col), area.y.saturating_add(row)));
     }
 
@@ -2073,13 +2113,14 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         return;
     }
 
-    let (list_area, hint_area) = if chrome_focus && inner.height > 1 {
-        let [list_area, hint_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-        (list_area, Some(hint_area))
-    } else {
-        (inner, None)
-    };
+    let (list_area, hint_area) =
+        if chrome_focus && app.settings.show_passive_hints() && inner.height > 1 {
+            let [list_area, hint_area] =
+                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+            (list_area, Some(hint_area))
+        } else {
+            (inner, None)
+        };
     app.areas.sidebar = list_area;
 
     let width = inner.width as usize;
@@ -2691,8 +2732,10 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                     None => {
                         let hint = if app.searching {
                             format!("search: {} · Esc clears", app.search_query)
-                        } else {
+                        } else if app.settings.show_passive_hints() {
                             "/ commands".to_string()
+                        } else {
+                            "/".to_string()
                         };
                         if (left_area.width as usize) >= hint.width() + 2 {
                             Line::from(Span::styled(hint, Style::new().fg(theme.muted_color())))
@@ -3047,7 +3090,11 @@ fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, layout: &LabelManage
         Line::styled(" Ctrl+S save ", Style::new().fg(theme.muted_color()))
     } else {
         Line::styled(
-            " Ctrl+A new · Backspace delete ",
+            if app.settings.show_passive_hints() {
+                " Ctrl+A new · Backspace delete "
+            } else {
+                " Ctrl+A new "
+            },
             Style::new().fg(theme.muted_color()),
         )
     };

@@ -386,7 +386,7 @@ pub(crate) enum ClickTarget {
     Labels,
 }
 
-pub const SETTINGS_ITEMS: [&str; 4] = ["Sort", "Theme", "Date format", "Task preview"];
+pub const SETTINGS_ITEMS: [&str; 5] = ["Sort", "Theme", "Date format", "Task preview", "Hints"];
 
 /// One row of the task table: a real task, or a category section header
 /// (All Tasks / search only). Headers are not selectable.
@@ -2612,6 +2612,7 @@ impl App {
                     settings.preview_position =
                         cycle_by(&PREVIEW_POSITIONS, &settings.preview_position, delta)
                 }
+                4 => settings.cycle_hint_level(delta),
                 _ => {}
             })
         }) {
@@ -2627,7 +2628,21 @@ impl App {
             3 => {
                 crate::settings::preview_position_label(&self.settings.preview_position).to_string()
             }
+            4 => crate::settings::hint_level_label(&self.settings.hint_level).to_string(),
             _ => String::new(),
+        }
+    }
+
+    /// `/hints` — atomically toggle passive shortcut teaching and return its label.
+    pub(crate) fn toggle_hint_level(&mut self) -> Option<&'static str> {
+        match self
+            .update_store(|data| data.update_settings(|settings| settings.cycle_hint_level(1)))
+        {
+            Ok(settings) => Some(crate::settings::hint_level_label(&settings.hint_level)),
+            Err(error) => {
+                self.report_store_error("Could not update settings", error);
+                None
+            }
         }
     }
 }

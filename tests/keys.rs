@@ -70,8 +70,29 @@ fn file_app() -> FileApp {
     FileApp { app, dir }
 }
 
+#[test]
+fn settings_can_enable_essential_hints_and_persist_the_choice() {
+    let mut fixture = file_app();
+    fixture.app.mode = Mode::Settings;
+    fixture.app.settings_index = 4;
+
+    press(&mut fixture.app, KeyCode::Right, KeyModifiers::NONE);
+
+    assert_eq!(fixture.app.settings.hint_level, "essential");
+    let persisted = Store::open(fixture.dir.path()).unwrap().snapshot().unwrap();
+    assert_eq!(persisted.settings.hint_level, "essential");
+}
+
 fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     handle_event(app, Event::Key(KeyEvent::new(code, modifiers)));
+}
+
+fn run_slash_command(app: &mut App, command: &str) {
+    press(app, KeyCode::Char('/'), KeyModifiers::NONE);
+    for c in command.chars() {
+        press(app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    press(app, KeyCode::Enter, KeyModifiers::NONE);
 }
 
 fn click(app: &mut App, column: u16, row: u16) {
@@ -561,6 +582,53 @@ fn slash_done_keeps_a_store_failure_visible() {
         "the persistence error must not be replaced by a false success: {:?}",
         message(&fixture.app)
     );
+}
+
+#[test]
+fn slash_hints_toggles_and_persists_the_resulting_level() {
+    let mut fixture = file_app();
+
+    run_slash_command(&mut fixture.app, "hints");
+
+    assert_eq!(fixture.app.settings.hint_level, "essential");
+    assert_eq!(message(&fixture.app), "Hints: Essential");
+    let persisted = Store::open(fixture.dir.path()).unwrap().snapshot().unwrap();
+    assert_eq!(persisted.settings.hint_level, "essential");
+
+    run_slash_command(&mut fixture.app, "hints");
+
+    assert_eq!(fixture.app.settings.hint_level, "all");
+    assert_eq!(message(&fixture.app), "Hints: All");
+    let persisted = Store::open(fixture.dir.path()).unwrap().snapshot().unwrap();
+    assert_eq!(persisted.settings.hint_level, "all");
+}
+
+#[test]
+fn slash_hints_keeps_a_store_failure_visible() {
+    let mut fixture = file_app();
+    let observer = rusqlite::Connection::open(fixture.dir.path().join("mach.db")).unwrap();
+    observer.execute("DELETE FROM app_state", []).unwrap();
+
+    run_slash_command(&mut fixture.app, "hints");
+
+    assert_eq!(fixture.app.settings.hint_level, "all");
+    assert!(
+        message(&fixture.app).contains("Could not update settings"),
+        "the persistence error must not be replaced by a false success: {:?}",
+        message(&fixture.app)
+    );
+}
+
+#[test]
+fn slash_hints_rejects_arguments_without_toggling() {
+    let mut fixture = file_app();
+
+    run_slash_command(&mut fixture.app, "hints essential");
+
+    assert_eq!(fixture.app.settings.hint_level, "all");
+    assert_eq!(message(&fixture.app), "Usage: /hints");
+    let persisted = Store::open(fixture.dir.path()).unwrap().snapshot().unwrap();
+    assert_eq!(persisted.settings.hint_level, "all");
 }
 
 #[test]

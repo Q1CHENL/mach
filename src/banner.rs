@@ -79,7 +79,7 @@ pub const HELP_COLUMNS: [HelpRow; 17] = [
         "TASK PREVIEW  (Enter · when space allows)",
     ),
     row(
-        "/search  /settings  /help",
+        "/search  /settings  /help  /hints",
         "Tab ⇧Tab     next / previous field",
     ),
     row("/whatsnew  /labels", "← → Space    choose category / flags"),
