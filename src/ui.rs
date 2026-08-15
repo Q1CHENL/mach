@@ -22,7 +22,7 @@ use crate::app::{
 use crate::banner;
 use crate::due;
 use crate::form::Field;
-use crate::model::{LabelColor, labels_for_task};
+use crate::model::{LabelColor, is_bidi_control, labels_for_task};
 use crate::theme::Theme;
 
 /// Outer width of the sidebar, borders and padding included.
@@ -155,6 +155,25 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         _ => {}
     }
     draw_hover(f, app, &theme);
+    strip_bidi_controls(f);
+}
+
+fn strip_bidi_controls(f: &mut Frame) {
+    let buffer = f.buffer_mut();
+    let area = *buffer.area();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buffer[(x, y)];
+            if cell.symbol().chars().any(is_bidi_control) {
+                let safe: String = cell
+                    .symbol()
+                    .chars()
+                    .filter(|character| !is_bidi_control(*character))
+                    .collect();
+                cell.set_symbol(&safe);
+            }
+        }
+    }
 }
 
 /// Paint only the topmost semantic row under the pointer. Hit geometry is

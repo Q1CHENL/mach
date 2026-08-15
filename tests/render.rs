@@ -100,6 +100,22 @@ fn draws_the_main_screen() {
 }
 
 #[test]
+fn terminal_frame_strips_bidirectional_formatting_controls() {
+    let mut app = sample_app();
+    app.tasks[0].title = "safe\u{202e}spoof".into();
+
+    let buffer = draw(&mut app, 100, 30);
+
+    assert!(
+        buffer
+            .content()
+            .iter()
+            .all(|cell| !cell.symbol().contains('\u{202e}'))
+    );
+    assert!(buffer_text(&buffer).contains("safespoof"));
+}
+
+#[test]
 fn essential_hints_hide_passive_main_screen_guidance_and_reclaim_its_row() {
     let mut all = sample_app();
     all.focus = Focus::Sidebar;

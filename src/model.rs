@@ -56,6 +56,18 @@ pub fn caseless_contains(haystack: &str, folded_needle: &str) -> bool {
     caseless_key(haystack).contains(folded_needle)
 }
 
+/// Unicode characters with the `Bidi_Control` property.
+pub(crate) const fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
 /// Sentinel category id for the "All Tasks" view. Not written to disk.
 pub const ALL_CATEGORY: &str = "";
 

@@ -15,7 +15,8 @@ use serde_json::{Value, json};
 
 use crate::VERSION;
 use crate::model::{
-    Block, Category, Label, LabelColor, Task, caseless_key, labels_for_task, task_matches_query,
+    Block, Category, Label, LabelColor, Task, caseless_key, is_bidi_control, labels_for_task,
+    task_matches_query,
 };
 use crate::store::{
     CategoryPatch, LabelPatch, PurgeScope, RelativePosition, Store, StoreData, StoreError,
@@ -1010,6 +1011,9 @@ fn terminal_text(text: &str) -> String {
             '\r' => safe.push_str("\\r"),
             '\t' => safe.push_str("\\t"),
             character if character.is_control() => {
+                safe.push_str(&format!("\\u{{{:x}}}", character as u32));
+            }
+            character if is_bidi_control(character) => {
                 safe.push_str(&format!("\\u{{{:x}}}", character as u32));
             }
             character => safe.push(character),

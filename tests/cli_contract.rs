@@ -76,6 +76,20 @@ fn plain_output_does_not_emit_user_supplied_terminal_controls() {
 }
 
 #[test]
+fn plain_output_escapes_bidirectional_formatting_controls() {
+    let dir = TempDir::new("terminal-bidi-controls");
+    let title = "safe\u{202e}spoof";
+    let added = mach(dir.path(), &["--json", "add", title]);
+    assert!(added.status.success());
+
+    let listed = mach(dir.path(), &["list"]);
+    assert!(listed.status.success());
+    let listed = String::from_utf8(listed.stdout).expect("UTF-8 list output");
+    assert!(!listed.contains('\u{202e}'));
+    assert!(listed.contains("safe\\u{202e}spoof"));
+}
+
+#[test]
 fn plain_cli_output_is_unstyled_for_pipes() {
     let dir = TempDir::new("plain-no-ansi");
     let added = mach(dir.path(), &["--json", "add", "plain", "--importance", "2"]);
