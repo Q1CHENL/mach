@@ -2112,6 +2112,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
             let tasks = app.areas.tasks;
             if contains(app.areas.command_bar, x, y) {
                 focus_command_bar(app, x);
+            } else if contains(app.areas.sidebar_bottom, x, y) {
+                app.last_click = None;
+                let _ = app.set_focus(Focus::Sidebar);
+                app.select_last_category();
+            } else if contains(app.areas.tasks_bottom, x, y) {
+                app.last_click = None;
+                let _ = app.set_focus(Focus::Tasks);
+                app.select_last_task();
             } else if contains(app.areas.preview_bottom, x, y) {
                 let viewport_height = usize::from(app.areas.preview_description.height);
                 if let Some(form) = &mut app.preview_form {

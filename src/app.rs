@@ -239,7 +239,9 @@ pub(crate) enum UpdateActivity {
 pub(crate) enum HoverTarget {
     Occluded,
     Sidebar(usize),
+    SidebarBottom,
     Task(usize),
+    TasksBottom,
     SlashCommand(usize),
     TaskCategory(usize),
     TaskLabel(usize),
@@ -272,7 +274,11 @@ pub(crate) struct HoverHit {
 #[derive(Debug, Default, Clone)]
 pub struct Areas {
     pub sidebar: Rect,
+    /// Centered Bottom control shown over an overflowing category list.
+    pub sidebar_bottom: Rect,
     pub tasks: Rect,
+    /// Centered Bottom control shown over an overflowing task list.
+    pub tasks_bottom: Rect,
     /// Inner row of the bottom command bar, including its clock.
     pub command_bar: Rect,
     /// Bottom-right task preview / docked editor, when the window is tall enough.

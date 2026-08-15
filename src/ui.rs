@@ -906,7 +906,7 @@ fn draw_block_editor(
     let menu_rect = slash_menu_rect(editor, area, cursor);
     *menu_area = menu_rect;
     let bottom_control = (editor.menu.is_none())
-        .then(|| bottom_control_rect(editor, area))
+        .then(|| description_bottom_control_rect(editor, area))
         .flatten();
     let image_occlusions = [menu_rect, options.external_occlusion, bottom_control]
         .into_iter()
@@ -973,10 +973,24 @@ fn draw_block_editor(
 
 const BOTTOM_CONTROL_LABEL: &str = " Bottom ↓ ";
 
-fn bottom_control_rect(editor: &crate::description::DescriptionEditor, area: Rect) -> Option<Rect> {
+fn description_bottom_control_rect(
+    editor: &crate::description::DescriptionEditor,
+    area: Rect,
+) -> Option<Rect> {
     let visible = usize::from(area.height);
     let max_scroll = editor.content_height().saturating_sub(visible);
-    if area.height == 0 || editor.scroll() >= max_scroll {
+    bottom_control_rect(area, editor.scroll() < max_scroll)
+}
+
+fn list_bottom_control_rect(area: Rect, total: usize, offset: usize) -> Option<Rect> {
+    bottom_control_rect(
+        area,
+        offset.saturating_add(usize::from(area.height)) < total,
+    )
+}
+
+fn bottom_control_rect(area: Rect, has_more: bool) -> Option<Rect> {
+    if area.height == 0 || !has_more {
         return None;
     }
     let width = u16::try_from(BOTTOM_CONTROL_LABEL.width()).unwrap_or(u16::MAX);
@@ -2209,6 +2223,15 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             );
         }
     }
+    if panels_accept_mouse(app)
+        && !app.searching
+        && let Some(control) =
+            list_bottom_control_rect(list_area, app.categories.len(), app.cat_state.offset())
+    {
+        app.areas.sidebar_bottom = control;
+        draw_bottom_control(f, theme, control);
+        app.areas.hover_control(HoverTarget::SidebarBottom, control);
+    }
     if let Some(hint_area) = hint_area {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -2382,6 +2405,14 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             }
             crate::app::TaskListRow::Task(_) => {}
         }
+    }
+    if panels_accept_mouse(app)
+        && let Some(control) =
+            list_bottom_control_rect(inner, app.list_rows.len(), app.task_state.offset())
+    {
+        app.areas.tasks_bottom = control;
+        draw_bottom_control(f, theme, control);
+        app.areas.hover_control(HoverTarget::TasksBottom, control);
     }
 
     scrollbar(

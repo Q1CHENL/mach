@@ -58,6 +58,38 @@ fn app() -> App {
     app
 }
 
+fn overflowing_app() -> App {
+    let mut store = Store::open_in_memory_with_paths(
+        std::env::temp_dir().join(format!("mach-keys-overflow-test-{}", uuid::Uuid::new_v4())),
+    )
+    .unwrap();
+    let categories = (0..20)
+        .map(|index| Category {
+            id: format!("c-{index:02}"),
+            name: format!("Category {index:02}"),
+            description: String::new(),
+        })
+        .collect::<Vec<_>>();
+    let last_category = categories.last().unwrap().id.clone();
+    let tasks = (0..20)
+        .map(|index| {
+            let title = format!("task {index:02}");
+            Task::new(&title, 0, Some(last_category.clone()), "")
+        })
+        .collect::<Vec<_>>();
+    store
+        .update(|data| {
+            data.categories = categories;
+            data.tasks = tasks;
+            data.settings.sort = "manual".into();
+            Ok(())
+        })
+        .unwrap();
+    let mut app = App::with_store("test", store).unwrap();
+    app.mode = Mode::Normal;
+    app
+}
+
 struct FileApp {
     app: App,
     dir: TempDir,
@@ -1737,6 +1769,46 @@ fn bottom_control_scrolls_overflowing_preview_without_opening_the_editor() {
     let at_bottom = buffer_text(&draw(&mut app, 120, 30));
     assert!(!at_bottom.contains("Bottom ↓"), "{at_bottom}");
     assert!(app.areas.preview_bottom.is_empty());
+}
+
+#[test]
+fn bottom_control_jumps_to_the_last_category_without_opening_it() {
+    let mut app = overflowing_app();
+    app.select_last_task();
+    app.focus = Focus::Sidebar;
+
+    let initial = draw(&mut app, 80, 16);
+    let (x, y) = find_cells(&initial, "Bottom ↓");
+    assert!(app.areas.sidebar_bottom.contains((x, y).into()));
+    click(&mut app, x, y);
+
+    assert_eq!(app.focus, Focus::Sidebar);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.category_form.is_none());
+    assert_eq!(app.cat_index, app.categories.len() - 1);
+    assert_eq!(app.categories[app.cat_index].name, "Category 19");
+    let _ = draw(&mut app, 80, 16);
+    assert!(app.areas.sidebar_bottom.is_empty());
+}
+
+#[test]
+fn bottom_control_jumps_to_the_last_task_without_opening_it() {
+    let mut app = overflowing_app();
+    app.select_last_category();
+    app.focus = Focus::Tasks;
+
+    let initial = draw(&mut app, 80, 16);
+    let (x, y) = find_cells(&initial, "Bottom ↓");
+    assert!(app.areas.tasks_bottom.contains((x, y).into()));
+    click(&mut app, x, y);
+
+    assert_eq!(app.focus, Focus::Tasks);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.form.is_none());
+    assert_eq!(app.task_index, app.view.len() - 1);
+    assert_eq!(app.selected_task().unwrap().title, "task 19");
+    let _ = draw(&mut app, 80, 16);
+    assert!(app.areas.tasks_bottom.is_empty());
 }
 
 #[test]
