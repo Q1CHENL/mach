@@ -38,6 +38,8 @@ const INSTALL_LOCK_DIR: &str = ".mach-install.lock";
 const INSTALL_LOCK_OWNER: &str = "owner";
 const INSTALL_LOCK_WAIT: Duration = Duration::from_secs(30);
 const INSTALL_LOCK_POLL: Duration = Duration::from_millis(100);
+/// Safely exceeds the bounded download and install-lock waits of a live updater.
+const INSTALL_TEMP_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
 pub struct CheckResult {
@@ -469,6 +471,108 @@ fn download_response(url: &str) -> Result<ureq::http::Response<ureq::Body>, Stri
         .map_err(map_download_err)
 }
 
+#[cfg(unix)]
+struct InstallTempFile {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl InstallTempFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InstallTempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_stale_install_files(parent: &Path) -> Result<(), String> {
+    let now = SystemTime::now();
+    let mut removed = false;
+    let entries = fs::read_dir(parent).map_err(|error| {
+        format!(
+            "could not inspect install directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not inspect install directory {}: {error}",
+                parent.display()
+            )
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_install_temp_name(name) {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "could not inspect temporary install file {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map_err(|error| {
+                format!(
+                    "could not inspect temporary install file {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+        if !now
+            .duration_since(modified)
+            .is_ok_and(|age| age >= INSTALL_TEMP_STALE_AFTER)
+        {
+            continue;
+        }
+        fs::remove_file(entry.path()).map_err(|error| {
+            format!(
+                "could not remove stale install file {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        removed = true;
+    }
+    if removed {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!(
+                    "could not sync install directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_install_temp_name(name: &str) -> bool {
+    name.strip_prefix(".mach.")
+        .and_then(|rest| {
+            rest.strip_suffix(".tar.gz")
+                .or_else(|| rest.strip_suffix(".tmp"))
+        })
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
 fn write_verified_archive<R: Read>(
     mut source: R,
     expected_sha: &str,
@@ -496,6 +600,7 @@ fn write_verified_archive<R: Read>(
                 parent.display()
             )
         })?;
+        cleanup_stale_install_files(parent)?;
         let parent_dir = File::open(parent)
             .map_err(|e| format!("could not open install directory {}: {e}", parent.display()))?;
         let archive_path = parent.join(format!(".mach.{}.tar.gz", uuid::Uuid::new_v4()));
@@ -504,6 +609,7 @@ fn write_verified_archive<R: Read>(
             .create_new(true)
             .open(&archive_path)
             .map_err(|e| format!("could not create temporary release archive: {e}"))?;
+        let archive_path = InstallTempFile::new(archive_path);
 
         progress(DownloadProgress {
             downloaded: 0,
@@ -553,23 +659,17 @@ fn write_verified_archive<R: Read>(
         })();
         drop(archive_file);
 
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&archive_path);
-            return Err(error);
-        }
+        write_result?;
 
-        let extracted = extract_release_binary(&archive_path, parent);
-        if let Err(error) = fs::remove_file(&archive_path) {
-            if let Ok((temp_path, _)) = &extracted {
-                let _ = fs::remove_file(temp_path);
-            }
+        let extracted = extract_release_binary(archive_path.path(), parent);
+        if let Err(error) = fs::remove_file(archive_path.path()) {
             return Err(format!(
                 "could not remove temporary release archive: {error}"
             ));
         }
         let (temp_path, actual_sha) = extracted?;
 
-        let install_result = (|| -> Result<(Version, InstallDisposition), String> {
+        (|| -> Result<(Version, InstallDisposition), String> {
             let _lock = InstallLock::acquire(parent)?;
             if let Some(installed_version) =
                 receipted_release_version(destination)?.filter(|version| version >= target_version)
@@ -579,7 +679,7 @@ fn write_verified_archive<R: Read>(
 
             let (installed_version, receipt_update) =
                 record_release_version(parent, &actual_sha, target_version)?;
-            if let Err(error) = fs::rename(&temp_path, destination) {
+            if let Err(error) = fs::rename(temp_path.path(), destination) {
                 let rollback_error = receipt_update.rollback().err();
                 let mut message = format!(
                     "could not replace {} atomically: {error}",
@@ -596,17 +696,15 @@ fn write_verified_archive<R: Read>(
                 format!("could not sync install directory {}: {e}", parent.display())
             })?;
             Ok((installed_version, InstallDisposition::Installed))
-        })();
-
-        if temp_path.exists() {
-            let _ = fs::remove_file(&temp_path);
-        }
-        install_result
+        })()
     }
 }
 
 #[cfg(unix)]
-fn extract_release_binary(archive_path: &Path, parent: &Path) -> Result<(PathBuf, String), String> {
+fn extract_release_binary(
+    archive_path: &Path,
+    parent: &Path,
+) -> Result<(InstallTempFile, String), String> {
     let archive_file = File::open(archive_path)
         .map_err(|e| format!("could not open verified release archive: {e}"))?;
     let decoder = GzDecoder::new(archive_file);
@@ -651,6 +749,7 @@ fn extract_release_binary(archive_path: &Path, parent: &Path) -> Result<(PathBuf
         .create_new(true)
         .open(&temp_path)
         .map_err(|e| format!("could not create temporary binary: {e}"))?;
+    let temp_path = InstallTempFile::new(temp_path);
     let extract_result = (|| -> Result<String, String> {
         let mut hasher = Sha256::new();
         let mut extracted = 0_u64;
@@ -692,23 +791,11 @@ fn extract_release_binary(archive_path: &Path, parent: &Path) -> Result<(PathBuf
     drop(temp_file);
     drop(entry);
 
-    let actual_sha = match extract_result {
-        Ok(actual_sha) => actual_sha,
-        Err(error) => {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error);
-        }
-    };
+    let actual_sha = extract_result?;
     match entries.next() {
         None => Ok((temp_path, actual_sha)),
-        Some(Ok(_)) => {
-            let _ = fs::remove_file(&temp_path);
-            Err("release archive must contain exactly one entry".into())
-        }
-        Some(Err(error)) => {
-            let _ = fs::remove_file(&temp_path);
-            Err(format!("could not read release archive entry: {error}"))
-        }
+        Some(Ok(_)) => Err("release archive must contain exactly one entry".into()),
+        Some(Err(error)) => Err(format!("could not read release archive entry: {error}")),
     }
 }
 
@@ -1760,6 +1847,54 @@ mod tests {
                 0o755
             );
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn verified_replace_sweeps_only_stale_managed_install_temps() {
+        let dir = std::env::temp_dir().join(format!("mach-update-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let destination = dir.join("mach");
+        let stale_archive = dir.join(format!(".mach.{}.tar.gz", uuid::Uuid::new_v4()));
+        let stale_binary = dir.join(format!(".mach.{}.tmp", uuid::Uuid::new_v4()));
+        let recent_managed = dir.join(format!(".mach.{}.tmp", uuid::Uuid::new_v4()));
+        let unmanaged = dir.join(".mach.keep-me.tmp");
+        for path in [&stale_archive, &stale_binary, &recent_managed, &unmanaged] {
+            fs::write(path, b"staging").unwrap();
+        }
+        let stale_time = SystemTime::now()
+            .checked_sub(Duration::from_secs(60 * 60))
+            .unwrap();
+        let stale_times = fs::FileTimes::new().set_modified(stale_time);
+        File::options()
+            .write(true)
+            .open(&stale_archive)
+            .unwrap()
+            .set_times(stale_times)
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(&stale_binary)
+            .unwrap()
+            .set_times(stale_times)
+            .unwrap();
+
+        let binary = b"verified binary";
+        let archive = release_archive(&[("mach", binary)]);
+        write_verified_archive(
+            std::io::Cursor::new(&archive),
+            &sha256_hex(&archive),
+            &destination,
+            &Version::parse("1.2.3").unwrap(),
+            None,
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(!stale_archive.exists());
+        assert!(!stale_binary.exists());
+        assert!(recent_managed.exists());
+        assert!(unmanaged.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

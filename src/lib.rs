@@ -81,7 +81,7 @@ pub fn run_tui(store: Store) -> io::Result<()> {
     app.record_launch().map_err(io::Error::other)?;
     app.poll_automatic_update_schedule();
     let result = event_loop(&mut terminal, &mut app);
-    app.shutdown_archive();
+    app.shutdown_background_work();
     result
 }
 

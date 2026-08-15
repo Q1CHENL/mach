@@ -163,8 +163,23 @@ enum UpdateEvent {
 
 struct UpdateJob {
     rx: Receiver<UpdateEvent>,
+    handle: Option<std::thread::JoinHandle<()>>,
     kind: UpdateJobKind,
     lease: Option<UpdateLease>,
+}
+
+impl UpdateJob {
+    fn join(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for UpdateJob {
+    fn drop(&mut self) {
+        self.join();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,12 +615,14 @@ pub struct App {
     category_edit_base: Option<Category>,
     /// One in-flight automatic check or explicit install.
     update_job: Option<UpdateJob>,
+    /// A manual `/update` requested while an automatic check is finishing.
+    pending_update_install: bool,
     /// One in-flight archive import or export. All archive I/O runs off the
     /// event-loop thread so large backups cannot freeze input or drawing.
     archive_job: Option<ArchiveJob>,
-    /// A quit requested while archive work is active waits for safe
+    /// A quit requested while background work is active waits for safe
     /// cancellation or finalization instead of abandoning temporary files.
-    quit_after_archive: bool,
+    quit_after_background_work: bool,
     /// Application-level update scheduling state, independent of task data.
     update_state: Option<UpdateStateStore>,
     /// Wall-clock deadline for the next cheap state refresh.
@@ -738,8 +755,9 @@ impl App {
             task_edit_base: None,
             category_edit_base: None,
             update_job: None,
+            pending_update_install: false,
             archive_job: None,
-            quit_after_archive: false,
+            quit_after_background_work: false,
             update_state,
             next_update_state_poll_at: 0,
             update_notice: None,
@@ -956,9 +974,7 @@ impl App {
                     let kind = job.kind;
                     let _ = job.handle.join();
                     changed |= self.finish_archive(kind, result);
-                    if self.quit_after_archive {
-                        self.should_quit = true;
-                    }
+                    changed |= self.finish_deferred_quit();
                     return changed;
                 }
                 Some(Err(TryRecvError::Disconnected)) => {
@@ -969,9 +985,7 @@ impl App {
                     let kind = job.kind;
                     let _ = job.handle.join();
                     self.error(format!("{} stopped unexpectedly", kind.title()));
-                    if self.quit_after_archive {
-                        self.should_quit = true;
-                    }
+                    self.finish_deferred_quit();
                     return true;
                 }
             }
@@ -1046,12 +1060,16 @@ impl App {
     }
 
     pub fn request_quit(&mut self) {
-        let Some(job) = self.archive_job.as_mut() else {
+        if self.archive_job.is_none() && self.update_job.is_none() {
             self.should_quit = true;
             return;
-        };
-        self.quit_after_archive = true;
-        if job.control.request_cancel() {
+        }
+
+        self.quit_after_background_work = true;
+        self.pending_update_install = false;
+        if let Some(job) = self.archive_job.as_mut()
+            && job.control.request_cancel()
+        {
             job.cancel_requested = true;
         }
         self.pending = None;
@@ -1059,12 +1077,46 @@ impl App {
         self.dirty = true;
     }
 
-    /// Join archive work before an event-loop error releases the process.
-    /// Normal quits already defer until `poll_archive` observes completion.
-    pub(crate) fn shutdown_archive(&mut self) {
+    fn finish_deferred_quit(&mut self) -> bool {
+        if self.quit_after_background_work
+            && self.archive_job.is_none()
+            && self.update_job.is_none()
+            && !self.should_quit
+        {
+            self.should_quit = true;
+            return true;
+        }
+        false
+    }
+
+    /// Join background work before an event-loop error releases the process.
+    /// Normal quits defer until polling observes every worker's completion.
+    pub(crate) fn shutdown_background_work(&mut self) {
+        self.pending_update_install = false;
         if let Some(job) = self.archive_job.take() {
             let _ = job.control.request_cancel();
             let _ = job.handle.join();
+        }
+
+        if let Some(mut job) = self.update_job.take() {
+            job.join();
+            let mut result = None;
+            while let Ok(event) = job.rx.try_recv() {
+                if let UpdateEvent::Finished(finished) = event {
+                    result = Some(*finished);
+                }
+            }
+            self.update_activity = None;
+            match result {
+                Some(result) => {
+                    self.finish_update(job.kind, job.lease.as_ref(), result);
+                }
+                None => self.finish_update_state_failure(
+                    job.lease.as_ref(),
+                    Utc::now().timestamp(),
+                    None,
+                ),
+            }
         }
     }
 
@@ -1162,19 +1214,28 @@ impl App {
     /// Explicitly check for and install the latest checksum-verified release (`/update`).
     pub(crate) fn start_update_install(&mut self) {
         self.update_notice = None;
-        if self
-            .update_job
-            .as_ref()
-            .is_some_and(|job| job.kind == UpdateJobKind::Install)
+        if self.pending_update_install
+            || self
+                .update_job
+                .as_ref()
+                .is_some_and(|job| job.kind == UpdateJobKind::Install)
         {
             self.info("Already updating…");
             return;
         }
 
-        // Explicit user intent supersedes an automatic check. Its detached
-        // worker may finish, but dropping the receiver prevents a stale result
-        // from competing with the install result in the UI.
-        self.update_job = None;
+        if self.update_job.is_some() {
+            self.pending_update_install = true;
+            self.update_activity = Some(UpdateActivity::Checking);
+            self.dirty = true;
+            return;
+        }
+
+        self.start_manual_update_worker();
+    }
+
+    fn start_manual_update_worker(&mut self) {
+        self.update_notice = None;
         let now = Utc::now().timestamp();
         let lease = self
             .update_state
@@ -1228,8 +1289,13 @@ impl App {
                 })();
                 let _ = tx.send(UpdateEvent::Finished(Box::new(result)));
             }) {
-            Ok(_) => {
-                self.update_job = Some(UpdateJob { rx, kind, lease });
+            Ok(handle) => {
+                self.update_job = Some(UpdateJob {
+                    rx,
+                    handle: Some(handle),
+                    kind,
+                    lease,
+                });
                 if kind == UpdateJobKind::Install {
                     self.update_activity = Some(UpdateActivity::Checking);
                     self.dirty = true;
@@ -1263,23 +1329,46 @@ impl App {
                     }
                 }
                 Some((kind, Ok(UpdateEvent::Finished(result)))) => {
-                    let lease = self.update_job.take().and_then(|job| job.lease);
+                    let mut job = self
+                        .update_job
+                        .take()
+                        .expect("update event requires an active job");
+                    job.join();
                     changed |= self.update_activity.take().is_some();
-                    return self.finish_update(kind, lease.as_ref(), *result) || changed;
+                    changed |= self.finish_update(kind, job.lease.as_ref(), *result);
+                    return self.after_update_job(changed);
                 }
                 Some((kind, Err(TryRecvError::Disconnected))) => {
-                    let lease = self.update_job.take().and_then(|job| job.lease);
+                    let mut job = self
+                        .update_job
+                        .take()
+                        .expect("update channel requires an active job");
+                    job.join();
                     changed |= self.update_activity.take().is_some();
-                    self.finish_update_state_failure(lease.as_ref(), Utc::now().timestamp(), None);
-                    return if kind == UpdateJobKind::Install {
+                    self.finish_update_state_failure(
+                        job.lease.as_ref(),
+                        Utc::now().timestamp(),
+                        None,
+                    );
+                    if kind == UpdateJobKind::Install {
                         self.show_update_message("Update failed".into(), MessageKind::Error);
-                        true
-                    } else {
-                        changed
-                    };
+                        changed = true;
+                    }
+                    return self.after_update_job(changed);
                 }
             }
         }
+    }
+
+    fn after_update_job(&mut self, mut changed: bool) -> bool {
+        if self.quit_after_background_work {
+            self.pending_update_install = false;
+            changed |= self.finish_deferred_quit();
+        } else if std::mem::take(&mut self.pending_update_install) {
+            self.start_manual_update_worker();
+            changed = true;
+        }
+        changed
     }
 
     fn finish_update(
@@ -2799,7 +2888,7 @@ impl App {
 
     pub(crate) fn archive_activity_text(&self) -> Option<String> {
         let job = self.archive_job.as_ref()?;
-        if self.quit_after_archive {
+        if self.quit_after_background_work {
             let action = if job.cancel_requested {
                 "Cancelling"
             } else {
@@ -3026,6 +3115,19 @@ mod tests {
         UpdateEvent::Finished(Box::new(result))
     }
 
+    fn update_job(
+        rx: Receiver<UpdateEvent>,
+        kind: UpdateJobKind,
+        lease: Option<UpdateLease>,
+    ) -> UpdateJob {
+        UpdateJob {
+            rx,
+            handle: Some(std::thread::spawn(|| {})),
+            kind,
+            lease,
+        }
+    }
+
     fn claim_automatic_lease(app: &mut App, now: i64) -> UpdateLease {
         let AutomaticClaim::Claimed(lease) = app
             .update_state
@@ -3173,6 +3275,45 @@ mod tests {
     }
 
     #[test]
+    fn quit_waits_for_background_update_cleanup() {
+        let store = Store::open_in_memory_with_paths("/tmp/mach-quit-update-test").unwrap();
+        let mut app = App::with_store("test", store).unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.update_job = Some(update_job(rx, UpdateJobKind::Install, None));
+        app.update_activity = Some(UpdateActivity::Checking);
+
+        app.request_quit();
+        assert!(!app.should_quit, "quit must wait for update cleanup");
+
+        tx.send(finished(Ok(UpdateOutcome::UpToDate {
+            info: update_result(false),
+            etag: None,
+        })))
+        .unwrap();
+        assert!(app.poll_update());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn manual_update_waits_for_an_automatic_worker_instead_of_detaching_it() {
+        let store = Store::open_in_memory_with_paths("/tmp/mach-queued-update-test").unwrap();
+        let mut app = App::with_store("test", store).unwrap();
+        let (_tx, rx) = mpsc::channel();
+        app.update_job = Some(update_job(rx, UpdateJobKind::Automatic, None));
+
+        app.start_update_install();
+
+        assert!(app.pending_update_install);
+        assert_eq!(app.update_activity(), Some(UpdateActivity::Checking));
+        assert!(
+            app.update_job
+                .as_ref()
+                .is_some_and(|job| job.kind == UpdateJobKind::Automatic),
+            "the automatic worker must remain owned until it finishes"
+        );
+    }
+
+    #[test]
     fn automatic_update_claim_is_shared_across_task_stores() {
         let root = std::env::temp_dir().join(format!(
             "mach-update-claim-{}-{}",
@@ -3226,11 +3367,7 @@ mod tests {
 
         let lease = claim_automatic_lease(&mut app, now);
         let (tx, rx) = mpsc::channel();
-        app.update_job = Some(UpdateJob {
-            rx,
-            kind: UpdateJobKind::Automatic,
-            lease: Some(lease),
-        });
+        app.update_job = Some(update_job(rx, UpdateJobKind::Automatic, Some(lease)));
         tx.send(finished(Err(update_failure("offline")))).unwrap();
 
         assert!(!app.poll_update());
@@ -3269,11 +3406,7 @@ mod tests {
         .unwrap();
         let lease = claim_automatic_lease(&mut app, Utc::now().timestamp());
         let (tx, rx) = mpsc::channel();
-        app.update_job = Some(UpdateJob {
-            rx,
-            kind: UpdateJobKind::Automatic,
-            lease: Some(lease),
-        });
+        app.update_job = Some(update_job(rx, UpdateJobKind::Automatic, Some(lease)));
         tx.send(finished(Ok(automatic_outcome(true)))).unwrap();
 
         assert!(app.poll_update());
@@ -3317,11 +3450,7 @@ mod tests {
         let now = Utc::now().timestamp();
         let lease = claim_automatic_lease(&mut checker, now);
         let (tx, rx) = mpsc::channel();
-        checker.update_job = Some(UpdateJob {
-            rx,
-            kind: UpdateJobKind::Automatic,
-            lease: Some(lease),
-        });
+        checker.update_job = Some(update_job(rx, UpdateJobKind::Automatic, Some(lease)));
         tx.send(finished(Ok(automatic_outcome(true)))).unwrap();
 
         assert!(checker.poll_update());
@@ -3429,11 +3558,7 @@ mod tests {
         let store = Store::open_in_memory_with_paths("/tmp/mach-install-success-test").unwrap();
         let mut app = App::with_store("test", store).unwrap();
         let (tx, rx) = mpsc::channel();
-        app.update_job = Some(UpdateJob {
-            rx,
-            kind: UpdateJobKind::Install,
-            lease: None,
-        });
+        app.update_job = Some(update_job(rx, UpdateJobKind::Install, None));
         app.update_activity = Some(UpdateActivity::Checking);
         tx.send(finished(Ok(UpdateOutcome::Installed {
             result: crate::update::InstallResult {
@@ -3468,11 +3593,7 @@ mod tests {
         let store = Store::open_in_memory_with_paths("/tmp/mach-install-race-test").unwrap();
         let mut app = App::with_store("test", store).unwrap();
         let (tx, rx) = mpsc::channel();
-        app.update_job = Some(UpdateJob {
-            rx,
-            kind: UpdateJobKind::Install,
-            lease: None,
-        });
+        app.update_job = Some(update_job(rx, UpdateJobKind::Install, None));
         app.update_activity = Some(UpdateActivity::Checking);
         tx.send(finished(Ok(UpdateOutcome::Installed {
             result: crate::update::InstallResult {
@@ -3497,11 +3618,7 @@ mod tests {
         let store = Store::open_in_memory_with_paths("/tmp/mach-install-progress-test").unwrap();
         let mut app = App::with_store("test", store).unwrap();
         let (tx, rx) = mpsc::channel();
-        app.update_job = Some(UpdateJob {
-            rx,
-            kind: UpdateJobKind::Install,
-            lease: None,
-        });
+        app.update_job = Some(update_job(rx, UpdateJobKind::Install, None));
         app.update_activity = Some(UpdateActivity::Checking);
         tx.send(UpdateEvent::DownloadProgress(
             crate::update::DownloadProgress {
@@ -3528,11 +3645,7 @@ mod tests {
         let store = Store::open_in_memory_with_paths("/tmp/mach-install-error-test").unwrap();
         let mut app = App::with_store("test", store).unwrap();
         let (tx, rx) = mpsc::channel();
-        app.update_job = Some(UpdateJob {
-            rx,
-            kind: UpdateJobKind::Install,
-            lease: None,
-        });
+        app.update_job = Some(update_job(rx, UpdateJobKind::Install, None));
         tx.send(finished(Ok(UpdateOutcome::InstallFailed {
             message:
                 "this mach executable is managed by Cargo; run cargo install --locked mach-tui"
@@ -3553,22 +3666,14 @@ mod tests {
         let store = Store::open_in_memory_with_paths("/tmp/mach-auto-update-test").unwrap();
         let mut app = App::with_store("0.2.0", store).unwrap();
         let (tx, rx) = mpsc::channel();
-        app.update_job = Some(UpdateJob {
-            rx,
-            kind: UpdateJobKind::Automatic,
-            lease: None,
-        });
+        app.update_job = Some(update_job(rx, UpdateJobKind::Automatic, None));
         tx.send(finished(Ok(automatic_outcome(false)))).unwrap();
 
         assert!(!app.poll_update());
         assert!(app.message.is_none());
 
         let (tx, rx) = mpsc::channel();
-        app.update_job = Some(UpdateJob {
-            rx,
-            kind: UpdateJobKind::Automatic,
-            lease: None,
-        });
+        app.update_job = Some(update_job(rx, UpdateJobKind::Automatic, None));
         tx.send(finished(Err(update_failure("offline")))).unwrap();
 
         assert!(!app.poll_update());
@@ -3581,11 +3686,7 @@ mod tests {
         let mut app = App::with_store("0.2.0", store).unwrap();
         app.ask_confirm(Confirm::Quit, "Press Ctrl+C again to quit");
         let (tx, rx) = mpsc::channel();
-        app.update_job = Some(UpdateJob {
-            rx,
-            kind: UpdateJobKind::Automatic,
-            lease: None,
-        });
+        app.update_job = Some(update_job(rx, UpdateJobKind::Automatic, None));
         tx.send(finished(Ok(automatic_outcome(true)))).unwrap();
 
         assert!(!app.poll_update());
