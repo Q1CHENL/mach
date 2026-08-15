@@ -43,6 +43,7 @@ const PREVIEW_SIDE_MIN: u16 = LIST_WIDTH_MIN + PREVIEW_WIDTH_MIN + 1;
 /// One full color cycle plus the Manage labels action before scrolling.
 /// Category and label dropdowns share this bounded viewport height.
 const TASK_FORM_PICKER_MAX_ROWS: usize = LabelColor::ALL.len() + 1;
+const LABEL_EDITOR_GAP_ROWS: u16 = 1;
 pub const MIN_TERMINAL_WIDTH: u16 = 60;
 pub const MIN_TERMINAL_HEIGHT: u16 = 16;
 
@@ -3059,7 +3060,11 @@ fn label_manager_layout(app: &App, area: Rect) -> LabelManagerLayout {
     let flow_rows = flow.last().map_or(1, |(_, rect)| rect.y.saturating_add(1));
     let desired_rows = flow_rows.clamp(3, 10);
     let height = desired_rows
-        .saturating_add(if editing { 10 } else { 2 })
+        .saturating_add(if editing {
+            10 + LABEL_EDITOR_GAP_ROWS
+        } else {
+            2
+        })
         .min(area.height);
     let rect = centered(area, width, height);
     LabelManagerLayout {
@@ -3112,8 +3117,12 @@ fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, layout: &LabelManage
     }
 
     let (list_area, input_area) = if editing {
-        let [list, input] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(8)]).areas(inner);
+        let [list, _, input] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(LABEL_EDITOR_GAP_ROWS),
+            Constraint::Length(8),
+        ])
+        .areas(inner);
         (list, Some(input))
     } else {
         (inner, None)
@@ -3181,11 +3190,7 @@ fn draw_labels(f: &mut Frame, app: &mut App, theme: &Theme, layout: &LabelManage
         } else {
             "New label"
         };
-        let editor_inner = render_field_box(
-            f,
-            field_block(label, true, None, theme).padding(Padding::ZERO),
-            input_area,
-        );
+        let editor_inner = render_field_box(f, field_block(label, true, None, theme), input_area);
         let [name_box, color_box] =
             Layout::vertical([Constraint::Length(3), Constraint::Length(3)]).areas(editor_inner);
         let name_area = render_field_box(
