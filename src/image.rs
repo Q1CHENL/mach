@@ -360,6 +360,7 @@ pub fn is_gif(path: &Path) -> bool {
 
 /// One decoded GIF ready to play in the full-size preview.
 pub struct GifPlayback {
+    source: PathBuf,
     frames: Vec<Arc<DynamicImage>>,
     delays: Vec<Duration>,
     index: usize,
@@ -406,6 +407,7 @@ impl GifPlayback {
         }
         let delay0 = delays[0];
         Ok(Self {
+            source: path.to_path_buf(),
             frames,
             delays,
             index: 0,
@@ -542,6 +544,11 @@ struct CachedImage {
     preview_protocol: Option<StatefulProtocol>,
 }
 
+struct GifProtocolCache {
+    source: PathBuf,
+    frames: Vec<Option<StatefulProtocol>>,
+}
+
 /// Result of asking the store for a drawable protocol.
 pub enum ImageReady<'a> {
     Ready(&'a mut StatefulProtocol),
@@ -565,8 +572,8 @@ pub struct ImageStore {
     /// FIFO work waiting for one of the bounded decode slots.
     queued: VecDeque<PathBuf>,
     queued_paths: HashSet<PathBuf>,
-    /// Encoded GIF frames for the open preview (one encode per frame index).
-    gif_protocols: Vec<Option<StatefulProtocol>>,
+    /// Encoded GIF frames for the open preview (one cache per source image).
+    gif_protocols: Option<GifProtocolCache>,
 }
 
 impl Default for ImageStore {
@@ -582,7 +589,7 @@ impl Default for ImageStore {
             pending: HashMap::new(),
             queued: VecDeque::new(),
             queued_paths: HashSet::new(),
-            gif_protocols: Vec::new(),
+            gif_protocols: None,
         }
     }
 }
@@ -769,7 +776,7 @@ impl ImageStore {
     /// is unchanged so there is no resize event, but pixel-per-cell is.
     /// Decoded bitmaps stay cached; only protocols are invalidated.
     pub fn recheck_cell_size(&mut self) -> bool {
-        if self.cache.is_empty() && self.gif_protocols.is_empty() {
+        if self.cache.is_empty() && self.gif_protocols.is_none() {
             return false;
         }
         // Halfblocks are cell glyphs, not pixel protocols.
@@ -860,10 +867,18 @@ impl ImageStore {
     pub fn preview_frame(&mut self, gif: &GifPlayback) -> Result<&mut StatefulProtocol, String> {
         let idx = gif.index;
         let n = gif.frame_count();
-        if self.gif_protocols.len() != n {
-            self.gif_protocols = (0..n).map(|_| None).collect();
+        if self
+            .gif_protocols
+            .as_ref()
+            .is_some_and(|cache| cache.source != gif.source || cache.frames.len() != n)
+        {
+            self.gif_protocols = None;
         }
-        match &mut self.gif_protocols[idx] {
+        let cache = self.gif_protocols.get_or_insert_with(|| GifProtocolCache {
+            source: gif.source.clone(),
+            frames: (0..n).map(|_| None).collect(),
+        });
+        match &mut cache.frames[idx] {
             Some(protocol) => Ok(protocol),
             slot @ None => {
                 let picker = self.picker.as_mut().ok_or("no image support")?;
@@ -874,7 +889,7 @@ impl ImageStore {
     }
 
     pub fn clear_preview(&mut self) {
-        self.gif_protocols.clear();
+        self.gif_protocols = None;
     }
 
     /// Drop the description protocols (the terminal deletes those pictures) but
@@ -1236,9 +1251,13 @@ mod gif_tests {
     use super::*;
     use image::codecs::gif::GifEncoder;
     use image::{Delay, Frame, Rgba, RgbaImage};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::StatefulWidget;
+    use ratatui_image::{Resize, StatefulImage};
     use std::fs::File;
 
-    fn write_test_gif(path: &Path, n: u32) {
+    fn write_test_gif(path: &Path, n: u32, red_offset: u8) {
         let file = File::create(path).unwrap();
         let mut enc = GifEncoder::new(file);
         enc.set_repeat(image::codecs::gif::Repeat::Infinite)
@@ -1246,7 +1265,7 @@ mod gif_tests {
         for i in 0..n {
             let mut img = RgbaImage::new(8, 8);
             for p in img.pixels_mut() {
-                *p = Rgba([((i * 80) % 255) as u8, 0, 255, 255]);
+                *p = Rgba([red_offset.wrapping_add((i * 80) as u8), 0, 255, 255]);
             }
             let delay = Delay::from_numer_denom_ms(50, 1);
             let frame = Frame::from_parts(img, 0, 0, delay);
@@ -1259,7 +1278,7 @@ mod gif_tests {
         let dir = std::env::temp_dir().join("mach-gif-test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("anim.gif");
-        write_test_gif(&path, 4);
+        write_test_gif(&path, 4, 0);
         assert!(is_gif(&path));
         let mut gif = GifPlayback::load(&path).expect("load gif");
         assert!(gif.frame_count() >= 2, "got {} frames", gif.frame_count());
@@ -1268,5 +1287,39 @@ mod gif_tests {
         std::thread::sleep(Duration::from_millis(120));
         assert!(gif.tick(), "should advance after delay");
         assert_ne!(gif.index, first);
+    }
+
+    #[test]
+    fn equal_length_gifs_do_not_share_preview_protocols() {
+        let dir = std::env::temp_dir().join(format!("mach-gif-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first_path = dir.join("first.gif");
+        let second_path = dir.join("second.gif");
+        write_test_gif(&first_path, 2, 0);
+        write_test_gif(&second_path, 2, 160);
+        let first = GifPlayback::load(&first_path).unwrap();
+        let second = GifPlayback::load(&second_path).unwrap();
+        assert_eq!(first.frame_count(), second.frame_count());
+        let mut store = ImageStore {
+            picker: Some(Picker::halfblocks()),
+            ..ImageStore::default()
+        };
+        let area = Rect::new(0, 0, 4, 2);
+
+        let mut first_buffer = Buffer::empty(area);
+        StatefulImage::default().resize(Resize::Scale(None)).render(
+            area,
+            &mut first_buffer,
+            store.preview_frame(&first).unwrap(),
+        );
+        let mut second_buffer = Buffer::empty(area);
+        StatefulImage::default().resize(Resize::Scale(None)).render(
+            area,
+            &mut second_buffer,
+            store.preview_frame(&second).unwrap(),
+        );
+
+        assert_ne!(first_buffer, second_buffer);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
