@@ -41,7 +41,8 @@ const PREVIEW_WIDTH_MIN: u16 = 28;
 /// Whole right column narrower than this → no side preview.
 const PREVIEW_SIDE_MIN: u16 = LIST_WIDTH_MIN + PREVIEW_WIDTH_MIN + 1;
 /// One full color cycle plus the Manage labels action before scrolling.
-const LABEL_PICKER_MAX_ROWS: usize = LabelColor::ALL.len() + 1;
+/// Category and label dropdowns share this bounded viewport height.
+const TASK_FORM_PICKER_MAX_ROWS: usize = LabelColor::ALL.len() + 1;
 pub const MIN_TERMINAL_WIDTH: u16 = 60;
 pub const MIN_TERMINAL_HEIGHT: u16 = 16;
 
@@ -55,6 +56,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         form.form_area = Rect::ZERO;
         form.description_menu_area = None;
         form.image_hits.clear();
+        form.set_category_picker_layout(Rect::ZERO, 0);
+        form.set_label_picker_layout(Rect::ZERO, 0);
         if let Some(picker) = &mut form.picker {
             picker.layout = crate::duepicker::PickerLayout::default();
         }
@@ -354,10 +357,23 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
         field_block("Category", focused, None, theme),
         category_box,
     );
-    form.areas.category = box_inner;
-    let category = format!("‹ {} ›", form.category_label());
+    // Store the outer box so the dropdown matches the field width and its
+    // border remains clickable, like the other picker-backed fields.
+    form.areas.category = category_box;
+    let row_width = box_inner.width as usize;
+    let category = truncate(form.category_label(), row_width.saturating_sub(2));
+    let padding = " ".repeat(row_width.saturating_sub(category.width()).saturating_sub(1));
+    let indicator = if form.category_picker_open() {
+        "▼"
+    } else {
+        "▶"
+    };
     f.render_widget(
-        Paragraph::new(truncate(&category, box_inner.width as usize)),
+        Paragraph::new(Line::from(vec![
+            Span::raw(category),
+            Span::raw(padding),
+            Span::raw(indicator),
+        ])),
         box_inner,
     );
 
@@ -455,6 +471,9 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
     // Picker/image lightbox use the full frame so they are not clipped.
     if let Some(picker) = form.picker.as_mut() {
         draw_due_picker(f, theme, picker, form.areas.due, overlay, areas);
+    }
+    if form.category_picker_open() {
+        draw_category_picker(f, theme, form, form.areas.category, overlay, areas);
     }
     if form.label_picker_open() {
         draw_label_picker(f, theme, form, form.areas.labels, overlay, areas);
@@ -1211,9 +1230,12 @@ fn draw_slash_menu(
 fn task_form_image_occlusion(form: &crate::form::TaskForm, area: Rect) -> Option<Rect> {
     if form.picker.is_some() {
         Some(due_picker_rect(form.areas.due, area))
+    } else if form.category_picker_open() {
+        let total_rows = form.category_choices().count();
+        Some(list_picker_rect(total_rows, form.areas.category, area))
     } else if form.label_picker_open() {
         let total_rows = form.label_choices().count().saturating_add(1);
-        Some(label_picker_rect(total_rows, form.areas.labels, area))
+        Some(list_picker_rect(total_rows, form.areas.labels, area))
     } else {
         None
     }
@@ -1380,10 +1402,8 @@ fn draw_due_picker(
     }
 }
 
-/// Bounded, scrolling task-label selector. Selection changes remain in the
-/// task draft; dismissing the overlay does not save the form.
-fn label_picker_rect(total_rows: usize, field: Rect, area: Rect) -> Rect {
-    let desired_rows = total_rows.clamp(1, LABEL_PICKER_MAX_ROWS) as u16;
+fn list_picker_rect(total_rows: usize, field: Rect, area: Rect) -> Rect {
+    let desired_rows = total_rows.clamp(1, TASK_FORM_PICKER_MAX_ROWS) as u16;
     let desired_height = desired_rows.saturating_add(2).min(area.height);
     let width = field.width.min(area.width);
     let below = field.bottom();
@@ -1408,6 +1428,86 @@ fn label_picker_rect(total_rows: usize, field: Rect, area: Rect) -> Rect {
     }
 }
 
+/// Bounded, scrolling task-category selector. The highlighted row remains
+/// pending until the user chooses it or saves the task form.
+fn draw_category_picker(
+    f: &mut Frame,
+    theme: &Theme,
+    form: &mut crate::form::TaskForm,
+    field: Rect,
+    area: Rect,
+    areas: &mut crate::app::Areas,
+) {
+    let choices = form
+        .category_choices()
+        .map(|(name, current)| (name.to_string(), current))
+        .collect::<Vec<_>>();
+    let total_rows = choices.len();
+    let selected = form
+        .category_picker
+        .as_ref()
+        .map(|picker| picker.index)
+        .unwrap_or_default()
+        .min(total_rows.saturating_sub(1));
+    let rect = list_picker_rect(total_rows, field, area);
+    areas.occlude_hover(rect);
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text());
+    let inner = block.inner(rect);
+    let visible = inner.height as usize;
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(total_rows.saturating_sub(visible));
+    form.set_category_picker_layout(rect, start);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let row_width = inner.width as usize;
+    let lines = choices
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, (name, current))| {
+            let marker = if *current { "✓" } else { " " };
+            let name = truncate(name, row_width.saturating_sub(3));
+            let padding = " ".repeat(row_width.saturating_sub(3 + name.width()));
+            let mut line = Line::from(vec![
+                Span::raw(" "),
+                Span::raw(marker),
+                Span::raw(" "),
+                Span::raw(name),
+                Span::raw(padding),
+            ]);
+            if index == selected {
+                line = line.style(theme.selection());
+            }
+            line
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(lines), inner);
+    for index in start..total_rows.min(start.saturating_add(visible)) {
+        areas.hover_fill(
+            HoverTarget::TaskCategory(index),
+            Rect {
+                y: inner
+                    .y
+                    .saturating_add(u16::try_from(index - start).unwrap_or(u16::MAX)),
+                height: 1,
+                ..inner
+            },
+        );
+    }
+    paint_scrollbar(f, theme, rect, total_rows, visible, start, true, 1);
+}
+
+/// Bounded, scrolling task-label selector. Selection changes remain in the
+/// task draft; dismissing the overlay does not save the form.
 fn draw_label_picker(
     f: &mut Frame,
     theme: &Theme,
@@ -1427,7 +1527,7 @@ fn draw_label_picker(
         .map(|picker| picker.index)
         .unwrap_or_default()
         .min(total_rows.saturating_sub(1));
-    let rect = label_picker_rect(total_rows, field, area);
+    let rect = list_picker_rect(total_rows, field, area);
     areas.occlude_hover(rect);
     let width = rect.width;
     let footer = if let Some(error) = &form.error {

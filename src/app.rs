@@ -241,6 +241,7 @@ pub(crate) enum HoverTarget {
     Sidebar(usize),
     Task(usize),
     SlashCommand(usize),
+    TaskCategory(usize),
     TaskLabel(usize),
     TaskDescriptionCommand(usize),
     CategoryDescriptionCommand(usize),
@@ -1564,6 +1565,11 @@ impl App {
 
     /// Type-to-jump: append `c` and select the best fuzzy match (list unchanged).
     pub fn typeahead_jump(&mut self, c: char) {
+        let category_picker_open = self.mode == Mode::TaskForm
+            && self
+                .form
+                .as_ref()
+                .is_some_and(TaskForm::category_picker_open);
         let label_picker_open = self.mode == Mode::TaskForm
             && self.form.as_ref().is_some_and(TaskForm::label_picker_open);
         let now = Instant::now();
@@ -1575,6 +1581,7 @@ impl App {
         }
         let limit = match self.mode {
             Mode::Labels => MAX_LABEL_NAME_LEN,
+            Mode::TaskForm if category_picker_open => MAX_CATEGORY_NAME_LEN,
             Mode::TaskForm if label_picker_open => MAX_LABEL_NAME_LEN,
             _ => match self.focus {
                 Focus::Tasks => MAX_TITLE_LEN,
@@ -1585,6 +1592,20 @@ impl App {
             self.typeahead.push(c);
         }
         self.typeahead_at = Some(now);
+
+        if category_picker_open {
+            let best = self.form.as_ref().and_then(|form| {
+                let names = form.category_choices().map(|(name, _)| name);
+                crate::fuzzy::best_index(&self.typeahead, names)
+            });
+            if let Some(pos) = best {
+                if let Some(form) = &mut self.form {
+                    form.select_category_picker(pos);
+                }
+                self.cancel_pending();
+            }
+            return;
+        }
 
         if label_picker_open {
             let best = self.form.as_ref().and_then(|form| {

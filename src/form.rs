@@ -315,10 +315,48 @@ struct LabelChoice {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LabelPicker {
+pub struct ListPicker {
     pub index: usize,
     area: Rect,
     start: usize,
+}
+
+impl ListPicker {
+    fn new(index: usize) -> Self {
+        Self {
+            index,
+            area: Rect::ZERO,
+            start: 0,
+        }
+    }
+
+    fn set_layout(&mut self, area: Rect, start: usize) {
+        self.area = area;
+        self.start = start;
+    }
+
+    fn row_at(&self, x: u16, y: u16, count: usize) -> Option<usize> {
+        if !self.area.contains(ratatui::layout::Position { x, y })
+            || y <= self.area.y
+            || y >= self.area.bottom().saturating_sub(1)
+        {
+            return None;
+        }
+        let index = self.start + usize::from(y - self.area.y - 1);
+        (index < count).then_some(index)
+    }
+
+    fn select(&mut self, index: usize, count: usize) {
+        if index < count {
+            self.index = index;
+        }
+    }
+
+    fn move_by(&mut self, delta: isize, count: usize) {
+        if count > 0 {
+            self.index = (self.index as isize + delta).clamp(0, count as isize - 1) as usize;
+        }
+    }
 }
 
 impl CategoryChoice {
@@ -355,8 +393,10 @@ pub struct TaskForm {
     pub gif_pending: Option<GifLoad>,
     /// The calendar, while a due date is being picked.
     pub picker: Option<DuePicker>,
+    /// The bounded single-select list, while Category is being edited.
+    pub category_picker: Option<ListPicker>,
     /// The bounded multi-select list, while Labels is being edited.
-    pub label_picker: Option<LabelPicker>,
+    pub label_picker: Option<ListPicker>,
     /// Last description click (line index), for double-click to open a picture.
     pub last_description_click: Option<(Instant, usize)>,
     /// Description scroll after last paint — scroll changes need the same protocol
@@ -412,6 +452,7 @@ impl TaskForm {
             gif: None,
             gif_pending: None,
             picker: None,
+            category_picker: None,
             label_picker: None,
             last_description_click: None,
             description_scroll: 0,
@@ -512,23 +553,90 @@ impl TaskForm {
             .unwrap_or("Uncategorized")
     }
 
-    /// Select the previous/next category, wrapping at either end.
-    pub fn cycle_category(&mut self, delta: i32) {
-        let len = self.category_choices.len();
-        if len <= 1 {
-            return;
-        }
-        let current = self
+    pub fn category_choices(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.category_choices.iter().map(|choice| {
+            (
+                choice.name.as_str(),
+                choice.id.as_deref() == self.category_id.as_deref(),
+            )
+        })
+    }
+
+    pub fn category_picker_open(&self) -> bool {
+        self.category_picker.is_some()
+    }
+
+    pub fn open_category_picker(&mut self) {
+        self.history.break_coalesce();
+        self.field = Field::Category;
+        self.picker = None;
+        self.label_picker = None;
+        self.description.close_menu();
+        let index = self
             .category_choices
             .iter()
             .position(|choice| choice.id.as_deref() == self.category_id.as_deref())
             .unwrap_or_default();
-        let next = (current as i32 + delta).rem_euclid(len as i32) as usize;
-        if next == current {
+        self.category_picker = Some(ListPicker::new(index));
+    }
+
+    pub fn close_category_picker(&mut self) {
+        self.category_picker = None;
+    }
+
+    pub fn commit_category_picker(&mut self) {
+        let Some(index) = self.category_picker.take().map(|picker| picker.index) else {
+            return;
+        };
+        let Some(category_id) = self
+            .category_choices
+            .get(index)
+            .map(|choice| choice.id.clone())
+        else {
+            return;
+        };
+        if category_id == self.category_id {
             return;
         }
         self.before_edit(EditKind::Atomic);
-        self.category_id = self.category_choices[next].id.clone();
+        self.category_id = category_id;
+    }
+
+    pub(crate) fn set_category_picker_layout(&mut self, area: Rect, start: usize) {
+        if let Some(picker) = &mut self.category_picker {
+            picker.set_layout(area, start);
+        }
+    }
+
+    pub fn category_picker_area(&self) -> Option<Rect> {
+        self.category_picker.as_ref().map(|picker| picker.area)
+    }
+
+    pub(crate) fn category_picker_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.category_picker
+            .as_ref()?
+            .row_at(x, y, self.category_choices.len())
+    }
+
+    pub(crate) fn select_category_picker(&mut self, index: usize) {
+        if let Some(picker) = &mut self.category_picker {
+            picker.select(index, self.category_choices.len());
+        }
+    }
+
+    pub fn move_category_picker(&mut self, delta: isize) {
+        if let Some(picker) = &mut self.category_picker {
+            picker.move_by(delta, self.category_choices.len());
+        }
+    }
+
+    pub fn select_first_category(&mut self) {
+        self.select_category_picker(0);
+    }
+
+    pub fn select_last_category(&mut self) {
+        let last = self.category_choices.len().saturating_sub(1);
+        self.select_category_picker(last);
     }
 
     pub fn clear_category(&mut self) {
@@ -620,17 +728,14 @@ impl TaskForm {
         self.history.break_coalesce();
         self.field = Field::Labels;
         self.picker = None;
+        self.category_picker = None;
         self.description.close_menu();
         let index = self
             .label_choices
             .iter()
             .position(|choice| self.label_ids.contains(&choice.id))
             .unwrap_or_default();
-        self.label_picker = Some(LabelPicker {
-            index,
-            area: Rect::default(),
-            start: 0,
-        });
+        self.label_picker = Some(ListPicker::new(index));
     }
 
     pub fn close_label_picker(&mut self) {
@@ -639,8 +744,7 @@ impl TaskForm {
 
     pub(crate) fn set_label_picker_layout(&mut self, area: Rect, start: usize) {
         if let Some(picker) = &mut self.label_picker {
-            picker.area = area;
-            picker.start = start;
+            picker.set_layout(area, start);
         }
     }
 
@@ -649,22 +753,15 @@ impl TaskForm {
     }
 
     pub(crate) fn label_picker_row_at(&self, x: u16, y: u16) -> Option<usize> {
-        let picker = self.label_picker.as_ref()?;
-        if !picker.area.contains(ratatui::layout::Position { x, y })
-            || y <= picker.area.y
-            || y >= picker.area.bottom().saturating_sub(1)
-        {
-            return None;
-        }
-        let index = picker.start + usize::from(y - picker.area.y - 1);
-        (index <= self.label_choices.len()).then_some(index)
+        self.label_picker
+            .as_ref()?
+            .row_at(x, y, self.label_choices.len().saturating_add(1))
     }
 
     pub(crate) fn select_label_picker(&mut self, index: usize) {
-        if let Some(picker) = &mut self.label_picker
-            && index <= self.label_choices.len()
-        {
-            picker.index = index;
+        let count = self.label_choices.len().saturating_add(1);
+        if let Some(picker) = &mut self.label_picker {
+            picker.select(index, count);
         }
     }
 
@@ -676,11 +773,8 @@ impl TaskForm {
 
     pub fn move_label_picker(&mut self, delta: isize) {
         let count = self.label_choices.len().saturating_add(1);
-        let Some(picker) = &mut self.label_picker else {
-            return;
-        };
-        if count > 0 {
-            picker.index = (picker.index as isize + delta).clamp(0, count as isize - 1) as usize;
+        if let Some(picker) = &mut self.label_picker {
+            picker.move_by(delta, count);
         }
     }
 
@@ -880,6 +974,7 @@ impl TaskForm {
         self.error = None;
         // Overlays are not part of content history.
         self.picker = None;
+        self.category_picker = None;
         self.label_picker = None;
         self.preview = false;
         self.gif_pending = None;
@@ -943,6 +1038,7 @@ impl TaskForm {
     pub fn open_due_picker(&mut self) {
         self.history.break_coalesce();
         self.field = Field::Due;
+        self.category_picker = None;
         self.label_picker = None;
         self.picker = Some(DuePicker::new(self.due.value().trim()));
     }
@@ -977,6 +1073,7 @@ impl TaskForm {
         }
         self.before_edit(EditKind::Atomic);
         self.picker = None;
+        self.category_picker = None;
         self.label_picker = None;
         self.due = TextInput::new("", 32);
     }
@@ -984,6 +1081,7 @@ impl TaskForm {
     pub fn focus_next(&mut self) {
         self.history.break_coalesce();
         self.picker = None;
+        self.category_picker = None;
         self.label_picker = None;
         self.description.close_menu();
         self.field = self.field.next();
@@ -992,6 +1090,7 @@ impl TaskForm {
     pub fn focus_prev(&mut self) {
         self.history.break_coalesce();
         self.picker = None;
+        self.category_picker = None;
         self.label_picker = None;
         self.description.close_menu();
         self.field = self.field.prev();
@@ -1003,6 +1102,9 @@ impl TaskForm {
         self.history.break_coalesce();
         if field != Field::Due {
             self.picker = None;
+        }
+        if field != Field::Category {
+            self.category_picker = None;
         }
         if field != Field::Labels {
             self.label_picker = None;
@@ -1184,7 +1286,7 @@ mod tests {
     }
 
     #[test]
-    fn category_selector_includes_uncategorized_and_is_part_of_the_draft() {
+    fn category_picker_includes_uncategorized_and_commits_to_the_draft() {
         let categories = [
             crate::model::Category::all_tasks(),
             crate::model::Category {
@@ -1200,7 +1302,9 @@ mod tests {
         assert_eq!(form.category_label(), "Work");
         assert!(!form.is_dirty());
 
-        form.cycle_category(1);
+        form.open_category_picker();
+        form.select_category_picker(0);
+        form.commit_category_picker();
         assert_eq!(form.category_id(), None);
         assert_eq!(form.category_label(), "Uncategorized");
         assert!(form.is_dirty());

@@ -1002,7 +1002,7 @@ fn new_task_from_all_opens_with_uncategorized_selected() {
 }
 
 #[test]
-fn task_form_can_move_an_existing_task_to_another_category() {
+fn task_form_category_dropdown_typeahead_moves_then_commits_the_selection() {
     let mut app = app();
     app.select_category(1);
     let id = app.selected_task().unwrap().id.clone();
@@ -1011,7 +1011,25 @@ fn task_form_can_move_an_existing_task_to_another_category() {
     assert_eq!(form.category_id(), Some("c-work"));
     form.set_field(mach::form::Field::Category);
 
-    press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+    let form = app.form.as_ref().unwrap();
+    assert!(form.category_picker_open());
+    assert_eq!(form.category_picker.unwrap().index, 2);
+    assert_eq!(
+        form.category_id(),
+        Some("c-work"),
+        "type-to-jump only moves the pending dropdown selection"
+    );
+
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    let form = app.form.as_ref().unwrap();
+    assert!(!form.category_picker_open());
+    assert_eq!(form.category_id(), Some("c-work"));
+
+    press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(!app.form.as_ref().unwrap().category_picker_open());
     assert_eq!(app.form.as_ref().unwrap().category_id(), Some("c-home"));
     press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
 
@@ -1025,6 +1043,33 @@ fn task_form_can_move_an_existing_task_to_another_category() {
             .as_deref(),
         Some("c-home")
     );
+}
+
+#[test]
+fn task_form_category_dropdown_supports_click_commit_and_outside_cancel() {
+    let mut app = app();
+    app.select_category(1);
+    app.open_edit_task();
+    draw(&mut app, 100, 30);
+
+    let category = app.form.as_ref().unwrap().areas.category;
+    click(&mut app, category.x, category.y);
+    assert!(app.form.as_ref().unwrap().category_picker_open());
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+
+    let title = app.form.as_ref().unwrap().areas.title;
+    click(&mut app, title.x, title.y);
+    let form = app.form.as_ref().unwrap();
+    assert!(!form.category_picker_open());
+    assert_eq!(form.category_id(), Some("c-work"));
+
+    click(&mut app, category.x, category.y);
+    draw(&mut app, 100, 30);
+    let picker = app.form.as_ref().unwrap().category_picker_area().unwrap();
+    click(&mut app, picker.x + 1, picker.y + 3);
+    let form = app.form.as_ref().unwrap();
+    assert!(!form.category_picker_open());
+    assert_eq!(form.category_id(), Some("c-home"));
 }
 
 #[test]
@@ -1319,6 +1364,30 @@ fn ctrl_s_commits_the_open_due_picker_before_saving() {
 
     assert_eq!(app.mode, Mode::Normal);
     assert_eq!(app.selected_task().unwrap().due, expected);
+}
+
+#[test]
+fn ctrl_s_commits_the_open_category_dropdown_before_saving() {
+    let mut app = app();
+    app.select_category(1);
+    app.open_new_task();
+    let form = app.form.as_mut().unwrap();
+    form.title.insert_str("category picker task");
+    form.open_category_picker();
+    form.move_category_picker(1);
+
+    press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(
+        app.tasks
+            .iter()
+            .find(|task| task.title == "category picker task")
+            .unwrap()
+            .category_id
+            .as_deref(),
+        Some("c-home")
+    );
 }
 
 #[test]

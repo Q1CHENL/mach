@@ -882,10 +882,13 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
             app.error("Choose or dismiss the description command before saving");
             return;
         }
-        if let Some(form) = &mut app.form
-            && form.picker.is_some()
-        {
-            form.take_due_picker();
+        if let Some(form) = &mut app.form {
+            if form.category_picker_open() {
+                form.commit_category_picker();
+            }
+            if form.picker.is_some() {
+                form.take_due_picker();
+            }
         }
         app.submit_form();
         return;
@@ -944,9 +947,37 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
     if app
         .form
         .as_ref()
+        .is_some_and(|form| form.category_picker_open())
+    {
+        handle_category_picker_key(app, key);
+        return;
+    }
+
+    if app
+        .form
+        .as_ref()
         .is_some_and(|form| form.label_picker_open())
     {
         handle_label_picker_key(app, key);
+        return;
+    }
+
+    // Category type-to-jump opens the dropdown on the first character.
+    if let KeyCode::Char(c) = key.code
+        && c != ' '
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        && !c.is_control()
+        && app
+            .form
+            .as_ref()
+            .is_some_and(|form| form.field == Field::Category)
+    {
+        if let Some(form) = &mut app.form {
+            form.open_category_picker();
+        }
+        app.typeahead_jump(c);
         return;
     }
 
@@ -994,7 +1025,8 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             let Some(form) = &mut app.form else { return };
             match form.field {
-                Field::Title | Field::Category | Field::Importance => form.focus_next(),
+                Field::Title | Field::Importance => form.focus_next(),
+                Field::Category => form.open_category_picker(),
                 Field::Labels => form.open_label_picker(),
                 Field::Due => form.open_due_picker(),
                 // On a picture there is nothing to type, so Enter is
@@ -1032,11 +1064,18 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
                     }
                     edit_description(&mut form.description, key);
                 }
-                // Category is a bounded selector. All tasks is deliberately
+                // Category is a bounded dropdown. All tasks is deliberately
                 // absent; Backspace/Delete returns the task to Uncategorized.
                 Field::Category => match key.code {
-                    KeyCode::Left | KeyCode::Up => form.cycle_category(-1),
-                    KeyCode::Right | KeyCode::Down | KeyCode::Char(' ') => form.cycle_category(1),
+                    KeyCode::Up => {
+                        form.open_category_picker();
+                        form.move_category_picker(-1);
+                    }
+                    KeyCode::Down => {
+                        form.open_category_picker();
+                        form.move_category_picker(1);
+                    }
+                    KeyCode::Char(' ') => form.open_category_picker(),
                     KeyCode::Backspace | KeyCode::Delete => form.clear_category(),
                     _ => form.break_coalesce(),
                 },
@@ -1078,6 +1117,33 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
+    }
+}
+
+fn handle_category_picker_key(app: &mut App, key: KeyEvent) {
+    if let KeyCode::Char(c) = key.code
+        && c != ' '
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        && !c.is_control()
+    {
+        app.typeahead_jump(c);
+        return;
+    }
+    app.clear_typeahead();
+
+    let Some(form) = &mut app.form else { return };
+    match key.code {
+        KeyCode::Esc => form.close_category_picker(),
+        KeyCode::Enter | KeyCode::Char(' ') => form.commit_category_picker(),
+        KeyCode::Up | KeyCode::BackTab => form.move_category_picker(-1),
+        KeyCode::Down | KeyCode::Tab => form.move_category_picker(1),
+        KeyCode::PageUp => form.move_category_picker(-8),
+        KeyCode::PageDown => form.move_category_picker(8),
+        KeyCode::Home => form.select_first_category(),
+        KeyCode::End => form.select_last_category(),
+        _ => {}
     }
 }
 
@@ -2211,6 +2277,12 @@ fn click_on_panels(app: &App, m: MouseEvent) -> bool {
             return false;
         }
         if form
+            .category_picker_area()
+            .is_some_and(|area| contains(area, x, y))
+        {
+            return false;
+        }
+        if form
             .label_picker_area()
             .is_some_and(|area| contains(area, x, y))
         {
@@ -2242,6 +2314,26 @@ fn click_on_panels(app: &App, m: MouseEvent) -> bool {
 /// a picture opens it, same as Enter. The due picker also takes clicks
 /// and scroll.
 fn handle_form_mouse(app: &mut App, m: MouseEvent) {
+    // The category dropdown owns wheel movement while the pointer is over it.
+    if matches!(
+        m.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) && app.form.as_ref().is_some_and(|form| {
+        form.category_picker_area()
+            .is_some_and(|area| contains(area, m.column, m.row))
+    }) {
+        app.clear_typeahead();
+        let delta = if m.kind == MouseEventKind::ScrollUp {
+            -1
+        } else {
+            1
+        };
+        if let Some(form) = &mut app.form {
+            form.move_category_picker(delta);
+        }
+        return;
+    }
+
     // The label picker owns wheel movement while the pointer is over it.
     if matches!(
         m.kind,
@@ -2328,6 +2420,35 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
             form.preview_click();
         }
         return;
+    }
+
+    // A row click commits the pending category; an outside click cancels it.
+    if app
+        .form
+        .as_ref()
+        .is_some_and(|form| form.category_picker_open())
+    {
+        app.clear_typeahead();
+        let inside = app.form.as_ref().is_some_and(|form| {
+            form.category_picker_area()
+                .is_some_and(|area| contains(area, m.column, m.row))
+        });
+        if inside {
+            let row = app
+                .form
+                .as_ref()
+                .and_then(|form| form.category_picker_row_at(m.column, m.row));
+            if let Some(index) = row
+                && let Some(form) = &mut app.form
+            {
+                form.select_category_picker(index);
+                form.commit_category_picker();
+            }
+            return;
+        }
+        if let Some(form) = &mut app.form {
+            form.close_category_picker();
+        }
     }
 
     // Consume picker chrome so re-clicking Labels cannot dismiss and
@@ -2437,7 +2558,7 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
                 AfterClick::None
             }
             Field::Category => {
-                form.cycle_category(1);
+                form.open_category_picker();
                 AfterClick::None
             }
             Field::Labels => {

@@ -549,7 +549,11 @@ fn task_label_picker_shows_manage_when_choices_fit_the_color_palette() {
 
 #[test]
 fn task_form_overlays_replace_overlapped_description_images_with_a_marker() {
-    for field in [mach::form::Field::Labels, mach::form::Field::Due] {
+    for field in [
+        mach::form::Field::Category,
+        mach::form::Field::Labels,
+        mach::form::Field::Due,
+    ] {
         let mut app = sample_app();
         app.create_label("bug").unwrap();
         app.tasks[0].description = vec![
@@ -562,6 +566,7 @@ fn task_form_overlays_replace_overlapped_description_images_with_a_marker() {
 
         let form = app.form.as_mut().unwrap();
         match field {
+            mach::form::Field::Category => form.open_category_picker(),
             mach::form::Field::Labels => form.open_label_picker(),
             mach::form::Field::Due => form.open_due_picker(),
             _ => unreachable!(),
