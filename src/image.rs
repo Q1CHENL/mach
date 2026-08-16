@@ -16,9 +16,10 @@ use std::time::{Duration, Instant};
 use image::codecs::gif::GifDecoder;
 use image::imageops::FilterType;
 use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, Limits};
-use ratatui_image::FontSize;
+use ratatui::layout::Size;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::{FontSize, Resize, ResizeEncodeRender};
 
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
@@ -535,13 +536,72 @@ impl GifLoad {
     }
 }
 
+struct ProtocolJob {
+    id: u64,
+    protocol: StatefulProtocol,
+    size: Size,
+    result: Sender<ProtocolResult>,
+}
+
+struct ProtocolResult {
+    id: u64,
+    protocol: StatefulProtocol,
+    error: Option<String>,
+}
+
+fn protocol_worker() -> &'static SyncSender<ProtocolJob> {
+    static WORKER: OnceLock<SyncSender<ProtocolJob>> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        // Keep at most one obsolete selection queued behind the active image.
+        // A full queue leaves the protocol in the cache so the current frame
+        // can retry without cloning more decoded pixels.
+        let (jobs, receiver) = mpsc::sync_channel::<ProtocolJob>(1);
+        let _ = std::thread::Builder::new()
+            .name("mach-image-encode".into())
+            .spawn(move || {
+                while let Ok(mut job) = receiver.recv() {
+                    job.protocol.resize_encode(&Resize::Scale(None), job.size);
+                    let error = job
+                        .protocol
+                        .last_encoding_result()
+                        .and_then(Result::err)
+                        .map(|error| error.to_string());
+                    let _ = job.result.send(ProtocolResult {
+                        id: job.id,
+                        protocol: job.protocol,
+                        error,
+                    });
+                }
+            });
+        jobs
+    })
+}
+
+struct PreparedProtocol {
+    protocol: Option<StatefulProtocol>,
+    pending_job: Option<u64>,
+    size: Size,
+    error: Option<String>,
+}
+
+impl PreparedProtocol {
+    fn new(protocol: StatefulProtocol) -> Self {
+        Self {
+            protocol: Some(protocol),
+            pending_job: None,
+            size: Size::default(),
+            error: None,
+        }
+    }
+}
+
 /// One file: decoded pixels stay in RAM. Description and full-screen preview keep
 /// separate protocols so closing the preview does not force a slow
 /// re-encode the next time it opens (description is ~10 rows; preview is large).
 struct CachedImage {
     image: Arc<DynamicImage>,
-    protocol: Option<StatefulProtocol>,
-    preview_protocol: Option<StatefulProtocol>,
+    protocol: Option<PreparedProtocol>,
+    preview_protocol: Option<PreparedProtocol>,
 }
 
 struct GifProtocolCache {
@@ -554,6 +614,8 @@ pub enum ImageReady<'a> {
     Ready(&'a mut StatefulProtocol),
     /// Decode still running on a worker thread.
     Loading,
+    /// Decoded pixels are being resized and encoded for this cell area.
+    Preparing(Size),
     Failed(String),
 }
 
@@ -574,10 +636,16 @@ pub struct ImageStore {
     queued_paths: HashSet<PathBuf>,
     /// Encoded GIF frames for the open preview (one cache per source image).
     gif_protocols: Option<GifProtocolCache>,
+    protocol_result_sender: Sender<ProtocolResult>,
+    protocol_results: Receiver<ProtocolResult>,
+    next_protocol_job: u64,
+    protocol_jobs_in_flight: usize,
+    protocol_retry: bool,
 }
 
 impl Default for ImageStore {
     fn default() -> Self {
+        let (protocol_result_sender, protocol_results) = mpsc::channel();
         Self {
             images_root: default_images_root(),
             attachments: AttachmentCatalog::default(),
@@ -590,6 +658,11 @@ impl Default for ImageStore {
             queued: VecDeque::new(),
             queued_paths: HashSet::new(),
             gif_protocols: None,
+            protocol_result_sender,
+            protocol_results,
+            next_protocol_job: 1,
+            protocol_jobs_in_flight: 0,
+            protocol_retry: false,
         }
     }
 }
@@ -740,10 +813,11 @@ impl ImageStore {
     }
 
     /// Pull finished background decodes into the cache.
-    /// Returns true when at least one image became ready (caller should redraw).
+    /// Returns true when decoded pixels or a prepared terminal image became
+    /// ready (caller should redraw).
     pub fn poll_pending(&mut self) -> bool {
         let keys: Vec<PathBuf> = self.pending.keys().cloned().collect();
-        let mut any = false;
+        let mut any = self.poll_protocol_results();
         for key in keys {
             let Some(rx) = self.pending.get(&key) else {
                 continue;
@@ -767,7 +841,42 @@ impl ImageStore {
     }
 
     pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty() || !self.queued.is_empty()
+        !self.pending.is_empty()
+            || !self.queued.is_empty()
+            || self.protocol_jobs_in_flight > 0
+            || self.protocol_retry
+    }
+
+    fn poll_protocol_results(&mut self) -> bool {
+        let mut changed = std::mem::take(&mut self.protocol_retry);
+        loop {
+            match self.protocol_results.try_recv() {
+                Ok(result) => {
+                    self.protocol_jobs_in_flight = self.protocol_jobs_in_flight.saturating_sub(1);
+                    changed = true;
+                    self.apply_protocol_result(result);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        changed
+    }
+
+    fn apply_protocol_result(&mut self, result: ProtocolResult) {
+        for cached in self.cache.values_mut().flatten() {
+            for slot in [&mut cached.protocol, &mut cached.preview_protocol] {
+                let Some(prepared) = slot.as_mut() else {
+                    continue;
+                };
+                if prepared.pending_job == Some(result.id) {
+                    prepared.protocol = Some(result.protocol);
+                    prepared.pending_job = None;
+                    prepared.error = result.error;
+                    return;
+                }
+            }
+        }
     }
 
     /// If the terminal cell size changed, drop encodings and rebuild.
@@ -814,17 +923,17 @@ impl ImageStore {
     ///
     /// Missing files are fetched in the background; the first call returns
     /// [`ImageReady::Loading`] until a later [`Self::poll_pending`] lands them.
-    pub fn get(&mut self, path: &Path) -> ImageReady<'_> {
-        self.protocol_for(path, false)
+    pub fn get(&mut self, path: &Path, bounds: Size) -> ImageReady<'_> {
+        self.protocol_for(path, false, bounds)
     }
 
     /// Full-screen preview protocol — kept separate from the description thumb so
     /// open → close → open does not thrash encode size every time.
-    pub fn get_preview(&mut self, path: &Path) -> ImageReady<'_> {
-        self.protocol_for(path, true)
+    pub fn get_preview(&mut self, path: &Path, bounds: Size) -> ImageReady<'_> {
+        self.protocol_for(path, true, bounds)
     }
 
-    fn protocol_for(&mut self, path: &Path, preview: bool) -> ImageReady<'_> {
+    fn protocol_for(&mut self, path: &Path, preview: bool, bounds: Size) -> ImageReady<'_> {
         // `poll_pending` is the event loop's job once per tick.
         match self.cache.get(path) {
             None => {
@@ -838,7 +947,15 @@ impl ImageStore {
         }
         self.touch_lru(path);
 
-        let Self { cache, picker, .. } = self;
+        let result_sender = self.protocol_result_sender.clone();
+        let Self {
+            cache,
+            picker,
+            next_protocol_job,
+            protocol_jobs_in_flight,
+            protocol_retry,
+            ..
+        } = self;
         let Some(Ok(CachedImage {
             image,
             protocol,
@@ -851,16 +968,61 @@ impl ImageStore {
         // Description and preview hold separate protocols so switching between them
         // does not re-encode the decoded image.
         let slot = if preview { preview_protocol } else { protocol };
-        let protocol = match slot {
+        let prepared = match slot {
             Some(protocol) => protocol,
             empty @ None => {
                 let Some(picker) = picker.as_mut() else {
                     return ImageReady::Failed("no image support".into());
                 };
-                empty.insert(picker.new_resize_protocol((**image).clone()))
+                empty.insert(PreparedProtocol::new(
+                    picker.new_resize_protocol((**image).clone()),
+                ))
             }
         };
-        ImageReady::Ready(protocol)
+        if let Some(error) = &prepared.error {
+            return ImageReady::Failed(error.clone());
+        }
+        let Some(protocol) = prepared.protocol.as_ref() else {
+            return ImageReady::Preparing(prepared.size);
+        };
+        prepared.size = protocol.size_for(Resize::Scale(None), bounds);
+        let Some(size) = protocol.needs_resize(&Resize::Scale(None), bounds) else {
+            return ImageReady::Ready(
+                prepared
+                    .protocol
+                    .as_mut()
+                    .expect("the protocol was available above"),
+            );
+        };
+
+        let protocol = prepared
+            .protocol
+            .take()
+            .expect("the protocol was available above");
+        let id = *next_protocol_job;
+        *next_protocol_job = next_protocol_job.wrapping_add(1).max(1);
+        let job = ProtocolJob {
+            id,
+            protocol,
+            size,
+            result: result_sender,
+        };
+        match protocol_worker().try_send(job) {
+            Ok(()) => {
+                prepared.pending_job = Some(id);
+                *protocol_jobs_in_flight = protocol_jobs_in_flight.saturating_add(1);
+            }
+            Err(TrySendError::Full(job)) => {
+                prepared.protocol = Some(job.protocol);
+                *protocol_retry = true;
+            }
+            Err(TrySendError::Disconnected(job)) => {
+                prepared.protocol = Some(job.protocol);
+                prepared.error = Some("image renderer stopped".into());
+                return ImageReady::Failed("image renderer stopped".into());
+            }
+        }
+        ImageReady::Preparing(prepared.size)
     }
 
     /// Protocol for the current GIF frame (encode once per frame index).
@@ -1086,6 +1248,45 @@ mod tests {
             }),
         );
         store
+    }
+
+    #[test]
+    fn decoded_images_prepare_without_blocking_the_render_call() {
+        let mut store = store_with_an_image();
+        let path = Path::new("/tmp/x.png");
+
+        assert!(matches!(
+            store.get(path, Size::new(4, 2)),
+            ImageReady::Preparing(_)
+        ));
+        assert!(
+            store.has_pending(),
+            "background image preparation must keep the event loop polling"
+        );
+    }
+
+    #[test]
+    fn invalidated_preparation_eventually_returns_the_current_protocol() {
+        let mut store = store_with_an_image();
+        let path = Path::new("/tmp/x.png");
+        let bounds = Size::new(4, 2);
+
+        assert!(matches!(store.get(path, bounds), ImageReady::Preparing(_)));
+        store.clear_cache();
+        assert!(matches!(store.get(path, bounds), ImageReady::Preparing(_)));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let _ = store.poll_pending();
+            if matches!(store.get(path, bounds), ImageReady::Ready(_)) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the current protocol never replaced invalidated background work"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

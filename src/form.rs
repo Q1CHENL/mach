@@ -413,6 +413,7 @@ pub struct TaskForm {
     /// Changes require graphics placements to be emitted again.
     pub(crate) image_occlusions: Vec<Rect>,
     pub(crate) image_layout: Vec<(std::path::PathBuf, u16, u16)>,
+    pub(crate) image_frame_initialized: bool,
     history: History<TaskSnap>,
     initial: TaskDraft,
     temporary_images: Vec<TemporaryImage>,
@@ -461,6 +462,7 @@ impl TaskForm {
             image_hits: Vec::new(),
             image_occlusions: Vec::new(),
             image_layout: Vec::new(),
+            image_frame_initialized: false,
             history: History::new(),
             initial: TaskDraft::default(),
             temporary_images: Vec::new(),

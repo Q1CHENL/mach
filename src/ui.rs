@@ -871,6 +871,7 @@ fn draw_description(
         image_hits,
         image_occlusions,
         image_layout,
+        image_frame_initialized,
         ..
     } = form;
     draw_block_editor(
@@ -885,6 +886,7 @@ fn draw_description(
         image_hits,
         image_occlusions,
         image_layout,
+        image_frame_initialized,
     )
 }
 
@@ -937,6 +939,7 @@ fn draw_block_editor(
     image_hits: &mut Vec<(usize, Rect)>,
     previous_image_occlusions: &mut Vec<Rect>,
     previous_image_layout: &mut Vec<(std::path::PathBuf, u16, u16)>,
+    image_frame_initialized: &mut bool,
 ) -> Option<Rect> {
     if options.show_empty_hint && editor.is_empty() && editor.menu.is_none() {
         render_or_placeholder(f, area, "", "Press / for commands", theme);
@@ -963,13 +966,19 @@ fn draw_block_editor(
     // Graphics protocols ignore cell Clear. Drop placements when overlays,
     // scrolling, or image geometry changes so the next get re-emits cleanly.
     // Decoded pixels stay in RAM; only the terminal encoding is rebuilt.
-    if *previous_image_occlusions != image_occlusions
+    let placement_changed = *previous_image_occlusions != image_occlusions
         || *previous_scroll != scroll
-        || *previous_image_layout != image_layout
-    {
-        store.clear_cache();
+        || *previous_image_layout != image_layout;
+    if placement_changed {
+        // A newly selected task has no placements of its own to invalidate.
+        // Keep any prepared protocol for the same attachment reusable; later
+        // changes within this form still force graphics protocols to re-emit.
+        if *image_frame_initialized {
+            store.clear_cache();
+        }
         f.render_widget(Clear, area);
     }
+    *image_frame_initialized = true;
     *previous_image_occlusions = image_occlusions.clone();
     *previous_scroll = scroll;
     *previous_image_layout = image_layout;
@@ -1860,13 +1869,21 @@ fn draw_image_preview(
             }
         }
     } else {
-        match store.get_preview(path) {
+        match store.get_preview(path, inner.as_size()) {
             crate::image::ImageReady::Ready(protocol) => {
                 let _ = render_protocol(f, protocol, inner, theme, None);
             }
             crate::image::ImageReady::Loading => {
                 // Loading means not cached yet — aspect unknown.
                 let slot = letterbox_rect(preview_slot_area(inner), 4, 3);
+                draw_image_slot(f, theme, slot, ImageSlotKind::Loading, false);
+            }
+            crate::image::ImageReady::Preparing(size) => {
+                let slot = letterbox_rect(
+                    preview_slot_area(inner),
+                    size.width.max(1),
+                    size.height.max(1),
+                );
                 draw_image_slot(f, theme, slot, ImageSlotKind::Loading, false);
             }
             crate::image::ImageReady::Failed(err) => {
@@ -1902,7 +1919,7 @@ fn draw_image(
         horizontal: 1,
         vertical: 1,
     });
-    match store.get(path) {
+    match store.get(path, inner.as_size()) {
         crate::image::ImageReady::Ready(protocol) => Some(render_protocol(
             f,
             protocol,
@@ -1913,6 +1930,11 @@ fn draw_image(
         crate::image::ImageReady::Loading => {
             // Not in cache yet — aspect unknown until decode finishes.
             let slot = letterbox_rect(area, 4, 3);
+            draw_image_slot(f, theme, slot, ImageSlotKind::Loading, selected);
+            Some(slot)
+        }
+        crate::image::ImageReady::Preparing(size) => {
+            let slot = letterbox_rect(area, size.width.max(1), size.height.max(1));
             draw_image_slot(f, theme, slot, ImageSlotKind::Loading, selected);
             Some(slot)
         }
