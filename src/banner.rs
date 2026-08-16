@@ -15,16 +15,16 @@ pub const BANNER_WIDTH: u16 = 35;
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
     (
-        "Faster category assignment",
-        "Open a scrolling Category menu in the task editor, then type to jump and choose with the keyboard or mouse.",
+        "Drag through long lists",
+        "Grab the scrollbar thumb in task and category lists, editors, pickers, and Labels to move directly through long content.",
     ),
     (
-        "Choose how many hints you see",
-        "Set Hints to All or Essential in Settings, or toggle it with /hints. Essential keeps action guidance while reclaiming space.",
+        "See before you click",
+        "Hover an unchecked task or label box to preview the change, and choose Bottom ↓ to jump through overflowing task and category lists.",
     ),
     (
-        "Jump through long descriptions",
-        "Choose Bottom ↓ in an overflowing preview or task editor to move straight to the end without disturbing your edit.",
+        "Smoother image previews",
+        "Image previews prepare in the background so moving through image-heavy task lists stays responsive.",
     ),
 ];
 
