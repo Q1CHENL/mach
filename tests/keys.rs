@@ -2,6 +2,7 @@
 
 use std::process::Command;
 
+use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -2073,6 +2074,117 @@ fn bottom_control_scrolls_the_task_editor_without_moving_its_caret() {
             .description_bottom
             .is_empty()
     );
+}
+
+/// Both lists can be scrolled at once, so a Top control has to be picked out
+/// by the panel that owns it rather than by the first label on screen.
+fn control_center(buffer: &Buffer, control: Rect, label: &str) -> (u16, u16) {
+    assert!(!control.is_empty(), "{label} control is not on screen");
+    let y = control.y;
+    let drawn: String = (control.x..control.right())
+        .map(|x| buffer[(x, y)].symbol())
+        .collect();
+    assert_eq!(drawn.trim(), label, "{}", buffer_text(buffer));
+    (control.x + control.width / 2, y)
+}
+
+#[test]
+fn top_control_jumps_to_the_first_category_without_opening_it() {
+    let mut app = overflowing_app();
+    app.select_last_category();
+    app.focus = Focus::Sidebar;
+
+    let initial = draw(&mut app, 80, 16);
+    let (x, y) = control_center(&initial, app.areas.sidebar_top, "Top ↑");
+    click(&mut app, x, y);
+
+    assert_eq!(app.focus, Focus::Sidebar);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.category_form.is_none());
+    assert_eq!(app.cat_index, 0);
+    let _ = draw(&mut app, 80, 16);
+    assert!(app.areas.sidebar_top.is_empty());
+}
+
+#[test]
+fn top_control_jumps_to_the_first_task_without_opening_it() {
+    let mut app = overflowing_app();
+    app.select_last_category();
+    app.select_last_task();
+    app.focus = Focus::Tasks;
+
+    let initial = draw(&mut app, 80, 16);
+    let (x, y) = control_center(&initial, app.areas.tasks_top, "Top ↑");
+    click(&mut app, x, y);
+
+    assert_eq!(app.focus, Focus::Tasks);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.form.is_none());
+    assert_eq!(app.task_index, 0);
+    assert_eq!(app.selected_task().unwrap().title, "task 00");
+    let _ = draw(&mut app, 80, 16);
+    assert!(app.areas.tasks_top.is_empty());
+}
+
+#[test]
+fn top_control_scrolls_overflowing_preview_without_opening_the_editor() {
+    let mut app = app();
+    app.tasks[0].description = long_description();
+    app.settings.hint_level = "essential".into();
+
+    let initial = draw(&mut app, 120, 30);
+    // Nothing above the first line, so only Bottom is offered until it is used.
+    assert!(app.areas.preview_top.is_empty());
+    let (x, y) = find_cells(&initial, "Bottom ↓");
+    click(&mut app, x, y);
+
+    let scrolled = draw(&mut app, 120, 30);
+    let (x, y) = find_cells(&scrolled, "Top ↑");
+    assert!(!app.areas.preview_top.is_empty());
+    click(&mut app, x, y);
+
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(
+        app.form.is_none(),
+        "the control must not open the task editor"
+    );
+    assert_eq!(app.preview_form.as_ref().unwrap().description.scroll(), 0);
+
+    let at_top = buffer_text(&draw(&mut app, 120, 30));
+    assert!(!at_top.contains("Top ↑"), "{at_top}");
+    assert!(app.areas.preview_top.is_empty());
+}
+
+#[test]
+fn top_control_scrolls_the_task_editor_without_moving_its_caret() {
+    let mut app = app();
+    app.tasks[0].description = long_description();
+    app.open_edit_task();
+
+    let initial = draw(&mut app, 120, 30);
+    let (x, y) = find_cells(&initial, "Bottom ↓");
+    click(&mut app, x, y);
+
+    let scrolled = draw(&mut app, 120, 30);
+    let (x, y) = find_cells(&scrolled, "Top ↑");
+    let form = app.form.as_ref().unwrap();
+    assert!(!form.areas.description_top.is_empty());
+    let field = form.field;
+    let cursor = form.description.cursor_line();
+    let dirty = form.is_dirty();
+
+    click(&mut app, x, y);
+
+    let form = app.form.as_ref().unwrap();
+    assert_eq!(app.mode, Mode::TaskForm);
+    assert_eq!(form.field, field);
+    assert_eq!(form.description.cursor_line(), cursor);
+    assert_eq!(form.is_dirty(), dirty);
+    assert_eq!(form.description.scroll(), 0);
+
+    let at_top = buffer_text(&draw(&mut app, 120, 30));
+    assert!(!at_top.contains("Top ↑"), "{at_top}");
+    assert!(app.form.as_ref().unwrap().areas.description_top.is_empty());
 }
 
 #[test]

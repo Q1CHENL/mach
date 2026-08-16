@@ -470,7 +470,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
     form.areas.description = box_inner;
     let overlay = f.area();
     let image_occlusion = task_form_image_occlusion(form, overlay);
-    let description_bottom = draw_description(
+    let description_controls = draw_description(
         f,
         form,
         store,
@@ -482,7 +482,9 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
             external_occlusion: image_occlusion,
         },
     );
-    form.areas.description_bottom = description_bottom.unwrap_or_default();
+    form.areas.description_top = description_controls.top.unwrap_or_default();
+    form.areas.description_bottom = description_controls.bottom.unwrap_or_default();
+    areas.hover_control(HoverTarget::TaskDescriptionTop, form.areas.description_top);
     areas.hover_control(
         HoverTarget::TaskDescriptionBottom,
         form.areas.description_bottom,
@@ -680,7 +682,7 @@ fn draw_task_preview(
         ..
     } = app;
     if let Some(paint) = preview_form.as_mut() {
-        areas.preview_bottom = draw_description(
+        let controls = draw_description(
             f,
             paint,
             store,
@@ -691,8 +693,10 @@ fn draw_task_preview(
                 show_empty_hint: false,
                 external_occlusion: image_occlusion,
             },
-        )
-        .unwrap_or_default();
+        );
+        areas.preview_top = controls.top.unwrap_or_default();
+        areas.preview_bottom = controls.bottom.unwrap_or_default();
+        areas.hover_control(HoverTarget::PreviewTop, areas.preview_top);
         areas.hover_control(HoverTarget::PreviewBottom, areas.preview_bottom);
     }
 }
@@ -863,7 +867,7 @@ fn draw_description(
     theme: &Theme,
     area: Rect,
     options: DescriptionRenderOptions,
-) -> Option<Rect> {
+) -> ScrollControls {
     let crate::form::TaskForm {
         description,
         description_scroll,
@@ -940,7 +944,7 @@ fn draw_block_editor(
     previous_image_occlusions: &mut Vec<Rect>,
     previous_image_layout: &mut Vec<(std::path::PathBuf, u16, u16)>,
     image_frame_initialized: &mut bool,
-) -> Option<Rect> {
+) -> ScrollControls {
     if options.show_empty_hint && editor.is_empty() && editor.menu.is_none() {
         render_or_placeholder(f, area, "", "Press / for commands", theme);
     }
@@ -955,12 +959,15 @@ fn draw_block_editor(
         .collect();
     let menu_rect = slash_menu_rect(editor, area, cursor);
     *menu_area = menu_rect;
-    let bottom_control = (editor.menu.is_none())
-        .then(|| description_bottom_control_rect(editor, area))
-        .flatten();
-    let image_occlusions = [menu_rect, options.external_occlusion, bottom_control]
+    let controls = if editor.menu.is_none() {
+        description_scroll_controls(editor, area)
+    } else {
+        ScrollControls::default()
+    };
+    let image_occlusions = [menu_rect, options.external_occlusion]
         .into_iter()
         .flatten()
+        .chain(controls.rects())
         .filter(|rect| rect.width > 0 && rect.height > 0 && rects_overlap(*rect, area))
         .collect::<Vec<_>>();
     // Graphics protocols ignore cell Clear. Drop placements when overlays,
@@ -1020,42 +1027,78 @@ fn draw_block_editor(
         f.set_cursor_position((area.x.saturating_add(col), area.y.saturating_add(row)));
     }
 
-    if let Some(button) = bottom_control {
-        draw_bottom_control(f, theme, button);
-    }
+    draw_scroll_controls(f, theme, controls);
     draw_slash_menu(f, editor, theme, area, cursor);
-    bottom_control
+    controls
 }
 
+const TOP_CONTROL_LABEL: &str = " Top ↑ ";
 const BOTTOM_CONTROL_LABEL: &str = " Bottom ↓ ";
 
-fn description_bottom_control_rect(
-    editor: &crate::description::DescriptionEditor,
-    area: Rect,
-) -> Option<Rect> {
-    let visible = usize::from(area.height);
-    let max_scroll = editor.content_height().saturating_sub(visible);
-    bottom_control_rect(area, editor.scroll() < max_scroll)
+/// The jump controls floating over an overflowing list or description: Top on
+/// its first row, Bottom on its last, each shown only while there is content
+/// that way to reach.
+#[derive(Debug, Default, Clone, Copy)]
+struct ScrollControls {
+    top: Option<Rect>,
+    bottom: Option<Rect>,
 }
 
-fn list_bottom_control_rect(area: Rect, total: usize, offset: usize) -> Option<Rect> {
-    bottom_control_rect(
+impl ScrollControls {
+    fn rects(self) -> impl Iterator<Item = Rect> {
+        [self.top, self.bottom].into_iter().flatten()
+    }
+}
+
+fn description_scroll_controls(
+    editor: &crate::description::DescriptionEditor,
+    area: Rect,
+) -> ScrollControls {
+    let visible = usize::from(area.height);
+    let max_scroll = editor.content_height().saturating_sub(visible);
+    scroll_controls(area, editor.scroll() > 0, editor.scroll() < max_scroll)
+}
+
+fn list_scroll_controls(area: Rect, total: usize, offset: usize) -> ScrollControls {
+    scroll_controls(
         area,
+        offset > 0,
         offset.saturating_add(usize::from(area.height)) < total,
     )
 }
 
-fn bottom_control_rect(area: Rect, has_more: bool) -> Option<Rect> {
-    if area.height == 0 || !has_more {
+fn scroll_controls(area: Rect, has_above: bool, has_below: bool) -> ScrollControls {
+    let bottom = scroll_control_rect(
+        area,
+        BOTTOM_CONTROL_LABEL,
+        area.bottom().saturating_sub(1),
+        has_below,
+    );
+    // A single row cannot carry both, and the two would land on top of each
+    // other. Bottom keeps the row: a list is read downwards, so its far end is
+    // the reach that reading cannot already give you.
+    ScrollControls {
+        top: scroll_control_rect(
+            area,
+            TOP_CONTROL_LABEL,
+            area.y,
+            has_above && (area.height > 1 || bottom.is_none()),
+        ),
+        bottom,
+    }
+}
+
+fn scroll_control_rect(area: Rect, label: &str, y: u16, shown: bool) -> Option<Rect> {
+    if area.height == 0 || !shown {
         return None;
     }
-    let width = u16::try_from(BOTTOM_CONTROL_LABEL.width()).unwrap_or(u16::MAX);
+    let width = u16::try_from(label.width()).unwrap_or(u16::MAX);
     if area.width < width {
         return None;
     }
     Some(centered(
         Rect {
-            y: area.bottom() - 1,
+            y,
             height: 1,
             ..area
         },
@@ -1064,12 +1107,16 @@ fn bottom_control_rect(area: Rect, has_more: bool) -> Option<Rect> {
     ))
 }
 
-fn draw_bottom_control(f: &mut Frame, theme: &Theme, area: Rect) {
-    clear_overlay(f, area);
-    f.render_widget(
-        Paragraph::new(Line::styled(BOTTOM_CONTROL_LABEL, theme.control())),
-        area,
-    );
+fn draw_scroll_controls(f: &mut Frame, theme: &Theme, controls: ScrollControls) {
+    for (area, label) in [
+        (controls.top, TOP_CONTROL_LABEL),
+        (controls.bottom, BOTTOM_CONTROL_LABEL),
+    ] {
+        if let Some(area) = area {
+            clear_overlay(f, area);
+            f.render_widget(Paragraph::new(Line::styled(label, theme.control())), area);
+        }
+    }
 }
 
 /// Wipe `area` for an overlay dropped into the middle of a text row.
@@ -2350,14 +2397,16 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             );
         }
     }
-    if panels_accept_mouse(app)
-        && !app.searching
-        && let Some(control) =
-            list_bottom_control_rect(list_area, app.categories.len(), app.cat_state.offset())
-    {
-        app.areas.sidebar_bottom = control;
-        draw_bottom_control(f, theme, control);
-        app.areas.hover_control(HoverTarget::SidebarBottom, control);
+    if panels_accept_mouse(app) && !app.searching {
+        let controls =
+            list_scroll_controls(list_area, app.categories.len(), app.cat_state.offset());
+        app.areas.sidebar_top = controls.top.unwrap_or_default();
+        app.areas.sidebar_bottom = controls.bottom.unwrap_or_default();
+        draw_scroll_controls(f, theme, controls);
+        app.areas
+            .hover_control(HoverTarget::SidebarTop, app.areas.sidebar_top);
+        app.areas
+            .hover_control(HoverTarget::SidebarBottom, app.areas.sidebar_bottom);
     }
     if let Some(hint_area) = hint_area {
         f.render_widget(
@@ -2554,13 +2603,15 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
             crate::app::TaskListRow::Task(_) => {}
         }
     }
-    if panels_accept_mouse(app)
-        && let Some(control) =
-            list_bottom_control_rect(inner, app.list_rows.len(), app.task_state.offset())
-    {
-        app.areas.tasks_bottom = control;
-        draw_bottom_control(f, theme, control);
-        app.areas.hover_control(HoverTarget::TasksBottom, control);
+    if panels_accept_mouse(app) {
+        let controls = list_scroll_controls(inner, app.list_rows.len(), app.task_state.offset());
+        app.areas.tasks_top = controls.top.unwrap_or_default();
+        app.areas.tasks_bottom = controls.bottom.unwrap_or_default();
+        draw_scroll_controls(f, theme, controls);
+        app.areas
+            .hover_control(HoverTarget::TasksTop, app.areas.tasks_top);
+        app.areas
+            .hover_control(HoverTarget::TasksBottom, app.areas.tasks_bottom);
     }
 
     if let Some(scrollbar) = paint_scrollbar(

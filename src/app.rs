@@ -350,17 +350,21 @@ struct ScrollbarDrag {
 pub(crate) enum HoverTarget {
     Occluded,
     Sidebar(usize),
+    SidebarTop,
     SidebarBottom,
     Task(usize),
     TaskDone(usize),
+    TasksTop,
     TasksBottom,
     SlashCommand(usize),
     TaskCategory(usize),
     TaskLabel(usize),
     TaskLabelCheck(usize),
     TaskDescriptionCommand(usize),
+    TaskDescriptionTop,
     TaskDescriptionBottom,
     CategoryDescriptionCommand(usize),
+    PreviewTop,
     PreviewBottom,
     Label(usize),
     DueDay(NaiveDate),
@@ -388,10 +392,12 @@ pub(crate) struct HoverHit {
 #[derive(Debug, Default, Clone)]
 pub struct Areas {
     pub sidebar: Rect,
-    /// Centered Bottom control shown over an overflowing category list.
+    /// Centered Top and Bottom controls over an overflowing category list.
+    pub sidebar_top: Rect,
     pub sidebar_bottom: Rect,
     pub tasks: Rect,
-    /// Centered Bottom control shown over an overflowing task list.
+    /// Centered Top and Bottom controls over an overflowing task list.
+    pub tasks_top: Rect,
     pub tasks_bottom: Rect,
     /// Inner row of the bottom command bar, including its clock.
     pub command_bar: Rect,
@@ -399,7 +405,9 @@ pub struct Areas {
     pub preview: Rect,
     /// Visible description body inside the read-only task preview.
     pub preview_description: Rect,
-    /// Centered Bottom control shown over an overflowing read-only description.
+    /// Centered Top and Bottom controls over an overflowing read-only
+    /// description.
+    pub preview_top: Rect,
     pub preview_bottom: Rect,
     /// Screen columns of the flag and done markers, as the table laid
     /// them out. `done_x` is the left edge of the `[ ]`/`[✓]` column
@@ -2068,6 +2076,10 @@ impl App {
             self.clear_typeahead();
             self.on_category_changed();
         }
+    }
+
+    pub fn select_first_category(&mut self) {
+        self.select_category(0);
     }
 
     pub fn select_last_category(&mut self) {

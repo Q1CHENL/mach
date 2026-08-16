@@ -1121,6 +1121,76 @@ fn the_bottom_control_survives_a_wide_grapheme_against_its_left_edge() {
     }
 }
 
+/// Each control is offered only while there is content that way to reach, so
+/// a list that is scrolled to one end shows the other end's control alone.
+#[test]
+fn the_scroll_controls_follow_what_is_left_to_reach() {
+    let mut app = app_overflowing_with((0..60).map(|index| format!("task {index}")));
+
+    app.select_first_task();
+    let at_top = render(&mut app, 100, 30);
+    assert!(!at_top.contains("Top ↑"), "{at_top}");
+    assert!(at_top.contains("Bottom ↓"), "{at_top}");
+
+    app.select_last_task();
+    let at_bottom = render(&mut app, 100, 30);
+    assert!(at_bottom.contains("Top ↑"), "{at_bottom}");
+    assert!(!at_bottom.contains("Bottom ↓"), "{at_bottom}");
+
+    app.select_task(30);
+    let midway = render(&mut app, 100, 30);
+    assert!(midway.contains("Top ↑"), "{midway}");
+    assert!(midway.contains("Bottom ↓"), "{midway}");
+}
+
+/// The two controls sit on the first and last row of what they scroll, which
+/// are the same row once that is one row tall. Bottom keeps it.
+#[test]
+fn a_one_row_description_carries_the_bottom_control_alone() {
+    let mut app = sample_app();
+    app.tasks[0].description = (0..40)
+        .map(|index| Block::text(&format!("description line {index}")))
+        .collect();
+    app.invalidate_preview();
+    app.rebuild_view();
+    app.open_edit_task();
+
+    let height = (16..34)
+        .find(|height| {
+            let _ = draw(&mut app, 100, *height);
+            app.form.as_ref().unwrap().areas.description.height == 1
+        })
+        .expect("some window height leaves the description box a single row");
+
+    // Scrolled into the middle both ends are reachable, but one row cannot
+    // carry both controls.
+    app.form.as_mut().unwrap().description.scroll_by(5, 1);
+    let _ = draw(&mut app, 100, height);
+
+    let form = app.form.as_ref().unwrap();
+    assert!(form.description.scroll() > 0);
+    assert!(form.areas.description_top.is_empty());
+    assert!(!form.areas.description_bottom.is_empty());
+}
+
+/// Wherever both controls are offered they must land on different rows.
+#[test]
+fn the_scroll_controls_never_share_a_row() {
+    let mut app = app_overflowing_with((0..60).map(|index| format!("task {index}")));
+    app.select_task(30);
+
+    for height in 16..40 {
+        for width in 60..100 {
+            let _ = draw(&mut app, width, height);
+            let (top, bottom) = (app.areas.tasks_top, app.areas.tasks_bottom);
+            if top.is_empty() || bottom.is_empty() {
+                continue;
+            }
+            assert_ne!(top.y, bottom.y, "overlap at {width}x{height}");
+        }
+    }
+}
+
 // ------------------------------------------------------- picture geometry
 
 /// A picture is letterboxed into its box, never cropped.

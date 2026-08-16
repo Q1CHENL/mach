@@ -223,6 +223,7 @@ pub struct FieldAreas {
     pub due: Rect,
     pub importance: Rect,
     pub description: Rect,
+    pub description_top: Rect,
     pub description_bottom: Rect,
 }
 
