@@ -1065,10 +1065,33 @@ fn bottom_control_rect(area: Rect, has_more: bool) -> Option<Rect> {
 }
 
 fn draw_bottom_control(f: &mut Frame, theme: &Theme, area: Rect) {
+    clear_overlay(f, area);
     f.render_widget(
         Paragraph::new(Line::styled(BOTTOM_CONTROL_LABEL, theme.control())),
         area,
     );
+}
+
+/// Wipe `area` for an overlay dropped into the middle of a text row.
+///
+/// A cell keeps the modifiers already on it, so without the wipe a finished
+/// task lends the overlay its strikethrough. A double-width grapheme on the
+/// left edge needs more than the wipe: the terminal paints both of its columns
+/// and the frame diff skips the column after a wide cell, so the overlay's own
+/// first cell never reaches the terminal. It then keeps the row's background
+/// until a resize redraws everything. Blank the half-covered grapheme, which
+/// could not have been drawn whole anyway.
+fn clear_overlay(f: &mut Frame, area: Rect) {
+    if area.x > f.area().x {
+        let buffer = f.buffer_mut();
+        for y in area.top()..area.bottom() {
+            let position = Position::new(area.x - 1, y);
+            if buffer.area.contains(position) && buffer[position].symbol().width() > 1 {
+                buffer[position].set_symbol(" ");
+            }
+        }
+    }
+    f.render_widget(Clear, area);
 }
 
 fn rects_overlap(a: Rect, b: Rect) -> bool {

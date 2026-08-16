@@ -1047,6 +1047,80 @@ fn survives_every_sort_order() {
     }
 }
 
+/// A task list that overflows far enough to float the Bottom control over
+/// its last row. `titles` decides what sits underneath it.
+fn app_overflowing_with(titles: impl Iterator<Item = String>) -> App {
+    let mut app = sample_app();
+    app.tasks = titles
+        .map(|title| Task::new(&title, 0, Some("c-work".into()), ""))
+        .collect();
+    app.rebuild_view();
+    app
+}
+
+/// The Bottom control floats over whatever row happens to be last, and a
+/// finished task draws its whole row struck through. Cell styles are patched
+/// rather than replaced, so the control has to wipe the cells it lands on —
+/// otherwise it reads as a struck-out, already-used button.
+#[test]
+fn the_bottom_control_is_not_struck_through_by_the_finished_row_beneath_it() {
+    let mut app = app_overflowing_with((0..60).map(|index| {
+        format!("finished task {index} with a title long enough to run under the control")
+    }));
+    for task in &mut app.tasks {
+        task.done = true;
+    }
+    app.rebuild_view();
+
+    let buffer = draw(&mut app, 100, 30);
+    let (x, y) = find_cells(&buffer, "Bottom ↓");
+
+    assert!(
+        (x..x + "Bottom ↓".chars().count() as u16)
+            .all(|x| !buffer[(x, y)].modifier.contains(Modifier::CROSSED_OUT)),
+        "{}",
+        buffer_text(&buffer)
+    );
+    // The wipe is the control's own cells, not the row it sits on. The label
+    // carries a pad space either side of the text, so the row resumes at x-2.
+    assert!(
+        buffer[(x - 2, y)].modifier.contains(Modifier::CROSSED_OUT),
+        "{}",
+        buffer_text(&buffer)
+    );
+}
+
+/// A wide grapheme paints both of its columns, and the frame diff skips the
+/// column after a wide cell. A CJK title ending against the Bottom control
+/// therefore swallowed the update for the control's first cell, which kept
+/// the row's background until a resize repainted the screen.
+///
+/// The title's leading pad shifts the grapheme boundary, so every alignment
+/// has to come out with the control's first cell sent to the terminal.
+#[test]
+fn the_bottom_control_survives_a_wide_grapheme_against_its_left_edge() {
+    for pad in 0..3 {
+        let prefix = "x".repeat(pad);
+        let mut app = app_overflowing_with(
+            (0..60).map(|index| format!("{prefix}任务标题很长很长很长很长很长很长很长很长{index}")),
+        );
+
+        let buffer = draw(&mut app, 100, 30);
+        let (x, y) = find_cells(&buffer, "Bottom ↓");
+        let first = x - 1;
+
+        let sent = Buffer::empty(buffer.area)
+            .diff(&buffer)
+            .into_iter()
+            .any(|(cx, cy, _)| (cx, cy) == (first, y));
+        assert!(
+            sent,
+            "pad {pad}: the control's first cell never reaches the terminal\n{}",
+            buffer_text(&buffer)
+        );
+    }
+}
+
 // ------------------------------------------------------- picture geometry
 
 /// A picture is letterboxed into its box, never cropped.
