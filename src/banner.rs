@@ -15,16 +15,16 @@ pub const BANNER_WIDTH: u16 = 35;
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 3] = [
     (
-        "Drag through long lists",
-        "Grab the scrollbar thumb in task and category lists, editors, pickers, and Labels to move directly through long content.",
+        "Jump back to the top",
+        "Overflowing category and task lists now show Top ↑ when there is content above.",
     ),
     (
-        "See before you click",
-        "Hover an unchecked task or label box to preview the change, and choose Bottom ↓ to jump through overflowing task and category lists.",
+        "Return to the start of a description",
+        "Overflowing previews and editors expose the same Top ↑ without moving the caret.",
     ),
     (
-        "Smoother image previews",
-        "Image previews prepare in the background so moving through image-heavy task lists stays responsive.",
+        "Cleaner jump controls",
+        "The floating controls wipe the cells they cover so they stay readable over finished rows.",
     ),
 ];
 
