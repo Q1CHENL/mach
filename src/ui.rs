@@ -135,6 +135,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_slash_palette(f, app, &theme, status);
     }
 
+    let centered_modal = matches!(
+        app.mode,
+        Mode::Help
+            | Mode::Settings
+            | Mode::Labels
+            | Mode::Welcome
+            | Mode::WhatsNew
+            | Mode::CategoryForm
+    ) || (app.mode == Mode::TaskForm && modal_task_form);
+    if centered_modal {
+        dim_underlay(f, area);
+    }
+
     match app.mode {
         Mode::Help => draw_help(f, app, &theme, area),
         Mode::Settings => draw_settings(f, app, &theme, area),
@@ -559,6 +572,7 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
             .or_else(|| form.description.images().first().cloned())
     {
         areas.occlude_hover(overlay);
+        dim_underlay(f, overlay);
         draw_image_preview(f, store, form, theme, &path, overlay);
     }
 }
@@ -3656,6 +3670,24 @@ fn draw_whats_new(f: &mut Frame, theme: &Theme, area: Rect) {
 }
 
 // ----------------------------------------------------------------- utils
+
+fn dim_underlay(f: &mut Frame, area: Rect) {
+    let buffer = f.buffer_mut();
+    let area = buffer.area.intersection(area);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buffer[(x, y)];
+            let (fg, bg) = (cell.fg, cell.bg);
+            cell.set_fg(crate::theme::dimmed(fg))
+                .set_bg(crate::theme::dimmed(bg))
+                .set_style(
+                    Style::new()
+                        .add_modifier(Modifier::DIM)
+                        .remove_modifier(Modifier::BOLD),
+                );
+        }
+    }
+}
 
 fn draw_box(f: &mut Frame, area: Rect, text: &str, style: Style) {
     let width = u16::try_from(text.width())
