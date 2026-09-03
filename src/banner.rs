@@ -72,7 +72,7 @@ pub const HELP_COLUMNS: [HelpRow; 17] = [
     ),
     row("type         jump to matching row", "Backspace ×2 delete"),
     row("Esc          back out", "Ctrl+C ×2    quit"),
-    row("Mouse        click, double-click, scroll", ""),
+    row("Mouse        click / scroll / resize panels", ""),
     row("", ""),
     heading(
         "COMMANDS  (press /)",

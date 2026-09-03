@@ -16,8 +16,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, Focus, HoverPaint, HoverTarget, MessageKind, Mode, SETTINGS_ITEMS, ScrollbarHit,
-    ScrollbarTarget, UpdateActivity,
+    App, Focus, HoverPaint, HoverTarget, MessageKind, Mode, PanelResizeHit, PanelSizeTarget,
+    SETTINGS_ITEMS, ScrollbarHit, ScrollbarTarget, UpdateActivity,
 };
 use crate::banner;
 use crate::due;
@@ -27,10 +27,15 @@ use crate::theme::Theme;
 
 /// Outer width of the sidebar, borders and padding included.
 pub const SIDEBAR_WIDTH: u16 = 26;
+/// Narrowest useful Categories panel, including its border and padding.
+const SIDEBAR_MIN_WIDTH: u16 = 16;
+/// Narrowest useful Tasks column, including its border and padding.
+const TASKS_COLUMN_MIN_WIDTH: u16 = 20;
 /// `[ ]` / `[✓]` in the task list and description subtasks.
 pub const DONE_MARK_WIDTH: u16 = 3;
 const CHECKED_BOX: &str = "[✓]";
 const EMPTY_BOX: &str = "[ ]";
+const TASK_PREVIEW_TITLE: &str = "Task preview";
 
 fn checkbox_rect(row: Rect) -> Rect {
     Rect {
@@ -100,16 +105,54 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // divider, a gap on top of that is just slack.
     // A column of air between the panels keeps each one's focus colour
     // unambiguous.
-    let [sidebar, right] =
-        Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(20)])
-            .spacing(1)
-            .areas(content);
+    let sidebar_max = content
+        .width
+        .saturating_sub(TASKS_COLUMN_MIN_WIDTH + 1)
+        .max(SIDEBAR_MIN_WIDTH);
+    let sidebar_width = bounded_panel_size(
+        app.panel_size(PanelSizeTarget::Sidebar),
+        SIDEBAR_WIDTH,
+        SIDEBAR_MIN_WIDTH,
+        sidebar_max,
+    );
+    let [sidebar, right] = Layout::horizontal([
+        Constraint::Length(sidebar_width),
+        Constraint::Min(TASKS_COLUMN_MIN_WIDTH),
+    ])
+    .spacing(1)
+    .areas(content);
+    if panels_resizable(app) {
+        let handle = Rect::new(
+            sidebar.right(),
+            content.y,
+            right.x.saturating_sub(sidebar.right()).saturating_add(1),
+            content.height,
+        );
+        app.areas.register_panel_resize(PanelResizeHit::new(
+            PanelSizeTarget::Sidebar,
+            handle,
+            sidebar.width,
+            SIDEBAR_MIN_WIDTH,
+            sidebar_max,
+        ));
+    }
 
     let mut modal_task_form = false;
     draw_sidebar(f, app, &theme, sidebar);
-    if let Some((list, preview_rect)) =
-        split_tasks_and_preview(right, &app.settings.preview_position)
-    {
+    if let Some(split) = split_tasks_and_preview(
+        right,
+        &app.settings.preview_position,
+        app.panel_size(PanelSizeTarget::PreviewBottom),
+        app.panel_size(PanelSizeTarget::PreviewRight),
+    ) {
+        let PreviewSplit {
+            list,
+            preview: preview_rect,
+            resize,
+        } = split;
+        if panels_resizable(app) {
+            app.areas.register_panel_resize(resize);
+        }
         app.areas.preview = preview_rect;
         draw_tasks(f, app, &theme, list);
         match app.mode {
@@ -129,6 +172,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             modal_task_form = true;
         }
     }
+    draw_panel_resize_highlights(f, app, &theme);
     draw_status(f, app, &theme, status);
     // Palette floats above the status bar.
     if app.mode == Mode::Slash {
@@ -207,6 +251,21 @@ fn draw_hover(f: &mut Frame, app: &mut App, theme: &Theme) {
     app.finish_hover_frame();
 }
 
+fn draw_panel_resize_highlights(f: &mut Frame, app: &mut App, theme: &Theme) {
+    app.reconcile_panel_resize_hover();
+    let highlighted_target = app.highlighted_panel_resize();
+    let buffer = f.buffer_mut();
+    let buffer_area = *buffer.area();
+    for resize in &app.areas.panel_resizes {
+        if highlighted_target != Some(resize.target) {
+            continue;
+        }
+        for edge in resize.affected_edges() {
+            buffer.set_style(buffer_area.intersection(edge), theme.accent_text());
+        }
+    }
+}
+
 fn paint_hover_background(f: &mut Frame, rect: Rect, style: Style) {
     let buffer = f.buffer_mut();
     let rect = buffer.area.intersection(rect);
@@ -220,39 +279,84 @@ fn paint_hover_background(f: &mut Frame, rect: Rect, style: Style) {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreviewSplit {
+    list: Rect,
+    preview: Rect,
+    resize: PanelResizeHit,
+}
+
+fn bounded_panel_size(preferred: Option<u16>, default: u16, min: u16, max: u16) -> u16 {
+    preferred.unwrap_or(default).clamp(min, max.max(min))
+}
+
 /// Split the right column into task list + preview when there is room.
 /// `position` is `"bottom"` (default) or `"right"`. Falls back to bottom
 /// when a side-by-side split will not fit, then to no preview.
-fn split_tasks_and_preview(right: Rect, position: &str) -> Option<(Rect, Rect)> {
+fn split_tasks_and_preview(
+    right: Rect,
+    position: &str,
+    bottom_height: Option<u16>,
+    right_width: Option<u16>,
+) -> Option<PreviewSplit> {
     if position == "right"
-        && let Some(pair) = split_preview_right(right)
+        && let Some(pair) = split_preview_right(right, right_width)
     {
         return Some(pair);
     }
-    split_preview_bottom(right)
+    split_preview_bottom(right, bottom_height)
 }
 
-fn split_preview_bottom(right: Rect) -> Option<(Rect, Rect)> {
+fn split_preview_bottom(right: Rect, preferred_height: Option<u16>) -> Option<PreviewSplit> {
     if right.height < PREVIEW_SPLIT_MIN {
         return None;
     }
+    let preview_max = right.height.saturating_sub(LIST_MIN);
+    let preview_height = bounded_panel_size(
+        preferred_height,
+        (right.height / 2).max(PREVIEW_MIN),
+        PREVIEW_MIN,
+        preview_max,
+    );
     let [list, preview] = Layout::vertical([
         Constraint::Min(LIST_MIN),
-        Constraint::Length((right.height / 2).max(PREVIEW_MIN)),
+        Constraint::Length(preview_height),
     ])
     .spacing(0)
     .areas(right);
     if list.height < LIST_MIN || preview.height < PREVIEW_MIN {
         return None;
     }
-    Some((list, preview))
+    let handle = Rect::new(
+        right.x,
+        preview.y.saturating_sub(1),
+        right.width,
+        2.min(right.bottom().saturating_sub(preview.y.saturating_sub(1))),
+    );
+    Some(PreviewSplit {
+        list,
+        preview,
+        resize: PanelResizeHit::new(
+            PanelSizeTarget::PreviewBottom,
+            handle,
+            preview.height,
+            PREVIEW_MIN,
+            preview_max,
+        ),
+    })
 }
 
-fn split_preview_right(right: Rect) -> Option<(Rect, Rect)> {
+fn split_preview_right(right: Rect, preferred_width: Option<u16>) -> Option<PreviewSplit> {
     if right.width < PREVIEW_SIDE_MIN || right.height < PREVIEW_MIN {
         return None;
     }
-    let preview_w = (right.width / 2).max(PREVIEW_WIDTH_MIN);
+    let preview_max = right.width.saturating_sub(LIST_WIDTH_MIN + 1);
+    let preview_w = bounded_panel_size(
+        preferred_width,
+        (right.width / 2).max(PREVIEW_WIDTH_MIN),
+        PREVIEW_WIDTH_MIN,
+        preview_max,
+    );
     let [list, preview] = Layout::horizontal([
         Constraint::Min(LIST_WIDTH_MIN),
         Constraint::Length(preview_w),
@@ -262,7 +366,23 @@ fn split_preview_right(right: Rect) -> Option<(Rect, Rect)> {
     if list.width < LIST_WIDTH_MIN || preview.width < PREVIEW_WIDTH_MIN {
         return None;
     }
-    Some((list, preview))
+    let handle = Rect::new(
+        list.right(),
+        right.y,
+        preview.x.saturating_sub(list.right()).saturating_add(1),
+        right.height,
+    );
+    Some(PreviewSplit {
+        list,
+        preview,
+        resize: PanelResizeHit::new(
+            PanelSizeTarget::PreviewRight,
+            handle,
+            preview.width,
+            PREVIEW_WIDTH_MIN,
+            preview_max,
+        ),
+    })
 }
 
 // --------------------------------------------------------- task dialog
@@ -587,7 +707,7 @@ fn draw_task_preview(
 ) {
     let focused = false;
     let show_passive_hints = app.settings.show_passive_hints();
-    let block = panel("Task preview", focused, theme);
+    let block = panel(TASK_PREVIEW_TITLE, focused, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
@@ -2648,6 +2768,10 @@ fn panels_accept_mouse(app: &App) -> bool {
         app.mode,
         Mode::Normal | Mode::Search | Mode::TaskForm | Mode::CategoryForm
     ) && !app.form.as_ref().is_some_and(|form| form.preview)
+}
+
+fn panels_resizable(app: &App) -> bool {
+    matches!(app.mode, Mode::Normal | Mode::Search)
 }
 
 /// If `vis` is the first task under a section header, do not let the table

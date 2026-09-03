@@ -154,17 +154,21 @@ fn release_click(app: &mut App, column: u16, row: u16) {
 }
 
 fn drag(app: &mut App, column: u16, from_row: u16, to_row: u16) {
-    click(app, column, from_row);
+    drag_between(app, column, from_row, column, to_row);
+}
+
+fn drag_between(app: &mut App, from_x: u16, from_y: u16, to_x: u16, to_y: u16) {
+    click(app, from_x, from_y);
     handle_event(
         app,
         Event::Mouse(MouseEvent {
             kind: MouseEventKind::Drag(MouseButton::Left),
-            column,
-            row: to_row,
+            column: to_x,
+            row: to_y,
             modifiers: KeyModifiers::NONE,
         }),
     );
-    release_click(app, column, to_row);
+    release_click(app, to_x, to_y);
 }
 
 fn repeat(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -1754,6 +1758,142 @@ fn long_description() -> Vec<Block> {
     (0..24)
         .map(|index| Block::text(&format!("description line {index}")))
         .collect()
+}
+
+#[test]
+fn main_panel_splitters_drag_and_clamp() {
+    let mut sidebar_app = app();
+    let (width, height) = (100, 30);
+    draw(&mut sidebar_app, width, height);
+
+    let sidebar_before = sidebar_app.areas.sidebar.width;
+    let sidebar_x = sidebar_app.areas.sidebar.right().saturating_add(2);
+    let sidebar_y = sidebar_app.areas.sidebar.y + sidebar_app.areas.sidebar.height / 2;
+    drag_between(
+        &mut sidebar_app,
+        sidebar_x,
+        sidebar_y,
+        sidebar_x + 10,
+        sidebar_y,
+    );
+    draw(&mut sidebar_app, width, height);
+    assert_eq!(sidebar_app.areas.sidebar.width, sidebar_before + 10);
+    let sidebar_after_drag = sidebar_app.areas.sidebar.width;
+    handle_event(
+        &mut sidebar_app,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: width - 1,
+            row: sidebar_y,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    draw(&mut sidebar_app, width, height);
+    assert_eq!(sidebar_app.areas.sidebar.width, sidebar_after_drag);
+
+    let sidebar_x = sidebar_app.areas.sidebar.right().saturating_add(2);
+    drag_between(&mut sidebar_app, sidebar_x, sidebar_y, 0, sidebar_y);
+    draw(&mut sidebar_app, width, height);
+    let sidebar_min = sidebar_app.areas.sidebar.width;
+    assert!(sidebar_min < sidebar_before);
+    let sidebar_x = sidebar_app.areas.sidebar.right().saturating_add(2);
+    drag_between(&mut sidebar_app, sidebar_x, sidebar_y, 0, sidebar_y);
+    draw(&mut sidebar_app, width, height);
+    assert_eq!(sidebar_app.areas.sidebar.width, sidebar_min);
+
+    let sidebar_x = sidebar_app.areas.sidebar.right().saturating_add(2);
+    drag_between(&mut sidebar_app, sidebar_x, sidebar_y, width - 1, sidebar_y);
+    draw(&mut sidebar_app, width, height);
+    let sidebar_max = sidebar_app.areas.sidebar.width;
+    assert!(sidebar_max > sidebar_before);
+    assert!(!sidebar_app.areas.tasks.is_empty());
+    let sidebar_x = sidebar_app.areas.sidebar.right().saturating_add(2);
+    drag_between(&mut sidebar_app, sidebar_x, sidebar_y, width - 1, sidebar_y);
+    draw(&mut sidebar_app, width, height);
+    assert_eq!(sidebar_app.areas.sidebar.width, sidebar_max);
+    draw(&mut sidebar_app, 60, 16);
+    assert!(!sidebar_app.areas.sidebar.is_empty());
+    assert!(!sidebar_app.areas.tasks.is_empty());
+    draw(&mut sidebar_app, width, height);
+    assert_eq!(sidebar_app.areas.sidebar.width, sidebar_max);
+
+    let mut bottom_app = app();
+    draw(&mut bottom_app, width, height);
+    let preview_before = bottom_app.areas.preview.height;
+    let split_x = bottom_app.areas.preview.x + bottom_app.areas.preview.width / 2;
+    let split_y = bottom_app.areas.preview.y;
+    drag_between(
+        &mut bottom_app,
+        split_x,
+        split_y,
+        split_x,
+        split_y.saturating_sub(4),
+    );
+    draw(&mut bottom_app, width, height);
+    assert_eq!(bottom_app.areas.preview.height, preview_before + 4);
+
+    let split_y = bottom_app.areas.preview.y;
+    drag_between(&mut bottom_app, split_x, split_y, split_x, 0);
+    draw(&mut bottom_app, width, height);
+    let preview_max = bottom_app.areas.preview.height;
+    assert!(preview_max > preview_before);
+    assert!(!bottom_app.areas.tasks.is_empty());
+    let split_y = bottom_app.areas.preview.y;
+    drag_between(&mut bottom_app, split_x, split_y, split_x, 0);
+    draw(&mut bottom_app, width, height);
+    assert_eq!(bottom_app.areas.preview.height, preview_max);
+
+    let split_y = bottom_app.areas.preview.y;
+    drag_between(&mut bottom_app, split_x, split_y, split_x, height - 1);
+    draw(&mut bottom_app, width, height);
+    let preview_min = bottom_app.areas.preview.height;
+    assert!(preview_min < preview_before);
+    let split_y = bottom_app.areas.preview.y;
+    drag_between(&mut bottom_app, split_x, split_y, split_x, height - 1);
+    draw(&mut bottom_app, width, height);
+    assert_eq!(bottom_app.areas.preview.height, preview_min);
+}
+
+#[test]
+fn right_preview_splitter_drags_and_clamps() {
+    let mut app = app();
+    app.settings.preview_position = "right".into();
+    let (width, height) = (120, 30);
+    draw(&mut app, width, height);
+
+    let preview_before = app.areas.preview.width;
+    let split_x = app.areas.preview.x.saturating_sub(1);
+    let split_y = app.areas.preview.y + app.areas.preview.height / 2;
+    drag_between(
+        &mut app,
+        split_x,
+        split_y,
+        split_x.saturating_sub(8),
+        split_y,
+    );
+    draw(&mut app, width, height);
+    assert_eq!(app.areas.preview.width, preview_before + 8);
+
+    let split_x = app.areas.preview.x.saturating_sub(1);
+    drag_between(&mut app, split_x, split_y, 0, split_y);
+    draw(&mut app, width, height);
+    let preview_max = app.areas.preview.width;
+    assert!(preview_max > preview_before);
+    assert!(!app.areas.tasks.is_empty());
+    let split_x = app.areas.preview.x.saturating_sub(1);
+    drag_between(&mut app, split_x, split_y, 0, split_y);
+    draw(&mut app, width, height);
+    assert_eq!(app.areas.preview.width, preview_max);
+
+    let split_x = app.areas.preview.x.saturating_sub(1);
+    drag_between(&mut app, split_x, split_y, width - 1, split_y);
+    draw(&mut app, width, height);
+    let preview_min = app.areas.preview.width;
+    assert!(preview_min < preview_before);
+    let split_x = app.areas.preview.x.saturating_sub(1);
+    drag_between(&mut app, split_x, split_y, width - 1, split_y);
+    draw(&mut app, width, height);
+    assert_eq!(app.areas.preview.width, preview_min);
 }
 
 #[test]

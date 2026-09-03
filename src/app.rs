@@ -344,6 +344,130 @@ struct ScrollbarDrag {
     grab_row: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PanelSizeTarget {
+    Sidebar,
+    PreviewBottom,
+    PreviewRight,
+}
+
+const PANEL_RESIZE_HOVER_DELAY: Duration = Duration::from_millis(100);
+
+impl PanelSizeTarget {
+    fn pointer_coordinate(self, position: Position) -> u16 {
+        match self {
+            Self::Sidebar | Self::PreviewRight => position.x,
+            Self::PreviewBottom => position.y,
+        }
+    }
+
+    fn size_delta(self, start: u16, current: u16) -> i32 {
+        match self {
+            Self::Sidebar => i32::from(current) - i32::from(start),
+            Self::PreviewBottom | Self::PreviewRight => i32::from(start) - i32::from(current),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PanelResizeHit {
+    pub target: PanelSizeTarget,
+    pub area: Rect,
+    pub current: u16,
+    pub min: u16,
+    pub max: u16,
+}
+
+impl PanelResizeHit {
+    pub(crate) fn new(
+        target: PanelSizeTarget,
+        area: Rect,
+        current: u16,
+        min: u16,
+        max: u16,
+    ) -> Self {
+        Self {
+            target,
+            area,
+            current,
+            min,
+            max,
+        }
+    }
+
+    pub(crate) fn affected_edges(self) -> [Rect; 2] {
+        match self.target {
+            PanelSizeTarget::Sidebar | PanelSizeTarget::PreviewRight => [
+                Rect::new(
+                    self.area.x.saturating_sub(1),
+                    self.area.y,
+                    1,
+                    self.area.height,
+                ),
+                Rect::new(
+                    self.area.right().saturating_sub(1),
+                    self.area.y,
+                    1,
+                    self.area.height,
+                ),
+            ],
+            PanelSizeTarget::PreviewBottom => [
+                Rect::new(self.area.x, self.area.y, self.area.width, 1),
+                Rect::new(
+                    self.area.x,
+                    self.area.bottom().saturating_sub(1),
+                    self.area.width,
+                    1,
+                ),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PanelResizeDrag {
+    hit: PanelResizeHit,
+    start: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PanelResizeHover {
+    target: PanelSizeTarget,
+    reveal_at: Instant,
+    visible: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MouseDrag {
+    Scrollbar(ScrollbarDrag),
+    PanelResize(PanelResizeDrag),
+}
+
+#[derive(Debug, Default)]
+struct PanelSizes {
+    sidebar: Option<u16>,
+    preview_bottom: Option<u16>,
+    preview_right: Option<u16>,
+}
+
+impl PanelSizes {
+    fn get(&self, target: PanelSizeTarget) -> Option<u16> {
+        match target {
+            PanelSizeTarget::Sidebar => self.sidebar,
+            PanelSizeTarget::PreviewBottom => self.preview_bottom,
+            PanelSizeTarget::PreviewRight => self.preview_right,
+        }
+    }
+
+    fn set(&mut self, target: PanelSizeTarget, size: u16) {
+        *match target {
+            PanelSizeTarget::Sidebar => &mut self.sidebar,
+            PanelSizeTarget::PreviewBottom => &mut self.preview_bottom,
+            PanelSizeTarget::PreviewRight => &mut self.preview_right,
+        } = Some(size);
+    }
+}
+
 /// Semantic mouse targets. Identity is deliberately independent of screen
 /// coordinates so moving within one control does not request another frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +493,7 @@ pub(crate) enum HoverTarget {
     Label(usize),
     DueDay(NaiveDate),
     Scrollbar(ScrollbarTarget),
+    PanelResize(PanelSizeTarget),
 }
 
 /// Hover paint is kept separate from hit geometry so modal chrome can block
@@ -425,6 +550,7 @@ pub struct Areas {
     pub label_name_input: Rect,
     pub label_color_hits: Vec<(LabelColor, Rect)>,
     pub(crate) scrollbars: Vec<ScrollbarHit>,
+    pub(crate) panel_resizes: Vec<PanelResizeHit>,
     pub(crate) label_flow_rows: Vec<u16>,
     pub(crate) hover_hits: Vec<HoverHit>,
 }
@@ -436,17 +562,20 @@ impl Areas {
         let mut label_hits = std::mem::take(&mut self.label_hits);
         let mut label_color_hits = std::mem::take(&mut self.label_color_hits);
         let mut scrollbars = std::mem::take(&mut self.scrollbars);
+        let mut panel_resizes = std::mem::take(&mut self.panel_resizes);
         let mut label_flow_rows = std::mem::take(&mut self.label_flow_rows);
         let mut hover_hits = std::mem::take(&mut self.hover_hits);
         label_hits.clear();
         label_color_hits.clear();
         scrollbars.clear();
+        panel_resizes.clear();
         label_flow_rows.clear();
         hover_hits.clear();
         *self = Self {
             label_hits,
             label_color_hits,
             scrollbars,
+            panel_resizes,
             label_flow_rows,
             hover_hits,
             ..Self::default()
@@ -480,6 +609,11 @@ impl Areas {
     pub(crate) fn register_scrollbar(&mut self, scrollbar: ScrollbarHit) {
         self.hover_no_paint(HoverTarget::Scrollbar(scrollbar.target), scrollbar.track);
         self.scrollbars.push(scrollbar);
+    }
+
+    pub(crate) fn register_panel_resize(&mut self, resize: PanelResizeHit) {
+        self.hover_no_paint(HoverTarget::PanelResize(resize.target), resize.area);
+        self.panel_resizes.push(resize);
     }
 
     fn hover(&mut self, target: HoverTarget, hit: Rect, paint: HoverPaint) {
@@ -599,7 +733,9 @@ pub struct App {
     pub areas: Areas,
     mouse_position: Option<Position>,
     hover_target: Option<HoverTarget>,
-    scrollbar_drag: Option<ScrollbarDrag>,
+    mouse_drag: Option<MouseDrag>,
+    panel_resize_hover: Option<PanelResizeHover>,
+    panel_sizes: PanelSizes,
     /// Description/preview image store.
     pub images: ImageStore,
     pub(crate) attachments: Vec<Attachment>,
@@ -749,7 +885,9 @@ impl App {
             areas: Areas::default(),
             mouse_position: None,
             hover_target: None,
-            scrollbar_drag: None,
+            mouse_drag: None,
+            panel_resize_hover: None,
+            panel_sizes: PanelSizes::default(),
             images,
             attachments,
             typeahead: String::new(),
@@ -1535,79 +1673,211 @@ impl App {
 
     /// Remember the pointer and report only semantic hover transitions.
     pub(crate) fn track_mouse(&mut self, column: u16, row: u16) -> bool {
+        self.track_mouse_at(column, row, Instant::now())
+    }
+
+    fn track_mouse_at(&mut self, column: u16, row: u16, now: Instant) -> bool {
         let position = Position { x: column, y: row };
         self.mouse_position = Some(position);
         let target = self.areas.hover_hit_at(position).map(|hit| hit.target);
         let changed = target != self.hover_target;
         self.hover_target = target;
-        changed
+        let resize_target = self.panel_resize_target_at(position);
+        let resize_changed = self.set_panel_resize_hover(resize_target, now);
+        changed || resize_changed
     }
 
     pub(crate) fn mouse_position(&self) -> Option<Position> {
         self.mouse_position
     }
 
-    pub(crate) fn begin_scrollbar_drag(&mut self, column: u16, row: u16) -> bool {
+    pub(crate) fn panel_size(&self, target: PanelSizeTarget) -> Option<u16> {
+        self.panel_sizes.get(target)
+    }
+
+    pub(crate) fn active_panel_resize(&self) -> Option<PanelSizeTarget> {
+        match self.mouse_drag {
+            Some(MouseDrag::PanelResize(drag)) => Some(drag.hit.target),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn reconcile_panel_resize_hover(&mut self) {
+        let target = self
+            .mouse_position
+            .and_then(|position| self.panel_resize_target_at(position));
+        self.set_panel_resize_hover(target, Instant::now());
+    }
+
+    pub(crate) fn highlighted_panel_resize(&self) -> Option<PanelSizeTarget> {
+        self.active_panel_resize().or_else(|| {
+            self.panel_resize_hover
+                .filter(|hover| hover.visible)
+                .map(|hover| hover.target)
+        })
+    }
+
+    pub(crate) fn panel_resize_hover_wait(&self) -> Option<Duration> {
+        self.panel_resize_hover_wait_at(Instant::now())
+    }
+
+    fn panel_resize_hover_wait_at(&self, now: Instant) -> Option<Duration> {
+        self.panel_resize_hover
+            .filter(|hover| !hover.visible)
+            .map(|hover| hover.reveal_at.saturating_duration_since(now))
+    }
+
+    pub(crate) fn poll_panel_resize_hover(&mut self) -> bool {
+        self.poll_panel_resize_hover_at(Instant::now())
+    }
+
+    fn poll_panel_resize_hover_at(&mut self, now: Instant) -> bool {
+        let Some(hover) = self.panel_resize_hover else {
+            return false;
+        };
+        if hover.visible || now < hover.reveal_at {
+            return false;
+        }
+        let target = self
+            .mouse_position
+            .and_then(|position| self.panel_resize_target_at(position));
+        if target != Some(hover.target) {
+            self.panel_resize_hover = None;
+            return false;
+        }
+        self.panel_resize_hover = Some(PanelResizeHover {
+            visible: true,
+            ..hover
+        });
+        true
+    }
+
+    fn panel_resize_target_at(&self, position: Position) -> Option<PanelSizeTarget> {
+        self.areas
+            .panel_resizes
+            .iter()
+            .rev()
+            .find(|resize| resize.area.contains(position))
+            .map(|resize| resize.target)
+    }
+
+    fn set_panel_resize_hover(&mut self, target: Option<PanelSizeTarget>, now: Instant) -> bool {
+        let was_visible = self
+            .panel_resize_hover
+            .filter(|hover| hover.visible)
+            .map(|hover| hover.target);
+        if self.panel_resize_hover.map(|hover| hover.target) != target {
+            self.panel_resize_hover = target.map(|target| PanelResizeHover {
+                target,
+                reveal_at: now + PANEL_RESIZE_HOVER_DELAY,
+                visible: false,
+            });
+        }
+        let is_visible = self
+            .panel_resize_hover
+            .filter(|hover| hover.visible)
+            .map(|hover| hover.target);
+        was_visible != is_visible
+    }
+
+    pub(crate) fn begin_mouse_drag(&mut self, column: u16, row: u16) -> bool {
         let position = Position { x: column, y: row };
-        let Some(HoverTarget::Scrollbar(target)) =
-            self.areas.hover_hit_at(position).map(|hit| hit.target)
-        else {
-            return false;
-        };
-        if !self.scrollbar_target_active(target) {
-            return false;
-        }
-        let Some(scrollbar) = self
+        if let Some(scrollbar) = self
             .areas
             .scrollbars
             .iter()
             .rev()
-            .find(|scrollbar| scrollbar.target == target && scrollbar.track.contains(position))
+            .find(|scrollbar| {
+                self.scrollbar_target_active(scrollbar.target) && scrollbar.track.contains(position)
+            })
             .copied()
-        else {
-            return false;
-        };
-        let on_thumb = scrollbar.thumb.contains(position);
-        let grab_row = if on_thumb {
-            row.saturating_sub(scrollbar.thumb.y)
-        } else {
-            scrollbar.thumb.height / 2
-        };
-        self.scrollbar_drag = Some(ScrollbarDrag { target, grab_row });
-        if !on_thumb {
-            let offset = scrollbar.offset_at(row, grab_row);
-            self.apply_scrollbar_offset(target, offset, scrollbar.visible);
+        {
+            let on_thumb = scrollbar.thumb.contains(position);
+            let grab_row = if on_thumb {
+                row.saturating_sub(scrollbar.thumb.y)
+            } else {
+                scrollbar.thumb.height / 2
+            };
+            self.mouse_drag = Some(MouseDrag::Scrollbar(ScrollbarDrag {
+                target: scrollbar.target,
+                grab_row,
+            }));
+            if !on_thumb {
+                let offset = scrollbar.offset_at(row, grab_row);
+                self.apply_scrollbar_offset(scrollbar.target, offset, scrollbar.visible);
+            }
+            return true;
         }
-        true
-    }
 
-    pub(crate) fn drag_scrollbar(&mut self, row: u16) -> bool {
-        let Some(drag) = self.scrollbar_drag else {
-            return false;
-        };
-        if !self.scrollbar_target_active(drag.target) {
-            self.scrollbar_drag = None;
+        if !matches!(self.mode, Mode::Normal | Mode::Search) {
             return false;
         }
-        let Some(scrollbar) = self
+        let Some(hit) = self
             .areas
-            .scrollbars
+            .panel_resizes
             .iter()
             .rev()
-            .find(|scrollbar| scrollbar.target == drag.target)
+            .find(|resize| resize.area.contains(position))
             .copied()
         else {
-            self.scrollbar_drag = None;
             return false;
         };
-        let grab_row = drag.grab_row.min(scrollbar.thumb.height.saturating_sub(1));
-        let offset = scrollbar.offset_at(row, grab_row);
-        self.apply_scrollbar_offset(drag.target, offset, scrollbar.visible);
+        self.begin_panel_resize_drag(hit, position);
         true
     }
 
-    pub(crate) fn end_scrollbar_drag(&mut self) -> bool {
-        self.scrollbar_drag.take().is_some()
+    fn begin_panel_resize_drag(&mut self, hit: PanelResizeHit, position: Position) {
+        self.mouse_drag = Some(MouseDrag::PanelResize(PanelResizeDrag {
+            hit,
+            start: hit.target.pointer_coordinate(position),
+        }));
+    }
+
+    pub(crate) fn drag_mouse(&mut self, column: u16, row: u16) -> bool {
+        let Some(drag) = self.mouse_drag else {
+            return false;
+        };
+        match drag {
+            MouseDrag::Scrollbar(drag) => {
+                if !self.scrollbar_target_active(drag.target) {
+                    self.mouse_drag = None;
+                    return false;
+                }
+                let Some(scrollbar) = self
+                    .areas
+                    .scrollbars
+                    .iter()
+                    .rev()
+                    .find(|scrollbar| scrollbar.target == drag.target)
+                    .copied()
+                else {
+                    self.mouse_drag = None;
+                    return false;
+                };
+                let grab_row = drag.grab_row.min(scrollbar.thumb.height.saturating_sub(1));
+                let offset = scrollbar.offset_at(row, grab_row);
+                self.apply_scrollbar_offset(drag.target, offset, scrollbar.visible);
+                true
+            }
+            MouseDrag::PanelResize(drag) => {
+                if !matches!(self.mode, Mode::Normal | Mode::Search) {
+                    self.mouse_drag = None;
+                    return false;
+                }
+                let position = Position { x: column, y: row };
+                let current = drag.hit.target.pointer_coordinate(position);
+                let delta = drag.hit.target.size_delta(drag.start, current);
+                let size = (i32::from(drag.hit.current) + delta)
+                    .clamp(i32::from(drag.hit.min), i32::from(drag.hit.max))
+                    as u16;
+                self.panel_sizes.set(drag.hit.target, size);
+                true
+            }
+        }
+    }
+
+    pub(crate) fn end_mouse_drag(&mut self) -> bool {
+        self.mouse_drag.take().is_some()
     }
 
     fn scrollbar_target_active(&self, target: ScrollbarTarget) -> bool {
@@ -3167,6 +3437,48 @@ mod tests {
         assert!(
             app.typeahead.graphemes(true).count() <= MAX_TITLE_LEN,
             "a held key must not grow the navigation query without bound"
+        );
+    }
+
+    #[test]
+    fn panel_resize_hover_requires_intent_but_drag_highlights_immediately() {
+        let store = Store::open_in_memory_with_paths("/tmp/mach-panel-resize-hover-test")
+            .expect("open in-memory store");
+        let mut app = App::with_store("test", store).expect("build app");
+        app.mode = Mode::Normal;
+        app.areas.register_panel_resize(PanelResizeHit::new(
+            PanelSizeTarget::Sidebar,
+            Rect::new(10, 0, 2, 20),
+            26,
+            16,
+            79,
+        ));
+        let entered_at = Instant::now();
+
+        assert!(app.track_mouse_at(10, 5, entered_at));
+        assert_eq!(app.highlighted_panel_resize(), None);
+        assert_eq!(
+            app.panel_resize_hover_wait_at(entered_at),
+            Some(PANEL_RESIZE_HOVER_DELAY)
+        );
+        assert!(!app.poll_panel_resize_hover_at(
+            entered_at + PANEL_RESIZE_HOVER_DELAY - Duration::from_millis(1)
+        ));
+        assert_eq!(app.highlighted_panel_resize(), None);
+        assert!(app.poll_panel_resize_hover_at(entered_at + PANEL_RESIZE_HOVER_DELAY));
+        assert_eq!(
+            app.highlighted_panel_resize(),
+            Some(PanelSizeTarget::Sidebar)
+        );
+
+        assert!(app.track_mouse_at(0, 0, entered_at + PANEL_RESIZE_HOVER_DELAY));
+        assert_eq!(app.highlighted_panel_resize(), None);
+
+        assert!(app.track_mouse_at(10, 5, entered_at + PANEL_RESIZE_HOVER_DELAY));
+        assert!(app.begin_mouse_drag(10, 5));
+        assert_eq!(
+            app.highlighted_panel_resize(),
+            Some(PanelSizeTarget::Sidebar)
         );
     }
 

@@ -181,6 +181,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         if app.images.poll_pending() {
             app.mark_dirty();
         }
+        if app.poll_panel_resize_hover() {
+            app.mark_dirty();
+        }
 
         let gif_advanced = app.form.as_mut().is_some_and(|f| f.tick_gif());
         if gif_advanced {
@@ -198,6 +201,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             need_fast,
             app.images.has_pending(),
             app.background_work_active(),
+            app.panel_resize_hover_wait(),
             until_housekeeping,
         );
         let _ = event::poll(wait)?;
@@ -216,6 +220,7 @@ fn loop_wait(
     need_fast: bool,
     images_pending: bool,
     background_active: bool,
+    panel_resize_hover_wait: Option<Duration>,
     until_housekeeping: Duration,
 ) -> Duration {
     let activity_wait = if need_fast {
@@ -227,7 +232,8 @@ fn loop_wait(
     } else {
         HOUSEKEEPING_INTERVAL
     };
-    activity_wait.min(until_housekeeping)
+    let wait = activity_wait.min(until_housekeeping);
+    panel_resize_hover_wait.map_or(wait, |hover_wait| wait.min(hover_wait))
 }
 
 #[cfg(test)]
@@ -253,20 +259,30 @@ mod tests {
     #[test]
     fn housekeeping_deadline_caps_animation_and_idle_waits() {
         assert_eq!(
-            loop_wait(true, false, false, Duration::from_millis(10)),
+            loop_wait(true, false, false, None, Duration::from_millis(10)),
             Duration::from_millis(10),
         );
         assert_eq!(
-            loop_wait(true, false, false, Duration::from_millis(200)),
+            loop_wait(true, false, false, None, Duration::from_millis(200)),
             Duration::from_millis(30),
         );
         assert_eq!(
-            loop_wait(false, false, false, Duration::from_millis(200)),
+            loop_wait(false, false, false, None, Duration::from_millis(200)),
             Duration::from_millis(200),
         );
         assert_eq!(
-            loop_wait(false, false, true, Duration::from_millis(500)),
+            loop_wait(false, false, true, None, Duration::from_millis(500)),
             BACKGROUND_WAIT,
+        );
+        assert_eq!(
+            loop_wait(
+                false,
+                false,
+                false,
+                Some(Duration::from_millis(100)),
+                Duration::from_millis(500),
+            ),
+            Duration::from_millis(100),
         );
     }
 }
