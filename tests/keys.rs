@@ -1444,6 +1444,111 @@ fn double_clicking_a_label_starts_renaming_that_label() {
     assert_eq!(app.labels[1].color, LabelColor::Green);
 }
 
+/// A description with two pictures, its lightbox open on the first.
+fn two_picture_preview() -> FileApp {
+    let mut fixture = file_app();
+    let mut draft = mach::form::TaskDraft::new("gallery");
+    draft.description = vec![
+        mach::model::Block::image(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/screenshot.png"
+        )),
+        mach::model::Block::image(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/screenshot-help.png"
+        )),
+    ];
+    fixture.app.create_task(&draft).unwrap();
+    fixture.app.open_edit_task();
+    let form = fixture.app.form.as_mut().expect("the editor is open");
+    assert!(form.open_image_preview().is_none());
+    assert_eq!(form.preview_position(), (1, 2));
+    fixture
+}
+
+/// The picture the lightbox is on, as its position in the description.
+fn previewed(app: &App) -> (usize, usize) {
+    let form = app.form.as_ref().expect("the editor is open");
+    let path = form.preview_path().expect("a picture is being previewed");
+    let images = form.preview_images();
+    let index = images
+        .iter()
+        .position(|candidate| *candidate == path)
+        .expect("the previewed picture is one of the description's");
+    assert_eq!(
+        form.preview_position(),
+        (index + 1, images.len()),
+        "the counter must agree with the picture on screen"
+    );
+    (index, images.len())
+}
+
+#[test]
+fn arrow_keys_step_through_the_previewed_pictures() {
+    let mut fixture = two_picture_preview();
+
+    press(&mut fixture.app, KeyCode::Right, KeyModifiers::NONE);
+    assert_eq!(previewed(&fixture.app), (1, 2));
+
+    // Both ends wrap, so a gallery is a loop in either direction.
+    press(&mut fixture.app, KeyCode::Right, KeyModifiers::NONE);
+    assert_eq!(previewed(&fixture.app), (0, 2));
+    press(&mut fixture.app, KeyCode::Left, KeyModifiers::NONE);
+    assert_eq!(previewed(&fixture.app), (1, 2));
+
+    // Stepping never leaves the lightbox.
+    assert_eq!(fixture.app.mode, Mode::TaskForm);
+    assert!(fixture.app.form.as_ref().is_some_and(|form| form.preview));
+}
+
+#[test]
+fn clicking_the_lightbox_edges_steps_between_pictures() {
+    let mut fixture = two_picture_preview();
+    draw(&mut fixture.app, 100, 30);
+    let (prev, next) = {
+        let areas = &fixture.app.form.as_ref().unwrap().areas;
+        (areas.preview_prev, areas.preview_next)
+    };
+    assert!(prev.width > 0 && next.width > 0, "steppers should be drawn");
+    assert_eq!(prev.y, next.y, "both controls sit at the same height");
+    assert!(prev.x < next.x, "prev is the left edge, next the right");
+
+    click(&mut fixture.app, next.x, next.y + next.height / 2);
+    assert_eq!(previewed(&fixture.app), (1, 2));
+
+    click(&mut fixture.app, prev.x, prev.y + prev.height / 2);
+    assert_eq!(previewed(&fixture.app), (0, 2));
+
+    // The lightbox is still open: an edge click is not an outside click.
+    assert!(fixture.app.form.as_ref().is_some_and(|form| form.preview));
+}
+
+#[test]
+fn a_single_picture_has_no_steppers() {
+    let mut fixture = file_app();
+    let mut draft = mach::form::TaskDraft::new("one picture");
+    draft.description = vec![mach::model::Block::image(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/screenshot.png"
+    ))];
+    fixture.app.create_task(&draft).unwrap();
+    fixture.app.open_edit_task();
+    assert!(
+        fixture
+            .app
+            .form
+            .as_mut()
+            .unwrap()
+            .open_image_preview()
+            .is_none()
+    );
+    draw(&mut fixture.app, 100, 30);
+
+    let areas = &fixture.app.form.as_ref().unwrap().areas;
+    assert_eq!(areas.preview_prev, Rect::ZERO);
+    assert_eq!(areas.preview_next, Rect::ZERO);
+}
+
 #[test]
 fn image_preview_owns_clicks_over_the_underlying_panels() {
     let mut fixture = file_app();

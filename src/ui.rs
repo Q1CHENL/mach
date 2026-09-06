@@ -686,17 +686,18 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
         );
     }
 
-    // Preview the picture the cursor is on, or the first one otherwise.
+    // Preview the picture the lightbox is on.
     if form.preview
-        && let Some(path) = form
-            .description
-            .selected_image()
-            .or_else(|| form.description.images().first().cloned())
+        && let Some(path) = form.preview_path()
     {
         areas.occlude_hover(overlay);
         dim_underlay(f, overlay);
-        let rect = draw_image_preview(f, store, form, theme, &path, overlay);
-        form.areas.preview = rect;
+        let chrome = draw_image_preview(f, store, form, theme, &path, overlay, mouse_position);
+        form.areas.preview = chrome.outer;
+        form.areas.preview_prev = chrome.prev;
+        form.areas.preview_next = chrome.next;
+        areas.hover_no_paint(HoverTarget::PreviewPrevImage, chrome.prev);
+        areas.hover_no_paint(HoverTarget::PreviewNextImage, chrome.next);
     }
 }
 
@@ -1571,7 +1572,12 @@ fn draw_slash_menu(
 }
 
 fn task_form_image_occlusion(form: &crate::form::TaskForm, area: Rect) -> Option<Rect> {
-    if form.picker.is_some() {
+    if form.preview {
+        // The lightbox is modal over the whole frame. Graphics protocols
+        // ignore a cell Clear, so every description picture underneath has to
+        // give up its placement or it draws through the box.
+        Some(area)
+    } else if form.picker.is_some() {
         Some(due_picker_rect(form.areas.due, area))
     } else if form.category_picker_open() {
         let total_rows = form.category_choices().count();
@@ -2042,8 +2048,54 @@ pub fn image_preview_rect(area: Rect, picture: Option<Size>, spare_rows: u16) ->
     )
 }
 
+/// Where the lightbox and its controls ended up: the outer rect so clicks
+/// outside it can close the box, and the two stepping controls (`ZERO` when
+/// there is only one picture to show).
+pub(crate) struct PreviewChrome {
+    pub outer: Rect,
+    pub prev: Rect,
+    pub next: Rect,
+}
+
+/// Chevrons set into the lightbox frame, halfway down each side: muted until
+/// the pointer is on one, then as bright as the frame around it. Returns their
+/// click targets, which reach one column inside the frame so a single border
+/// column is not the whole target.
+fn preview_steppers(
+    f: &mut Frame,
+    theme: &Theme,
+    rect: Rect,
+    count: usize,
+    mouse: Option<Position>,
+) -> (Rect, Rect) {
+    if count < 2 || rect.width < PREVIEW_MIN_WIDTH || rect.height < 3 {
+        return (Rect::ZERO, Rect::ZERO);
+    }
+    let row = rect.y.saturating_add(rect.height / 2);
+    let target = |x: u16| Rect {
+        x,
+        y: row.saturating_sub(1),
+        width: 2,
+        height: 3,
+    };
+    let prev = target(rect.x);
+    let next = target(rect.right().saturating_sub(2));
+    for (hit, glyph, x) in [
+        (prev, "❮", rect.x),
+        (next, "❯", rect.right().saturating_sub(1)),
+    ] {
+        let hovered = mouse.is_some_and(|position| hit.contains(position));
+        let style = if hovered {
+            theme.accent_text().bold()
+        } else {
+            Style::new().fg(theme.muted_color())
+        };
+        f.buffer_mut().set_string(x, row, glyph, style);
+    }
+    (prev, next)
+}
+
 /// A description image at whatever size the screen allows.
-/// Returns the outer rect so clicks outside it can close the lightbox.
 fn draw_image_preview(
     f: &mut Frame,
     store: &mut crate::image::ImageStore,
@@ -2051,7 +2103,8 @@ fn draw_image_preview(
     theme: &Theme,
     path: &std::path::Path,
     area: Rect,
-) -> Rect {
+    mouse_position: Option<Position>,
+) -> PreviewChrome {
     let max = image_preview_bounds(area);
     let canvas_bounds = Size {
         width: max.width.saturating_sub(2 + PREVIEW_GAP_X * 2),
@@ -2089,11 +2142,6 @@ fn draw_image_preview(
         _ => 0,
     };
     let rect = image_preview_rect(area, picture, spare);
-    let title = truncate(
-        &path.file_name().unwrap_or_default().to_string_lossy(),
-        rect.width.saturating_sub(10) as usize,
-    );
-    let kind = crate::image::type_label(path);
     let anim_note = form
         .gif
         .as_ref()
@@ -2101,6 +2149,19 @@ fn draw_image_preview(
         .filter(|g| g.is_animated())
         .map(|g| format!(" · {}/{}", g.frame_number(), g.frame_count()))
         .unwrap_or_default();
+    let kind = crate::image::type_label(path);
+    let (position, count) = form.preview_position();
+    // Which of the description's pictures this is, when there are several.
+    let counter = if count > 1 {
+        format!("{position}/{count} · ")
+    } else {
+        String::new()
+    };
+    let metadata = format!(" {counter}{kind}{anim_note} ");
+    let title = truncate(
+        &path.file_name().unwrap_or_default().to_string_lossy(),
+        rect.width.saturating_sub(10) as usize,
+    );
     let block = Block::bordered()
         .border_type(BorderType::Thick)
         .border_style(theme.accent_text())
@@ -2109,11 +2170,7 @@ fn draw_image_preview(
             theme.accent_text().bold(),
         ))
         .title_top(
-            Line::styled(
-                format!(" {kind}{anim_note} "),
-                Style::new().fg(theme.muted_color()),
-            )
-            .right_aligned(),
+            Line::styled(metadata, Style::new().fg(theme.muted_color())).right_aligned(),
         )
         .title_bottom(
             Line::styled(
@@ -2139,6 +2196,9 @@ fn draw_image_preview(
         width: block_inner.width.saturating_sub(PREVIEW_GAP_X * 2),
         height: block_inner.height.saturating_sub(PREVIEW_GAP_Y + below),
     };
+    // The stepping controls sit in the frame itself, halfway down each side,
+    // so the picture keeps the whole inside to itself.
+    let (prev, next) = preview_steppers(f, theme, rect, count, mouse_position);
     // Draw into exactly what was measured. Handing the picture a larger area
     // than it was encoded for would have it re-encoded every frame.
     let canvas = match picture {
@@ -2197,7 +2257,11 @@ fn draw_image_preview(
             }
         }
     }
-    rect
+    PreviewChrome {
+        outer: rect,
+        prev,
+        next,
+    }
 }
 
 /// Draws a decoded image, or a loading / broken stand-in sized like the

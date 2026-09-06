@@ -500,6 +500,8 @@ pub(crate) enum HoverTarget {
     TaskDescriptionBottom,
     CategoryDescriptionCommand(usize),
     PreviewTop,
+    PreviewPrevImage,
+    PreviewNextImage,
     PreviewBottom,
     Label(usize),
     DueDay(NaiveDate),

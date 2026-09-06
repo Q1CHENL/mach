@@ -227,6 +227,10 @@ pub struct FieldAreas {
     pub description_bottom: Rect,
     /// The image lightbox's outer rect while it is open; `ZERO` otherwise.
     pub preview: Rect,
+    /// Its previous/next controls, drawn only when the description holds more
+    /// than one picture; `ZERO` otherwise.
+    pub preview_prev: Rect,
+    pub preview_next: Rect,
 }
 
 impl FieldAreas {
@@ -391,6 +395,9 @@ pub struct TaskForm {
     pub form_area: Rect,
     /// Whether the description's image is shown full size.
     pub preview: bool,
+    /// Which of the description's pictures the lightbox is showing, as an
+    /// index into `description.images()`.
+    preview_index: usize,
     /// Decoded GIF for preview, keyed by path (kept after close for fast reopen).
     pub gif: Option<(std::path::PathBuf, GifPlayback)>,
     /// GIF decode in progress; polled by the normal animation tick.
@@ -454,6 +461,7 @@ impl TaskForm {
             areas: FieldAreas::default(),
             form_area: Rect::ZERO,
             preview: false,
+            preview_index: 0,
             gif: None,
             gif_pending: None,
             picker: None,
@@ -853,11 +861,57 @@ impl TaskForm {
             self.preview = false;
             return Some("No image to preview".into());
         };
+        let images = self.description.images();
+        self.preview_index = images
+            .iter()
+            .position(|candidate| *candidate == path)
+            .unwrap_or(0);
         self.preview = true;
-        if crate::image::is_gif(&path) {
-            // Keep a decoded GIF across close/reopen while this form is open.
-            if matches!(&self.gif, Some((p, _)) if p == &path) {
-                return None;
+        self.adopt_preview_source(&path);
+        None
+    }
+
+    /// Every picture the lightbox can step through, in description order.
+    pub fn preview_images(&self) -> Vec<std::path::PathBuf> {
+        self.description.images()
+    }
+
+    /// The picture the lightbox is showing.
+    pub fn preview_path(&self) -> Option<std::path::PathBuf> {
+        self.preview_images().into_iter().nth(self.preview_index)
+    }
+
+    /// Its position in the description's pictures, counting from one, and how
+    /// many there are.
+    pub fn preview_position(&self) -> (usize, usize) {
+        let count = self.preview_images().len();
+        (self.preview_index.saturating_add(1).min(count), count)
+    }
+
+    /// Step to another picture, wrapping at both ends. Returns whether the
+    /// lightbox is now showing a different one.
+    pub fn step_preview_image(&mut self, delta: isize) -> bool {
+        let images = self.preview_images();
+        if images.len() < 2 {
+            return false;
+        }
+        let count = images.len() as isize;
+        let next = ((self.preview_index as isize + delta).rem_euclid(count)) as usize;
+        if next == self.preview_index {
+            return false;
+        }
+        self.preview_index = next;
+        let path = images[next].clone();
+        self.adopt_preview_source(&path);
+        true
+    }
+
+    /// Point the animation state at `path`: keep a decoded GIF across
+    /// close/reopen while this form is open, and drop it for a still.
+    fn adopt_preview_source(&mut self, path: &std::path::Path) {
+        if crate::image::is_gif(path) {
+            if matches!(&self.gif, Some((p, _)) if p == path) {
+                return;
             }
             if self
                 .gif_pending
@@ -865,21 +919,22 @@ impl TaskForm {
                 .is_none_or(|pending| pending.path() != path)
             {
                 self.gif = None;
-                self.gif_pending = Some(GifLoad::start(path));
+                self.gif_pending = Some(GifLoad::start(path.to_path_buf()));
             }
         } else {
             // Different still — drop any previous GIF cache.
-            if !matches!(&self.gif, Some((p, _)) if p == &path) {
+            if !matches!(&self.gif, Some((p, _)) if p == path) {
                 self.gif = None;
             }
             self.gif_pending = None;
         }
-        None
     }
 
     pub fn close_image_preview(&mut self) {
         self.preview = false;
         self.areas.preview = Rect::ZERO;
+        self.areas.preview_prev = Rect::ZERO;
+        self.areas.preview_next = Rect::ZERO;
         // Keep `gif` so reopening the same animation is instant.
     }
 

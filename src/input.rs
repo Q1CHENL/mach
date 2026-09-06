@@ -903,6 +903,23 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
 
 // ------------------------------------------------------------ task dialog
 
+/// Show another of the description's pictures in the open lightbox. The
+/// previous picture's frames and protocol are dropped so the next draw does
+/// not spend an encode tick on a picture nobody is looking at.
+fn step_preview_image(app: &mut App, delta: isize) {
+    let moved = app
+        .form
+        .as_mut()
+        .is_some_and(|form| form.step_preview_image(delta));
+    if moved {
+        // Drop every placement, not just the frames: the picture being left
+        // behind must give its graphics-protocol placement back, or it stays
+        // on screen under the next one.
+        app.images.release_form_graphics();
+        app.dirty = true;
+    }
+}
+
 /// Tab and the mouse move between fields. Ctrl+S saves; Enter acts on the
 /// focused field (and starts a new block in the description).
 fn handle_form_key(app: &mut App, key: KeyEvent) {
@@ -954,6 +971,11 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
                 if let Some(form) = &mut app.form {
                     form.preview_click();
                 }
+            }
+            // Several pictures in one description: step between them.
+            KeyCode::Left | KeyCode::Right => {
+                let delta = if key.code == KeyCode::Left { -1 } else { 1 };
+                step_preview_image(app, delta);
             }
             _ => {}
         }
@@ -2524,6 +2546,19 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
     // Click in the image preview: pause/resume GIF. A click outside it
     // closes the lightbox, like Esc.
     if app.form.as_ref().is_some_and(|f| f.preview) {
+        // The steppers sit inside the box, so they are hit-tested first.
+        if let Some(delta) = app.form.as_ref().and_then(|form| {
+            if contains(form.areas.preview_prev, m.column, m.row) {
+                Some(-1)
+            } else if contains(form.areas.preview_next, m.column, m.row) {
+                Some(1)
+            } else {
+                None
+            }
+        }) {
+            step_preview_image(app, delta);
+            return;
+        }
         let inside = app
             .form
             .as_ref()
