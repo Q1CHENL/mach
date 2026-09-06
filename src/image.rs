@@ -461,6 +461,12 @@ impl GifPlayback {
         true
     }
 
+    /// Pixel size of the frames, for grid measurement.
+    pub fn pixel_size(&self) -> (u32, u32) {
+        let frame = self.current();
+        (frame.width(), frame.height())
+    }
+
     pub fn current(&self) -> &DynamicImage {
         &self.frames[self.index]
     }
@@ -665,6 +671,27 @@ impl Default for ImageStore {
             protocol_retry: false,
         }
     }
+}
+
+/// How much of the bottom row of `cells` a scaled picture leaves empty, in
+/// whole rows (0 or 1). Mirrors the scaling the image protocols apply: the
+/// picture keeps its aspect and fills `bounds`, then is measured in cells
+/// rounded up, so up to one row of the reservation is never painted.
+fn spare_bottom_rows(pixels: (u32, u32), cells: Size, bounds: Size, font: FontSize) -> u16 {
+    let (width, height) = pixels;
+    if width == 0 || height == 0 || font.height == 0 {
+        return 0;
+    }
+    let available_width = u32::from(bounds.width) * u32::from(font.width);
+    let available_height = u32::from(bounds.height) * u32::from(font.height);
+    let ratio = f64::min(
+        f64::from(available_width) / f64::from(width),
+        f64::from(available_height) / f64::from(height),
+    );
+    let painted = (f64::from(height) * ratio).round().max(1.0);
+    let reserved = f64::from(u32::from(cells.height) * u32::from(font.height));
+    // Half a row is where the uneven gap starts to show.
+    u16::from(reserved - painted >= f64::from(font.height) / 2.0)
 }
 
 /// [`FontSize`] carries no `PartialEq`.
@@ -929,6 +956,25 @@ impl ImageStore {
 
     /// Full-screen preview protocol — kept separate from the description thumb so
     /// open → close → open does not thrash encode size every time.
+    /// Pixel size of a decoded picture, if it is in the cache.
+    pub fn pixel_size(&self, path: &Path) -> Option<(u32, u32)> {
+        match self.cache.get(path) {
+            Some(Ok(cached)) => Some((cached.image.width(), cached.image.height())),
+            _ => None,
+        }
+    }
+
+    /// Rows of its reserved `cells` that a picture of `pixels` leaves unpainted
+    /// inside `bounds`. Pictures are drawn in pixels but measured in whole
+    /// cells, so the last row can be mostly empty; a caller that puts a gap
+    /// under the picture can take that much of it back.
+    pub fn spare_bottom_rows(&self, pixels: (u32, u32), cells: Size, bounds: Size) -> u16 {
+        let Some(font) = self.picker.as_ref().map(|picker| picker.font_size()) else {
+            return 0;
+        };
+        spare_bottom_rows(pixels, cells, bounds, font)
+    }
+
     pub fn get_preview(&mut self, path: &Path, bounds: Size) -> ImageReady<'_> {
         self.protocol_for(path, true, bounds)
     }
@@ -1123,6 +1169,41 @@ pub fn short_in(path: &Path, images_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A picture is measured in whole cells but painted in pixels, so the
+    /// reservation can hold most of a row it never covers.
+    #[test]
+    fn a_picture_reports_the_row_it_leaves_unpainted() {
+        let font = FontSize::new(8, 16);
+        // 200x40 cells is 1600x640 px, so these are all width-bound and keep
+        // their pixel height.
+        let bounds = Size::new(200, 40);
+
+        // 400 px is exactly 25 rows: nothing spare.
+        assert_eq!(
+            spare_bottom_rows((1600, 400), Size::new(200, 25), bounds, font),
+            0
+        );
+        // 401 px reserves 26 rows and paints one of them almost not at all.
+        assert_eq!(
+            spare_bottom_rows((1600, 401), Size::new(200, 26), bounds, font),
+            1
+        );
+        // Half a row is where the uneven gap starts to show.
+        assert_eq!(
+            spare_bottom_rows((1600, 408), Size::new(200, 26), bounds, font),
+            1
+        );
+        assert_eq!(
+            spare_bottom_rows((1600, 409), Size::new(200, 26), bounds, font),
+            0
+        );
+        // A degenerate image has nothing to say.
+        assert_eq!(
+            spare_bottom_rows((0, 0), Size::new(200, 26), bounds, font),
+            0
+        );
+    }
 
     #[test]
     fn recognises_picture_extensions() {

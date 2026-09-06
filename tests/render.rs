@@ -1298,6 +1298,54 @@ fn a_picture_is_letterboxed_into_its_box_never_cropped() {
     }
 }
 
+/// The lightbox is sized by its picture, not by the terminal.
+#[test]
+fn the_image_lightbox_shrinks_to_the_picture_it_shows() {
+    use ratatui::layout::{Rect, Size};
+
+    let frame = Rect {
+        x: 0,
+        y: 0,
+        width: 200,
+        height: 60,
+    };
+    let full = ui::image_preview_rect(frame, None, 0);
+
+    // A wide screenshot: full width, but only as tall as it needs plus the
+    // border and the gap above and below.
+    let wide = ui::image_preview_rect(frame, Some(Size::new(174, 20)), 0);
+    assert_eq!(wide.width, 180);
+    assert_eq!(wide.height, 24);
+    assert!(wide.height < full.height, "{wide:?} vs {full:?}");
+
+    // A picture that leaves its last row mostly empty gets no gap under it;
+    // the unpainted remainder is the gap.
+    let short = ui::image_preview_rect(frame, Some(Size::new(174, 20)), 1);
+    assert_eq!(short.height, wide.height - 1);
+    assert_eq!(short.width, wide.width);
+
+    // A tall picture narrows the box the same way.
+    let tall = ui::image_preview_rect(frame, Some(Size::new(40, 50)), 0);
+    assert_eq!(tall.width, 46);
+    assert_eq!(tall.height, 54);
+
+    // Chrome keeps a floor under both.
+    let tiny = ui::image_preview_rect(frame, Some(Size::new(4, 1)), 0);
+    assert_eq!((tiny.width, tiny.height), (34, 5));
+
+    // Nothing grows past the frame, and both stay centered in it.
+    let huge = ui::image_preview_rect(frame, Some(Size::new(400, 400)), 0);
+    assert_eq!((huge.width, huge.height), (full.width, full.height));
+    for rect in [full, wide, short, tall, huge] {
+        assert!(rect.right() <= frame.right() && rect.bottom() <= frame.bottom());
+        assert_eq!(
+            rect.x + rect.width / 2,
+            frame.width / 2,
+            "{rect:?} should stay centered"
+        );
+    }
+}
+
 #[test]
 fn categories_scrollbar_track_uses_accent_when_focused() {
     let mut app = sample_app();

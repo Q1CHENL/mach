@@ -3,7 +3,7 @@
 //! block whose border lights up when it holds focus.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Text;
 use ratatui::text::{Line, Span};
@@ -2001,6 +2001,47 @@ fn draw_label_picker(
     }
 }
 
+/// Breathing room between the picture and the lightbox frame. Two columns to
+/// one row, because a terminal cell is about twice as tall as it is wide, so
+/// the gap reads as even on all four sides.
+const PREVIEW_GAP_X: u16 = 2;
+const PREVIEW_GAP_Y: u16 = 1;
+/// Room for the title and the closing hint, whatever the picture measures.
+const PREVIEW_MIN_WIDTH: u16 = 34;
+const PREVIEW_MIN_HEIGHT: u16 = 5;
+
+/// The largest the lightbox may grow inside the frame.
+fn image_preview_bounds(area: Rect) -> Rect {
+    centered(
+        area,
+        (u32::from(area.width) * 9 / 10) as u16,
+        (u32::from(area.height) * 9 / 10) as u16,
+    )
+}
+
+/// The lightbox is as big as the picture needs and no bigger: a wide
+/// screenshot gets a short box instead of a screen of empty frame. A picture
+/// whose aspect is not known yet — still decoding, or broken — keeps the full
+/// box, since there is nothing to size it by.
+pub fn image_preview_rect(area: Rect, picture: Option<Size>, spare_rows: u16) -> Rect {
+    let max = image_preview_bounds(area);
+    let Some(size) = picture else {
+        return max;
+    };
+    let below = PREVIEW_GAP_Y.saturating_sub(spare_rows);
+    centered(
+        area,
+        size.width
+            .saturating_add(2 + PREVIEW_GAP_X * 2)
+            .max(PREVIEW_MIN_WIDTH)
+            .min(max.width),
+        size.height
+            .saturating_add(2 + PREVIEW_GAP_Y + below)
+            .max(PREVIEW_MIN_HEIGHT)
+            .min(max.height),
+    )
+}
+
 /// A description image at whatever size the screen allows.
 /// Returns the outer rect so clicks outside it can close the lightbox.
 fn draw_image_preview(
@@ -2011,11 +2052,43 @@ fn draw_image_preview(
     path: &std::path::Path,
     area: Rect,
 ) -> Rect {
-    let rect = centered(
-        area,
-        (u32::from(area.width) * 9 / 10) as u16,
-        (u32::from(area.height) * 9 / 10) as u16,
-    );
+    let max = image_preview_bounds(area);
+    let canvas_bounds = Size {
+        width: max.width.saturating_sub(2 + PREVIEW_GAP_X * 2),
+        height: max.height.saturating_sub(2 + PREVIEW_GAP_Y * 2),
+    };
+    // Measured with the same bounds the drawing pass asks for, so the picture
+    // is encoded once per frame rather than resized back and forth.
+    let pixels = match form.gif.as_ref() {
+        Some((_, gif)) => Some(gif.pixel_size()),
+        None => store.pixel_size(path),
+    };
+    let picture = match form.gif.as_ref() {
+        Some((_, gif)) => store
+            .preview_frame(gif)
+            .ok()
+            .map(|protocol| protocol.size_for(Resize::Scale(None), canvas_bounds)),
+        None => match store.get_preview(path, canvas_bounds) {
+            crate::image::ImageReady::Ready(protocol) => {
+                Some(protocol.size_for(Resize::Scale(None), canvas_bounds))
+            }
+            // A picture still being encoded already knows the shape it will
+            // take, so the box is sized right away rather than snapping in
+            // once the protocol lands.
+            crate::image::ImageReady::Preparing(size) => Some(size),
+            // Before it is decoded there is nothing to go on: the box stays
+            // full until the aspect is known.
+            _ => None,
+        },
+    };
+    // The picture is drawn in pixels inside cells it never quite fills, and
+    // what it leaves at the bottom already reads as a gap. Take that much
+    // back so the frame looks even above and below.
+    let spare = match (picture, pixels) {
+        (Some(cells), Some(pixels)) => store.spare_bottom_rows(pixels, cells, canvas_bounds),
+        _ => 0,
+    };
+    let rect = image_preview_rect(area, picture, spare);
     let title = truncate(
         &path.file_name().unwrap_or_default().to_string_lossy(),
         rect.width.saturating_sub(10) as usize,
@@ -2055,15 +2128,33 @@ fn draw_image_preview(
             )
             .right_aligned(),
         );
-    let inner = block.inner(rect);
+    let block_inner = block.inner(rect);
     f.render_widget(Clear, rect);
     f.render_widget(block, rect);
+    // The gap the box was sized for, so the picture never touches its chrome.
+    let below = PREVIEW_GAP_Y.saturating_sub(spare);
+    let inner = Rect {
+        x: block_inner.x.saturating_add(PREVIEW_GAP_X),
+        y: block_inner.y.saturating_add(PREVIEW_GAP_Y),
+        width: block_inner.width.saturating_sub(PREVIEW_GAP_X * 2),
+        height: block_inner.height.saturating_sub(PREVIEW_GAP_Y + below),
+    };
+    // Draw into exactly what was measured. Handing the picture a larger area
+    // than it was encoded for would have it re-encoded every frame.
+    let canvas = match picture {
+        Some(size) => centered(
+            inner,
+            size.width.min(inner.width),
+            size.height.min(inner.height),
+        ),
+        None => inner,
+    };
 
     // Preview has its own chrome; no selection frame margin.
     if let Some((_, gif)) = form.gif.as_ref() {
         match store.preview_frame(gif) {
             Ok(protocol) => {
-                let _ = render_protocol(f, protocol, inner, theme, None);
+                let _ = render_protocol(f, protocol, canvas, theme, None);
             }
             Err(err) => {
                 let slot = letterbox_rect(preview_slot_area(inner), 4, 3);
@@ -2077,9 +2168,9 @@ fn draw_image_preview(
             }
         }
     } else {
-        match store.get_preview(path, inner.as_size()) {
+        match store.get_preview(path, canvas_bounds) {
             crate::image::ImageReady::Ready(protocol) => {
-                let _ = render_protocol(f, protocol, inner, theme, None);
+                let _ = render_protocol(f, protocol, canvas, theme, None);
             }
             crate::image::ImageReady::Loading => {
                 // Loading means not cached yet — aspect unknown.
