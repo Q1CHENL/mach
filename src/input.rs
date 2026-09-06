@@ -903,19 +903,15 @@ fn run_slash(app: &mut App, cmd: crate::slash::SlashCommand, query: &str) {
 
 // ------------------------------------------------------------ task dialog
 
-/// Show another of the description's pictures in the open lightbox. The
-/// previous picture's frames and protocol are dropped so the next draw does
-/// not spend an encode tick on a picture nobody is looking at.
+/// Show another of the description's pictures in the open lightbox.
+/// Encoded stills and decoded GIFs stay cached until the lightbox closes,
+/// so stepping back does not decode or encode the same picture again.
 fn step_preview_image(app: &mut App, delta: isize) {
     let moved = app
         .form
         .as_mut()
         .is_some_and(|form| form.step_preview_image(delta));
     if moved {
-        // Drop every placement, not just the frames: the picture being left
-        // behind must give its graphics-protocol placement back, or it stays
-        // on screen under the next one.
-        app.images.release_form_graphics();
         app.dirty = true;
     }
 }

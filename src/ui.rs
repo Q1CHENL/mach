@@ -691,8 +691,14 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
         && let Some(path) = form.preview_path()
     {
         areas.occlude_hover(overlay);
+        // Wipe the last box before dimming so a smaller picture does not
+        // leave the previous graphics-protocol placement around it.
+        if form.last_preview != Rect::ZERO {
+            f.render_widget(Clear, form.last_preview);
+        }
         dim_underlay(f, overlay);
         let chrome = draw_image_preview(f, store, form, theme, &path, overlay, mouse_position);
+        form.last_preview = chrome.outer;
         form.areas.preview = chrome.outer;
         form.areas.preview_prev = chrome.prev;
         form.areas.preview_next = chrome.next;
@@ -2169,9 +2175,7 @@ fn draw_image_preview(
             format!(" {title} "),
             theme.accent_text().bold(),
         ))
-        .title_top(
-            Line::styled(metadata, Style::new().fg(theme.muted_color())).right_aligned(),
-        )
+        .title_top(Line::styled(metadata, Style::new().fg(theme.muted_color())).right_aligned())
         .title_bottom(
             Line::styled(
                 match form.gif.as_ref().map(|(_, g)| g) {

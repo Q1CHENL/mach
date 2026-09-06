@@ -1,6 +1,8 @@
 //! The task dialog — title, description, due date and subtasks — used for
 //! both creating and editing a task.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ratatui::layout::Rect;
@@ -398,8 +400,14 @@ pub struct TaskForm {
     /// Which of the description's pictures the lightbox is showing, as an
     /// index into `description.images()`.
     preview_index: usize,
+    /// Last frame's lightbox, so a smaller picture can wipe the previous one
+    /// without dropping its encoding.
+    pub(crate) last_preview: Rect,
     /// Decoded GIF for preview, keyed by path (kept after close for fast reopen).
-    pub gif: Option<(std::path::PathBuf, GifPlayback)>,
+    pub gif: Option<(PathBuf, GifPlayback)>,
+    /// Decoded GIFs that are not on screen. Stepping away parks the current
+    /// one here so stepping back does not decode it again.
+    gif_ready: HashMap<PathBuf, GifPlayback>,
     /// GIF decode in progress; polled by the normal animation tick.
     pub gif_pending: Option<GifLoad>,
     /// The calendar, while a due date is being picked.
@@ -462,7 +470,9 @@ impl TaskForm {
             form_area: Rect::ZERO,
             preview: false,
             preview_index: 0,
+            last_preview: Rect::ZERO,
             gif: None,
+            gif_ready: HashMap::new(),
             gif_pending: None,
             picker: None,
             category_picker: None,
@@ -872,12 +882,12 @@ impl TaskForm {
     }
 
     /// Every picture the lightbox can step through, in description order.
-    pub fn preview_images(&self) -> Vec<std::path::PathBuf> {
+    pub fn preview_images(&self) -> Vec<PathBuf> {
         self.description.images()
     }
 
     /// The picture the lightbox is showing.
-    pub fn preview_path(&self) -> Option<std::path::PathBuf> {
+    pub fn preview_path(&self) -> Option<PathBuf> {
         self.preview_images().into_iter().nth(self.preview_index)
     }
 
@@ -906,11 +916,24 @@ impl TaskForm {
         true
     }
 
-    /// Point the animation state at `path`: keep a decoded GIF across
-    /// close/reopen while this form is open, and drop it for a still.
-    fn adopt_preview_source(&mut self, path: &std::path::Path) {
+    /// Point the animation state at `path`. A decoded GIF is parked when
+    /// stepping away so stepping back does not decode it again; a load still
+    /// in flight is left running and parked when it finishes.
+    fn adopt_preview_source(&mut self, path: &Path) {
+        self.park_current_gif(path);
+        if matches!(&self.gif, Some((p, _)) if p == path) {
+            return;
+        }
         if crate::image::is_gif(path) {
-            if matches!(&self.gif, Some((p, _)) if p == path) {
+            if let Some(gif) = self.gif_ready.remove(path) {
+                self.gif = Some((path.to_path_buf(), gif));
+                if self
+                    .gif_pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.path() == path)
+                {
+                    self.gif_pending = None;
+                }
                 return;
             }
             if self
@@ -918,15 +941,19 @@ impl TaskForm {
                 .as_ref()
                 .is_none_or(|pending| pending.path() != path)
             {
-                self.gif = None;
                 self.gif_pending = Some(GifLoad::start(path.to_path_buf()));
             }
+        }
+    }
+
+    fn park_current_gif(&mut self, keep: &Path) {
+        let Some((path, gif)) = self.gif.take() else {
+            return;
+        };
+        if path.as_path() == keep {
+            self.gif = Some((path, gif));
         } else {
-            // Different still — drop any previous GIF cache.
-            if !matches!(&self.gif, Some((p, _)) if p == path) {
-                self.gif = None;
-            }
-            self.gif_pending = None;
+            self.gif_ready.insert(path, gif);
         }
     }
 
@@ -935,7 +962,8 @@ impl TaskForm {
         self.areas.preview = Rect::ZERO;
         self.areas.preview_prev = Rect::ZERO;
         self.areas.preview_next = Rect::ZERO;
-        // Keep `gif` so reopening the same animation is instant.
+        self.last_preview = Rect::ZERO;
+        // Keep decoded GIFs so reopening or stepping back is instant.
     }
 
     pub fn gif_playing(&self) -> bool {
@@ -958,10 +986,18 @@ impl TaskForm {
                 .path()
                 .to_path_buf();
             match result {
-                Ok(gif) => self.gif = Some((path, gif)),
+                Ok(gif) => {
+                    if self.preview_path().as_deref() == Some(path.as_path()) {
+                        self.gif = Some((path, gif));
+                    } else {
+                        self.gif_ready.insert(path, gif);
+                    }
+                }
                 Err(error) => {
-                    self.gif = None;
-                    self.error = Some(error);
+                    if self.preview_path().as_deref() == Some(path.as_path()) {
+                        self.gif = None;
+                        self.error = Some(error);
+                    }
                 }
             }
             return true;
@@ -1039,6 +1075,7 @@ impl TaskForm {
         self.category_picker = None;
         self.label_picker = None;
         self.preview = false;
+        self.last_preview = Rect::ZERO;
         self.gif_pending = None;
         self.description.close_menu();
     }
@@ -1345,6 +1382,71 @@ mod tests {
         assert!(form.open_image_preview().is_none());
         assert!(form.gif.is_none());
         assert!(form.gif_pending.is_some());
+    }
+
+    fn write_test_gif(path: &Path, frames: u32) {
+        use image::codecs::gif::GifEncoder;
+        use image::{Delay, Frame, Rgba, RgbaImage};
+        use std::fs::File;
+
+        let file = File::create(path).unwrap();
+        let mut encoder = GifEncoder::new(file);
+        encoder
+            .set_repeat(image::codecs::gif::Repeat::Infinite)
+            .unwrap();
+        for i in 0..frames {
+            let mut img = RgbaImage::new(8, 8);
+            for pixel in img.pixels_mut() {
+                *pixel = Rgba([i as u8 * 80, 0, 255, 255]);
+            }
+            encoder
+                .encode_frame(Frame::from_parts(
+                    img,
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(50, 1),
+                ))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn stepping_back_to_a_gif_does_not_decode_it_again() {
+        let dir = std::env::temp_dir().join(format!("mach-gif-step-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let gif_path = dir.join("anim.gif");
+        write_test_gif(&gif_path, 2);
+        let png = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/screenshot.png");
+        let mut task = Task::new("gallery", 0, None, "");
+        task.description = vec![
+            Block::image(&gif_path.display().to_string()),
+            Block::image(png),
+        ];
+        let mut form = TaskForm::edit(&task);
+
+        assert!(form.open_image_preview().is_none());
+        form.gif = Some((
+            gif_path.clone(),
+            crate::image::GifPlayback::load(&gif_path).unwrap(),
+        ));
+        form.gif_pending = None;
+
+        assert!(form.step_preview_image(1));
+        assert!(form.gif.is_none(), "the still is not a GIF");
+        assert!(
+            form.gif_ready.contains_key(&gif_path),
+            "the decoded GIF is parked, not dropped"
+        );
+
+        assert!(form.step_preview_image(-1));
+        assert!(
+            matches!(&form.gif, Some((path, _)) if path == &gif_path),
+            "stepping back must reuse the parked GIF"
+        );
+        assert!(form.gif_pending.is_none(), "must not start another decode");
+        assert!(!form.gif_ready.contains_key(&gif_path));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

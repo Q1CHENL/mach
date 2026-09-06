@@ -611,7 +611,6 @@ struct CachedImage {
 }
 
 struct GifProtocolCache {
-    source: PathBuf,
     frames: Vec<Option<StatefulProtocol>>,
 }
 
@@ -640,8 +639,9 @@ pub struct ImageStore {
     /// FIFO work waiting for one of the bounded decode slots.
     queued: VecDeque<PathBuf>,
     queued_paths: HashSet<PathBuf>,
-    /// Encoded GIF frames for the open preview (one cache per source image).
-    gif_protocols: Option<GifProtocolCache>,
+    /// Encoded GIF frames for pictures shown in the open lightbox, keyed by
+    /// source path so stepping away and back does not encode them again.
+    gif_protocols: HashMap<PathBuf, GifProtocolCache>,
     protocol_result_sender: Sender<ProtocolResult>,
     protocol_results: Receiver<ProtocolResult>,
     next_protocol_job: u64,
@@ -663,7 +663,7 @@ impl Default for ImageStore {
             pending: HashMap::new(),
             queued: VecDeque::new(),
             queued_paths: HashSet::new(),
-            gif_protocols: None,
+            gif_protocols: HashMap::new(),
             protocol_result_sender,
             protocol_results,
             next_protocol_job: 1,
@@ -912,7 +912,7 @@ impl ImageStore {
     /// is unchanged so there is no resize event, but pixel-per-cell is.
     /// Decoded bitmaps stay cached; only protocols are invalidated.
     pub fn recheck_cell_size(&mut self) -> bool {
-        if self.cache.is_empty() && self.gif_protocols.is_none() {
+        if self.cache.is_empty() && self.gif_protocols.is_empty() {
             return false;
         }
         // Halfblocks are cell glyphs, not pixel protocols.
@@ -1075,17 +1075,15 @@ impl ImageStore {
     pub fn preview_frame(&mut self, gif: &GifPlayback) -> Result<&mut StatefulProtocol, String> {
         let idx = gif.index;
         let n = gif.frame_count();
-        if self
+        let cache = self
             .gif_protocols
-            .as_ref()
-            .is_some_and(|cache| cache.source != gif.source || cache.frames.len() != n)
-        {
-            self.gif_protocols = None;
+            .entry(gif.source.clone())
+            .or_insert_with(|| GifProtocolCache {
+                frames: (0..n).map(|_| None).collect(),
+            });
+        if cache.frames.len() != n {
+            cache.frames = (0..n).map(|_| None).collect();
         }
-        let cache = self.gif_protocols.get_or_insert_with(|| GifProtocolCache {
-            source: gif.source.clone(),
-            frames: (0..n).map(|_| None).collect(),
-        });
         match &mut cache.frames[idx] {
             Some(protocol) => Ok(protocol),
             slot @ None => {
@@ -1097,7 +1095,7 @@ impl ImageStore {
     }
 
     pub fn clear_preview(&mut self) {
-        self.gif_protocols = None;
+        self.gif_protocols.clear();
     }
 
     /// Drop the description protocols (the terminal deletes those pictures) but
@@ -1514,6 +1512,54 @@ mod tests {
     }
 
     #[test]
+    fn a_ready_preview_encoding_survives_showing_another_picture() {
+        let mut store = ImageStore {
+            picker: Some(Picker::halfblocks()),
+            ..Default::default()
+        };
+        let first = PathBuf::from("/tmp/a.png");
+        let second = PathBuf::from("/tmp/b.png");
+        let image = || Arc::new(DynamicImage::new_rgba8(4, 4));
+        for path in [&first, &second] {
+            store.cache.insert(
+                path.clone(),
+                Ok(CachedImage {
+                    image: image(),
+                    protocol: None,
+                    preview_protocol: None,
+                }),
+            );
+        }
+        let bounds = Size::new(4, 2);
+
+        assert!(matches!(
+            store.get_preview(&first, bounds),
+            ImageReady::Preparing(_)
+        ));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let _ = store.poll_pending();
+            if matches!(store.get_preview(&first, bounds), ImageReady::Ready(_)) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the first preview never finished encoding"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(matches!(
+            store.get_preview(&second, bounds),
+            ImageReady::Preparing(_)
+        ));
+        assert!(
+            matches!(store.get_preview(&first, bounds), ImageReady::Ready(_)),
+            "stepping to another picture must not drop a ready preview encoding"
+        );
+    }
+
+    #[test]
     fn half_blocks_are_never_re_measured() {
         // Their font size is a stand-in, not a measurement, so acting on a
         // real one would drop every encoding and change nothing on screen.
@@ -1602,6 +1648,11 @@ mod gif_tests {
         );
 
         assert_ne!(first_buffer, second_buffer);
+        assert_eq!(
+            store.gif_protocols.len(),
+            2,
+            "each GIF keeps its encoded frames while the lightbox stays open"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
