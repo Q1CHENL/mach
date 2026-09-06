@@ -693,7 +693,8 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
     {
         areas.occlude_hover(overlay);
         dim_underlay(f, overlay);
-        draw_image_preview(f, store, form, theme, &path, overlay);
+        let rect = draw_image_preview(f, store, form, theme, &path, overlay);
+        form.areas.preview = rect;
     }
 }
 
@@ -1999,6 +2000,7 @@ fn draw_label_picker(
 }
 
 /// A description image at whatever size the screen allows.
+/// Returns the outer rect so clicks outside it can close the lightbox.
 fn draw_image_preview(
     f: &mut Frame,
     store: &mut crate::image::ImageStore,
@@ -2006,7 +2008,7 @@ fn draw_image_preview(
     theme: &Theme,
     path: &std::path::Path,
     area: Rect,
-) {
+) -> Rect {
     let rect = centered(
         area,
         (u32::from(area.width) * 9 / 10) as u16,
@@ -2042,9 +2044,9 @@ fn draw_image_preview(
             Line::styled(
                 match form.gif.as_ref().map(|(_, g)| g) {
                     Some(g) if g.is_animated() && g.is_paused() => {
-                        " Esc closes · click/space resume "
+                        " Esc closes · space/click resume "
                     }
-                    Some(g) if g.is_animated() => " Esc closes · click/space pause ",
+                    Some(g) if g.is_animated() => " Esc closes · space/click pause ",
                     _ => " Esc closes ",
                 },
                 Style::new().fg(theme.muted_color()),
@@ -2102,6 +2104,7 @@ fn draw_image_preview(
             }
         }
     }
+    rect
 }
 
 /// Draws a decoded image, or a loading / broken stand-in sized like the

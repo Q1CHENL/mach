@@ -1463,20 +1463,27 @@ fn image_preview_owns_clicks_over_the_underlying_panels() {
             .open_image_preview()
             .is_none()
     );
-    lay_out(&mut fixture.app);
+    draw(&mut fixture.app, 100, 30);
+    let preview = fixture.app.form.as_ref().unwrap().areas.preview;
+    let editing = fixture.app.form.as_ref().unwrap().editing.clone();
+    let category = fixture.app.cat_index;
 
-    handle_event(
+    click(
         &mut fixture.app,
-        Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 30,
-            row: 3,
-            modifiers: KeyModifiers::NONE,
-        }),
+        preview.x + preview.width / 2,
+        preview.y + preview.height / 2,
     );
+    assert!(fixture.app.form.as_ref().is_some_and(|form| form.preview));
+
+    let sidebar = fixture.app.areas.sidebar;
+    assert!(sidebar.x < preview.x);
+    click(&mut fixture.app, sidebar.x, sidebar.y + 1);
 
     assert_eq!(fixture.app.mode, Mode::TaskForm);
-    assert!(fixture.app.form.as_ref().is_some_and(|form| form.preview));
+    let form = fixture.app.form.as_ref().unwrap();
+    assert!(!form.preview);
+    assert_eq!(form.editing, editing);
+    assert_eq!(fixture.app.cat_index, category);
 }
 
 #[test]

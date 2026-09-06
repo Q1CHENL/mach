@@ -2464,10 +2464,24 @@ fn handle_form_mouse(app: &mut App, m: MouseEvent) {
     if m.kind != MouseEventKind::Down(MouseButton::Left) {
         return;
     }
-    // Click in the image preview: pause/resume GIF (does not close).
+    // Click in the image preview: pause/resume GIF. A click outside it
+    // closes the lightbox, like Esc.
     if app.form.as_ref().is_some_and(|f| f.preview) {
-        if let Some(form) = &mut app.form {
-            form.preview_click();
+        let inside = app
+            .form
+            .as_ref()
+            .is_some_and(|form| contains(form.areas.preview, m.column, m.row));
+        if inside {
+            if let Some(form) = &mut app.form {
+                form.preview_click();
+            }
+        } else {
+            // Drop frames/protocol first so the next draw cannot spend
+            // another encode tick on this preview.
+            if let Some(form) = &mut app.form {
+                form.close_image_preview();
+            }
+            app.images.clear_preview();
         }
         return;
     }

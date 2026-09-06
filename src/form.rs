@@ -225,6 +225,8 @@ pub struct FieldAreas {
     pub description: Rect,
     pub description_top: Rect,
     pub description_bottom: Rect,
+    /// The image lightbox's outer rect while it is open; `ZERO` otherwise.
+    pub preview: Rect,
 }
 
 impl FieldAreas {
@@ -877,6 +879,7 @@ impl TaskForm {
 
     pub fn close_image_preview(&mut self) {
         self.preview = false;
+        self.areas.preview = Rect::ZERO;
         // Keep `gif` so reopening the same animation is instant.
     }
 
