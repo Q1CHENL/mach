@@ -1481,7 +1481,7 @@ fn draw_image_slot(
         Style::new().fg(theme.muted_color())
     };
     let (icon, title, title_style, detail) = match kind {
-        ImageSlotKind::Loading => ("▢", "loading", Style::new().fg(theme.muted_color()), None),
+        ImageSlotKind::Loading => ("▧", "Loading", Style::new().fg(theme.muted_color()), None),
         ImageSlotKind::Broken { detail } => (
             "✕",
             "broken image",
