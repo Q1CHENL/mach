@@ -16,8 +16,8 @@ use crate::form::{CategoryForm, TaskDraft, TaskForm};
 use crate::image::ImageStore;
 use crate::model::{
     ALL_CATEGORY, Category, Label, LabelColor, MAX_CATEGORY_COUNT, MAX_CATEGORY_NAME_LEN,
-    MAX_LABEL_COUNT, MAX_LABEL_NAME_LEN, MAX_TASK_COUNT, MAX_TITLE_LEN, Task, caseless_key,
-    category_name_key, task_matches_query,
+    MAX_LABEL_COUNT, MAX_LABEL_NAME_LEN, MAX_TASK_COUNT, MAX_TITLE_LEN, Task, caseless_contains,
+    caseless_key, category_name_key, task_matches_query,
 };
 use crate::settings::{LaunchState, Settings};
 use crate::store::{
@@ -468,6 +468,16 @@ impl PanelSizes {
     }
 }
 
+/// One label offered as a search completion, with the size of the group it
+/// would select.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelSuggestion {
+    pub name: String,
+    pub color: LabelColor,
+    /// Tasks currently carrying the label, done ones included.
+    pub tasks: usize,
+}
+
 /// Semantic mouse targets. Identity is deliberately independent of screen
 /// coordinates so moving within one control does not request another frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,6 +491,7 @@ pub(crate) enum HoverTarget {
     TasksTop,
     TasksBottom,
     SlashCommand(usize),
+    SearchLabel(usize),
     TaskCategory(usize),
     TaskLabel(usize),
     TaskLabelCheck(usize),
@@ -544,6 +555,14 @@ pub struct Areas {
     pub slash_menu: Rect,
     /// Index of the first command drawn inside a clipped command palette.
     pub slash_menu_start: usize,
+    /// Open label suggestion dropdown under the search field, including its
+    /// border.
+    pub search_menu: Rect,
+    /// Index of the first label drawn inside a clipped suggestion list.
+    pub search_menu_start: usize,
+    /// Columns the command field spends before the typed text: the `/` plus
+    /// any label badges pinned to a search.
+    pub command_prefix: u16,
     /// Final badge rectangles in the global label manager.
     pub label_hits: Vec<(usize, Rect)>,
     /// Name field and selectable color swatches in the label editor.
@@ -711,6 +730,12 @@ pub struct App {
     pub input: TextInput,
     /// Selected row in the `/` palette dropdown.
     pub slash_index: usize,
+    /// Highlighted label suggestion under the search field. `None` is the
+    /// typed query itself, which is what Enter commits.
+    pub search_suggestion: Option<usize>,
+    /// Label ids pinned to the search as badges. A task must carry every one
+    /// of them, on top of matching the typed text.
+    pub search_labels: Vec<String>,
     /// The open task dialog, if any.
     pub form: Option<TaskForm>,
     /// The open category dialog, if any.
@@ -868,6 +893,8 @@ impl App {
             list_rows: Vec::new(),
             searching: false,
             search_query: String::new(),
+            search_suggestion: None,
+            search_labels: Vec::new(),
             input: TextInput::default(),
             slash_index: 0,
             form: None,
@@ -1008,6 +1035,8 @@ impl App {
         self.store_revision = revision;
         self.tasks = tasks;
         self.labels = labels;
+        self.search_labels
+            .retain(|id| self.labels.iter().any(|label| label.id == *id));
         self.settings = settings;
         self.attachments = attachments;
         self.images.set_attachments(&self.attachments);
@@ -2059,10 +2088,17 @@ impl App {
         let hide_done = self.settings.hide_done;
         let candidates: Vec<usize> = if self.searching {
             let q = caseless_key(&self.search_query);
+            // Pinned labels narrow first and are conjunctive: each badge is
+            // another condition the task has to meet, not another way to match.
+            let labels = &self.search_labels;
             self.tasks
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| !(hide_done && t.done) && task_matches_query(t, &self.labels, &q))
+                .filter(|(_, t)| {
+                    !(hide_done && t.done)
+                        && labels.iter().all(|id| t.label_ids.contains(id))
+                        && task_matches_query(t, &self.labels, &q)
+                })
                 .map(|(i, _)| i)
                 .collect()
         } else {
@@ -2359,6 +2395,8 @@ impl App {
     fn on_category_changed(&mut self) {
         self.searching = false;
         self.search_query.clear();
+        self.search_suggestion = None;
+        self.search_labels.clear();
         self.task_index = 0;
         self.rebuild_view();
     }
@@ -2595,6 +2633,8 @@ impl App {
         let id = task.id;
         self.searching = false;
         self.search_query.clear();
+        self.search_suggestion = None;
+        self.search_labels.clear();
         self.rebuild_view();
         self.select_task_by_id(&id);
         Some(id)
@@ -3100,6 +3140,8 @@ impl App {
         self.input = TextInput::new(query, MAX_TITLE_LEN);
         self.search_query = query.to_string();
         self.searching = true;
+        self.search_suggestion = None;
+        self.search_labels.clear();
         self.task_index = 0;
         self.rebuild_view();
     }
@@ -3119,15 +3161,122 @@ impl App {
         }
         self.mode = Mode::Search;
         self.input = TextInput::new(&self.search_query, MAX_TITLE_LEN);
+        self.search_suggestion = None;
         self.dirty = true;
     }
 
     pub fn end_search(&mut self) {
         self.searching = false;
         self.search_query.clear();
+        self.search_suggestion = None;
+        self.search_labels.clear();
         self.task_index = 0;
         self.mode = Mode::Normal;
         self.rebuild_view();
+    }
+
+    /// Labels offered under the search field, in the global label order.
+    ///
+    /// Suggestions are a completion, so they appear only once something has
+    /// been typed, and narrow with the same caseless identity the search
+    /// itself uses. Labels already pinned to the query are not offered twice.
+    pub fn search_label_suggestions(&self) -> Vec<LabelSuggestion> {
+        let key = caseless_key(&self.search_query);
+        if key.is_empty() {
+            return Vec::new();
+        }
+        self.labels
+            .iter()
+            .filter(|label| !self.search_labels.contains(&label.id))
+            .filter(|label| caseless_contains(&label.name, &key))
+            .map(|label| LabelSuggestion {
+                name: label.name.clone(),
+                color: label.color,
+                tasks: self
+                    .tasks
+                    .iter()
+                    .filter(|task| task.label_ids.contains(&label.id))
+                    .count(),
+            })
+            .collect()
+    }
+
+    /// Move the suggestion highlight. `None` is one stop in the cycle, so
+    /// stepping back off the first row returns the typed query untouched.
+    pub fn cycle_search_suggestion(&mut self, delta: isize) {
+        let count = self.search_label_suggestions().len() as isize;
+        if count == 0 {
+            return;
+        }
+        let current = self.search_suggestion.map_or(0, |index| index as isize + 1);
+        let next = (current + delta).rem_euclid(count + 1);
+        self.search_suggestion = (next > 0).then(|| (next - 1) as usize);
+        self.dirty = true;
+    }
+
+    /// Pin a suggested label to the query as a badge. The typed name it
+    /// completed is consumed, leaving the field ready for the next term.
+    pub fn apply_search_label(&mut self, index: usize) {
+        let Some(suggestion) = self.search_label_suggestions().into_iter().nth(index) else {
+            return;
+        };
+        let Some(id) = self
+            .labels
+            .iter()
+            .find(|label| label.name == suggestion.name)
+            .map(|label| label.id.clone())
+        else {
+            return;
+        };
+        self.mode = Mode::Search;
+        self.search_labels.push(id);
+        self.input = TextInput::new("", MAX_TITLE_LEN);
+        self.search_query.clear();
+        self.searching = true;
+        self.search_suggestion = None;
+        self.task_index = 0;
+        self.rebuild_view();
+    }
+
+    /// Drop the last pinned label. Returns whether one was removed, so
+    /// Backspace can fall through to ordinary text editing.
+    pub fn pop_search_label(&mut self) -> bool {
+        if self.search_labels.pop().is_none() {
+            return false;
+        }
+        self.search_suggestion = None;
+        self.task_index = 0;
+        self.rebuild_view();
+        true
+    }
+
+    /// The pinned labels as name and color, in the order they were added.
+    /// Labels deleted while a search is open simply stop appearing.
+    pub fn search_label_badges(&self) -> Vec<(String, LabelColor)> {
+        self.search_labels
+            .iter()
+            .filter_map(|id| self.labels.iter().find(|label| label.id == *id))
+            .map(|label| (label.name.clone(), label.color))
+            .collect()
+    }
+
+    /// Everything the search is narrowed by, as plain text for panel titles
+    /// and the resting status line.
+    pub fn search_summary(&self) -> String {
+        let mut parts: Vec<String> = self
+            .search_label_badges()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        if !self.search_query.is_empty() {
+            parts.push(self.search_query.clone());
+        }
+        parts.join(" + ")
+    }
+
+    /// Whether anything is still narrowing the list.
+    pub fn search_is_empty(&self) -> bool {
+        self.search_query.is_empty() && self.search_labels.is_empty()
     }
 
     pub fn clamp_slash_index(&mut self) {

@@ -783,20 +783,40 @@ fn close_slash(app: &mut App) {
 fn handle_search_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
+            // A highlighted suggestion is dropped first, so browsing the
+            // labels never throws away what was already typed.
+            if app.search_suggestion.take().is_some() {
+                app.dirty = true;
+                return;
+            }
             app.input = TextInput::default();
             app.end_search();
         }
+        KeyCode::Up => app.cycle_search_suggestion(-1),
+        KeyCode::Down | KeyCode::Tab => app.cycle_search_suggestion(1),
+        // Backspace at the start of the text takes the badges back off,
+        // newest first, the way it removes any other character before it.
+        KeyCode::Backspace if app.input.is_empty() => {
+            app.pop_search_label();
+        }
         KeyCode::Enter => {
+            // Completing a label pins it to the query as a badge and leaves
+            // the field open for the next term.
+            if let Some(index) = app.search_suggestion {
+                app.apply_search_label(index);
+                return;
+            }
             // Keep the current query; just leave the typing field.
             app.mode = Mode::Normal;
             app.input = TextInput::default();
             // Keep searching/search_query so the list stays narrowed until Esc.
-            if app.search_query.is_empty() {
+            if app.search_is_empty() {
                 app.end_search();
             }
         }
         _ => {
             if edit_line(&mut app.input, key) {
+                app.search_suggestion = None;
                 app.update_search();
             }
         }
@@ -2005,6 +2025,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         handle_slash_mouse(app, m);
         return;
     }
+    // The suggestion list floats over the task list; everything outside it
+    // keeps the ordinary search behaviour.
+    if app.mode == Mode::Search && handle_search_menu_mouse(app, m) {
+        return;
+    }
     if app.mode == Mode::Labels {
         handle_labels_mouse(app, m);
         return;
@@ -2286,6 +2311,34 @@ fn handle_slash_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
+/// Scroll or click inside the search suggestion dropdown. Returns whether the
+/// event belonged to it.
+fn handle_search_menu_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    let rect = app.areas.search_menu;
+    if !contains(rect, mouse.column, mouse.row) {
+        return false;
+    }
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                -1
+            } else {
+                1
+            };
+            app.cycle_search_suggestion(delta);
+            true
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if mouse.row > rect.y && mouse.row + 1 < rect.bottom() {
+                let row = (mouse.row - rect.y - 1) as usize;
+                app.apply_search_label(app.areas.search_menu_start + row);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Give the bottom command bar the same input mode as its keyboard entry
 /// point. A locked search resumes editing instead of being silently cleared.
 fn focus_command_bar(app: &mut App, x: u16) {
@@ -2299,8 +2352,12 @@ fn focus_command_bar(app: &mut App, x: u16) {
 }
 
 fn set_command_bar_cursor(app: &mut App, x: u16) {
-    // The visible slash occupies the first cell of the command field.
-    let col = x.saturating_sub(app.areas.command_bar.x).saturating_sub(1) as usize;
+    // The visible slash, and any label badges pinned to a search, occupy the
+    // first cells of the command field.
+    let prefix = app.areas.command_prefix.max(1);
+    let col = x
+        .saturating_sub(app.areas.command_bar.x)
+        .saturating_sub(prefix) as usize;
     app.input.set_cursor_from_col(col);
     app.dirty = true;
 }

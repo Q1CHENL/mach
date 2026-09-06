@@ -825,3 +825,37 @@ fn category_form_merges_disjoint_human_and_agent_fields() {
     assert_eq!(saved.name, "Agent work");
     assert_eq!(saved.description, "human description");
 }
+
+#[test]
+fn deleting_a_pinned_label_preserves_the_remaining_search() {
+    for external in [false, true] {
+        let mut pair = on_disk_pair();
+        let removed = pair.app.create_label("release").unwrap();
+        let kept = pair.app.create_label("backend").unwrap();
+        pair.app
+            .set_task_labels("t-open", vec![removed.clone(), kept.clone()])
+            .unwrap();
+        pair.app.start_search("release");
+        pair.app.apply_search_label(0);
+        pair.app.input.insert_str("backend");
+        pair.app.update_search();
+        pair.app.apply_search_label(0);
+        pair.app.input.insert_str("open");
+        pair.app.update_search();
+        if external {
+            pair.external
+                .update(|data| data.delete_label(&removed))
+                .unwrap();
+            assert!(pair.app.poll_external_changes());
+        } else {
+            assert!(pair.app.delete_label_by_id(&removed));
+        }
+        assert_eq!(pair.app.search_labels, vec![kept.clone()]);
+        assert_eq!(pair.app.search_query, "open");
+        assert_eq!(pair.app.view.len(), 1);
+        assert_eq!(pair.app.selected_task().unwrap().id, "t-open");
+        assert!(pair.app.delete_label_by_id(&kept));
+        assert!(pair.app.search_labels.is_empty());
+        assert_eq!(pair.app.view.len(), 1);
+    }
+}

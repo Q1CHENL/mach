@@ -177,6 +177,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Palette floats above the status bar.
     if app.mode == Mode::Slash {
         draw_slash_palette(f, app, &theme, status);
+    } else if app.mode == Mode::Search {
+        draw_search_suggestions(f, app, &theme, status);
     }
 
     let centered_modal = matches!(
@@ -2588,7 +2590,11 @@ fn draw_tasks(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let mut block = panel("Tasks", chrome_focus, theme);
     // Search spells out what matched; category notes stay in the editor.
     if app.searching {
-        let context = format!(" search: {} · {} found ", app.search_query, app.view.len());
+        let context = format!(
+            " search: {} · {} found ",
+            app.search_summary(),
+            app.view.len()
+        );
         block = block
             .title_top(Line::styled(context, Style::new().fg(theme.muted_color())).right_aligned());
     }
@@ -3097,18 +3103,29 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let field = left_area.width.saturating_sub(2) as usize;
     let left = match app.mode {
         Mode::Slash | Mode::Search => {
-            let view = app.input.visible(field);
+            // Labels pinned to a search sit in the field as badges, ahead of
+            // the text still being typed.
+            let badges = if app.mode == Mode::Search {
+                search_badge_spans(app, theme, field / 2)
+            } else {
+                Vec::new()
+            };
+            let prefix: usize = 1 + badges.iter().map(|span| span.width()).sum::<usize>();
+            let view = app.input.visible(field.saturating_sub(prefix - 1));
+            app.areas.command_prefix = u16::try_from(prefix).unwrap_or(u16::MAX);
             f.set_cursor_position((
                 left_area
                     .x
-                    .saturating_add(1)
-                    .saturating_add(view.cursor_col),
+                    .saturating_add(app.areas.command_prefix)
+                    .saturating_add(view.cursor_col)
+                    .min(left_area.right().saturating_sub(1)),
                 left_area.y,
             ));
             let description = line_with_selection(&view.text, view.sel_cols, Style::new(), theme);
             Line::from(
                 [
                     vec![Span::styled("/", theme.accent_text())],
+                    badges,
                     description.spans,
                 ]
                 .concat(),
@@ -3132,7 +3149,7 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
                     }
                     None => {
                         let hint = if app.searching {
-                            format!("search: {} · Esc clears", app.search_query)
+                            format!("search: {} · Esc clears", app.search_summary())
                         } else if app.settings.show_passive_hints() {
                             "/ commands".to_string()
                         } else {
@@ -3149,6 +3166,23 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
         }
     };
     f.render_widget(Paragraph::new(left), left_area);
+}
+
+/// The search's pinned labels, drawn in the command field as badges so the
+/// query reads as what it filters by.
+fn search_badge_spans(app: &App, theme: &Theme, width: usize) -> Vec<Span<'static>> {
+    let labels: Vec<LabelToken> = app
+        .search_label_badges()
+        .into_iter()
+        .map(|(name, color)| LabelToken::new(&name, color))
+        .collect();
+    // Leave a gap after the badges and keep room for editing the query.
+    let visible = compact_badge_tokens(&labels, width.saturating_sub(1));
+    let mut spans = label_badges_spans(&visible, theme, false);
+    if !spans.is_empty() {
+        spans.push(Span::raw(" "));
+    }
+    spans
 }
 
 fn draw_download_progress(
@@ -3272,6 +3306,143 @@ fn draw_slash_palette(f: &mut Frame, app: &mut App, theme: &Theme, status: Rect)
             },
         );
     }
+}
+
+/// Label completions for the search field, drawn upward from the status bar.
+/// Search already matches label names, so a completion is ordinary query text
+/// — it just spells the label exactly and says how big the group is.
+fn draw_search_suggestions(f: &mut Frame, app: &mut App, theme: &Theme, status: Rect) {
+    let suggestions = app.search_label_suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+    let hints: Vec<String> = suggestions
+        .iter()
+        .map(|suggestion| match suggestion.tasks {
+            1 => "1 task".to_string(),
+            n => format!("{n} tasks"),
+        })
+        .collect();
+    // Names share one column so the group sizes line up under each other.
+    let name_width = suggestions
+        .iter()
+        .map(|suggestion| suggestion.name.width())
+        .max()
+        .unwrap_or(0);
+    let desired_width = hints
+        .iter()
+        .map(|hint| format!("  {:name_width$}  {hint} ", "").width() as u16)
+        .max()
+        .unwrap_or(24)
+        .saturating_add(3);
+    // Wide enough for the title, then clamped to the bar it hangs from.
+    let width = desired_width.max(26).min(status.width.saturating_sub(2));
+    let height = u16::try_from(suggestions.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(status.y.max(3));
+    let rect = Rect {
+        x: status.x,
+        y: status.y.saturating_sub(height),
+        width,
+        height,
+    };
+    app.areas.search_menu = rect;
+    let visible_rows = usize::from(height.saturating_sub(2));
+    // With nothing highlighted the list stays parked at its top.
+    let selected = app
+        .search_suggestion
+        .filter(|index| *index < suggestions.len());
+    let start = selected
+        .unwrap_or(0)
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(suggestions.len().saturating_sub(visible_rows));
+    app.areas.search_menu_start = start;
+    let row_width = width.saturating_sub(2) as usize;
+    let lines: Vec<Line> = suggestions
+        .iter()
+        .zip(&hints)
+        .enumerate()
+        .skip(start)
+        .take(visible_rows)
+        .map(|(index, (suggestion, hint))| {
+            label_dropdown_row(
+                theme,
+                selected == Some(index),
+                &suggestion.name,
+                suggestion.color,
+                name_width,
+                hint,
+                row_width,
+            )
+        })
+        .collect();
+    let block = Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(theme.accent_text())
+        .title(Span::styled(
+            if selected.is_some() {
+                " labels · Enter to use "
+            } else {
+                " labels · Tab to browse "
+            },
+            Style::new().fg(theme.muted_color()),
+        ));
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+    app.areas.occlude_hover(rect);
+    let inner = rect.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    for index in start..suggestions.len().min(start.saturating_add(visible_rows)) {
+        app.areas.hover_fill(
+            HoverTarget::SearchLabel(index),
+            Rect {
+                y: inner
+                    .y
+                    .saturating_add(u16::try_from(index - start).unwrap_or(u16::MAX)),
+                height: 1,
+                ..inner
+            },
+        );
+    }
+}
+
+/// A dropdown row whose label is a colored badge instead of plain text.
+fn label_dropdown_row(
+    theme: &Theme,
+    selected: bool,
+    name: &str,
+    color: LabelColor,
+    name_width: usize,
+    hint: &str,
+    row_width: usize,
+) -> Line<'static> {
+    let badge = truncate(&format!(" {name} "), row_width.saturating_sub(2));
+    // The badge keeps its own width; the column is padded outside it.
+    let column = " ".repeat(name_width.saturating_add(2).saturating_sub(badge.width()));
+    let used = badge.width() + column.width() + 2;
+    let hint_space = row_width.saturating_sub(used);
+    let hint_part = if hint_space <= 1 {
+        String::new()
+    } else {
+        format!("{} ", truncate(hint, hint_space - 1))
+    };
+    let pad = " ".repeat(row_width.saturating_sub(used + hint_part.width()));
+    let (row_style, hint_style) = if selected {
+        (theme.selection(), theme.selection())
+    } else {
+        (Style::new(), Style::new().fg(theme.muted_color()))
+    };
+    Line::from(vec![
+        Span::styled(" ", row_style),
+        Span::styled(badge, theme.label_badge(color, false)),
+        Span::styled(format!("{column} "), row_style),
+        Span::styled(hint_part, hint_style),
+        Span::styled(pad, row_style),
+    ])
 }
 
 /// One row of a small dropdown: no leading arrow; selection wash runs

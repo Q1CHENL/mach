@@ -917,6 +917,50 @@ fn draws_search_and_its_empty_result() {
 }
 
 #[test]
+fn search_suggests_labels_and_draws_the_pinned_ones_as_badges() {
+    let mut app = sample_app();
+    let urgent = Label::new("urgent", LabelColor::Red);
+    let later = Label::new("later", LabelColor::Blue);
+    app.tasks[0].label_ids.push(urgent.id.clone());
+    app.tasks[2].label_ids.push(urgent.id.clone());
+    app.labels = vec![urgent, later];
+
+    // Nothing typed is nothing to complete.
+    app.start_search("");
+    let screen = render(&mut app, 100, 30);
+    assert!(!screen.contains("2 tasks"), "{screen}");
+
+    // Typing narrows the vocabulary caselessly, with each group's size.
+    app.start_search("R");
+    let screen = render(&mut app, 100, 30);
+    assert!(
+        screen.contains("urgent") && screen.contains("later"),
+        "{screen}"
+    );
+    assert!(screen.contains("2 tasks"), "{screen}");
+
+    app.start_search("URG");
+    let screen = render(&mut app, 100, 30);
+    assert!(screen.contains("urgent"), "{screen}");
+    assert!(!screen.contains("later"), "{screen}");
+
+    // A pinned label sits in the command field as a badge and titles the list.
+    app.apply_search_label(0);
+    let buffer = draw(&mut app, 100, 30);
+    let screen = buffer_text(&buffer);
+    assert!(screen.contains("search: urgent"), "{screen}");
+    let bar_row = buffer.area.height - 2;
+    let bar: String = (0..buffer.area.width)
+        .map(|x| buffer[(x, bar_row)].symbol())
+        .collect();
+    let badge_x = bar.find("urgent").expect(&screen) as u16;
+    assert!(
+        buffer[(badge_x, bar_row)].style().bg.is_some(),
+        "a pinned label keeps its color in the command bar:\n{screen}"
+    );
+}
+
+#[test]
 fn draws_an_empty_store() {
     let mut app = sample_app();
     app.tasks.clear();

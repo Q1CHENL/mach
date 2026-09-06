@@ -13,7 +13,7 @@ use ratatui::style::{Color, Modifier};
 use mach::app::{App, Confirm, Focus, Mode};
 use mach::form::{TaskDraft, TaskForm};
 use mach::input::handle_event;
-use mach::model::{Block, Category, LabelColor, Task};
+use mach::model::{Block, Category, Label, LabelColor, Task};
 use mach::store::Store;
 
 mod common;
@@ -1661,6 +1661,169 @@ fn command_bar_click_opens_the_palette_and_positions_its_cursor() {
     assert_eq!(app.input.cursor(), 2);
 }
 
+fn labelled_search_app() -> App {
+    let mut app = app();
+    let urgent = Label::new("urgent", LabelColor::Red);
+    let later = Label::new("later", LabelColor::Blue);
+    app.tasks[1].label_ids.push(urgent.id.clone());
+    app.tasks[1].label_ids.push(later.id.clone());
+    app.tasks[2].label_ids.push(urgent.id.clone());
+    app.labels = vec![urgent, later];
+    app
+}
+
+fn search_titles(app: &App) -> Vec<&str> {
+    app.view
+        .iter()
+        .map(|index| app.tasks[*index].title.as_str())
+        .collect()
+}
+
+fn type_search(app: &mut App, text: &str) {
+    for c in text.chars() {
+        press(app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+}
+
+#[test]
+fn suggestions_appear_only_once_something_is_typed() {
+    let mut app = labelled_search_app();
+    app.start_search("");
+    assert!(
+        app.search_label_suggestions().is_empty(),
+        "an empty search field has nothing to complete"
+    );
+
+    type_search(&mut app, "l");
+    let names: Vec<String> = app
+        .search_label_suggestions()
+        .into_iter()
+        .map(|suggestion| suggestion.name)
+        .collect();
+    assert_eq!(names, vec!["later".to_string()]);
+}
+
+#[test]
+fn enter_pins_a_suggested_label_to_the_query() {
+    let mut app = labelled_search_app();
+    app.start_search("");
+    type_search(&mut app, "urg");
+
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(app.search_suggestion, Some(0));
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    assert_eq!(
+        app.mode,
+        Mode::Search,
+        "the field stays open for more terms"
+    );
+    assert_eq!(app.search_label_badges().len(), 1);
+    assert_eq!(app.search_label_badges()[0].0, "urgent");
+    assert_eq!(
+        app.input.value(),
+        "",
+        "the typed name is consumed by the badge"
+    );
+    assert_eq!(app.search_query, "");
+    assert_eq!(app.search_suggestion, None);
+    assert_eq!(search_titles(&app), vec!["second", "third"]);
+
+    // A second badge narrows further instead of widening the match.
+    type_search(&mut app, "lat");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.search_label_badges().len(), 2);
+    assert_eq!(search_titles(&app), vec!["second"]);
+
+    // Text typed after a badge narrows it further still.
+    type_search(&mut app, "zzz");
+    assert!(search_titles(&app).is_empty());
+}
+
+#[test]
+fn backspace_takes_the_pinned_labels_back_off() {
+    let mut app = labelled_search_app();
+    app.start_search("");
+    type_search(&mut app, "urg");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    type_search(&mut app, "th");
+
+    // Text first, then the badge behind it.
+    press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+    assert_eq!(app.search_query, "");
+    assert_eq!(app.search_label_badges().len(), 1);
+
+    press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+    assert!(app.search_label_badges().is_empty());
+    assert_eq!(search_titles(&app), vec!["first", "second", "third"]);
+}
+
+#[test]
+fn a_label_only_search_survives_leaving_the_field() {
+    let mut app = labelled_search_app();
+    app.start_search("");
+    type_search(&mut app, "urg");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    // Enter with nothing highlighted leaves the field; an empty text query
+    // must not end a search that is still narrowed by a badge.
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.searching);
+    assert_eq!(search_titles(&app), vec!["second", "third"]);
+
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(!app.searching);
+}
+
+#[test]
+fn typing_narrows_the_suggestions_and_drops_the_highlight() {
+    let mut app = labelled_search_app();
+    app.start_search("");
+    type_search(&mut app, "l");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+    press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+
+    assert_eq!(app.search_suggestion, None, "typing returns to the query");
+    assert_eq!(app.search_query, "la");
+}
+
+#[test]
+fn esc_drops_a_search_suggestion_before_it_clears_the_search() {
+    let mut app = labelled_search_app();
+    app.start_search("l");
+    press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    assert_eq!(app.search_suggestion, Some(0));
+
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(app.search_suggestion, None);
+    assert!(app.searching, "the typed query survives the first Esc");
+    assert_eq!(app.search_query, "l");
+
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(!app.searching);
+}
+
+#[test]
+fn clicking_a_suggested_label_pins_it() {
+    let mut app = labelled_search_app();
+    app.start_search("urg");
+    draw(&mut app, 100, 30);
+    let menu = app.areas.search_menu;
+    assert!(menu.height > 2, "the suggestion list should be on screen");
+
+    click(&mut app, menu.x + 2, menu.y + 1);
+
+    assert_eq!(app.search_label_badges()[0].0, "urgent");
+    assert_eq!(app.search_query, "");
+    assert_eq!(app.mode, Mode::Search);
+}
+
 #[test]
 fn command_bar_click_resumes_a_locked_search() {
     let mut app = app();
@@ -2421,4 +2584,25 @@ fn the_wheel_outside_both_panels_does_nothing() {
     let (cat, task) = (app.cat_index, app.task_index);
     scroll(&mut app, MouseEventKind::ScrollDown, 200, 200);
     assert_eq!((app.cat_index, app.task_index), (cat, task));
+}
+
+#[test]
+fn overflowing_search_badges_keep_text_visible_and_clickable() {
+    let mut app = labelled_search_app();
+    app.labels[0].name = "界".repeat(64);
+    app.start_search("界");
+    app.apply_search_label(0);
+    type_search(&mut app, "needle");
+    for width in [60, 80, 120] {
+        let buffer = draw(&mut app, width, 30);
+        let row = app.areas.command_bar.y;
+        let text: String = (0..width).map(|x| buffer[(x, row)].symbol()).collect();
+        assert!(text.contains("needle"), "{text}");
+        assert!(text.contains("+1"), "{text}");
+        let start = (0..width)
+            .find(|x| buffer[(*x, row)].symbol() == "n")
+            .unwrap();
+        click(&mut app, start + 2, row);
+        assert_eq!(app.input.cursor(), 2);
+    }
 }
