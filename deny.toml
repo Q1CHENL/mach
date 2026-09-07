@@ -35,6 +35,7 @@ skip = [
     { crate = "getrandom@0.2.17", reason = "ring and ratatui-image have not converged on getrandom 0.4" },
     { crate = "hashbrown@0.16.1", reason = "ratatui's kasuari and lru dependencies require adjacent hashbrown releases" },
     { crate = "linux-raw-sys@0.4.15", reason = "ratatui-image still requires rustix 0.38" },
+    { crate = "miniz_oxide@0.8.9", reason = "png has not converged on flate2's miniz_oxide 0.9" },
     { crate = "rand@0.8.7", reason = "ratatui-image still uses rand 0.8 while its quantette path uses rand 0.9" },
     { crate = "rand_core@0.6.4", reason = "allowed with the reviewed rand 0.8 dependency" },
     { crate = "rustix@0.38.44", reason = "ratatui-image has not converged on rustix 1" },

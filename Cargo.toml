@@ -32,12 +32,12 @@ path = "src/bin/mach.rs"
 
 [dependencies]
 arboard = { version = "3.6.1", features = ["image-data"] }
-base64 = "0.22"
+base64 = "0.23.1"
 caseless = "0.2.2"
 chrono = "0.4.45"
 clap = { version = "4.6.5", features = ["derive"] }
 dirs = "6.0.0"
-flate2 = "1.1.9"
+flate2 = "1.1.10"
 httpdate = "1.0.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # image → zune-jpeg: empty warn! stubs break release builds unless `log` is on.
@@ -55,7 +55,7 @@ time = { version = "0.3.55", default-features = false, features = ["std"] }
 unicode-normalization = "0.1.25"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
-ureq = "3"
+ureq = "3.4.1"
 uuid = { version = "1.24.0", features = ["v4"] }
 zip = { version = "8.6.0", default-features = false }
 
