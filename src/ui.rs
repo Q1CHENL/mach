@@ -691,14 +691,8 @@ fn draw_task_form(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect, layou
         && let Some(path) = form.preview_path()
     {
         areas.occlude_hover(overlay);
-        // Wipe the last box before dimming so a smaller picture does not
-        // leave the previous graphics-protocol placement around it.
-        if form.last_preview != Rect::ZERO {
-            f.render_widget(Clear, form.last_preview);
-        }
         dim_underlay(f, overlay);
         let chrome = draw_image_preview(f, store, form, theme, &path, overlay, mouse_position);
-        form.last_preview = chrome.outer;
         form.areas.preview = chrome.outer;
         form.areas.preview_prev = chrome.prev;
         form.areas.preview_next = chrome.next;
@@ -2135,6 +2129,7 @@ fn draw_image_preview(
             // take, so the box is sized right away rather than snapping in
             // once the protocol lands.
             crate::image::ImageReady::Preparing(size) => Some(size),
+            crate::image::ImageReady::Resizing(frame) => Some(frame.size),
             // Before it is decoded there is nothing to go on: the box stays
             // full until the aspect is known.
             _ => None,
@@ -2236,6 +2231,9 @@ fn draw_image_preview(
             crate::image::ImageReady::Ready(protocol) => {
                 let _ = render_protocol(f, protocol, canvas, theme, None);
             }
+            crate::image::ImageReady::Resizing(frame) => {
+                frame.render(canvas, f.buffer_mut());
+            }
             crate::image::ImageReady::Loading => {
                 // Loading means not cached yet — aspect unknown.
                 let slot = letterbox_rect(preview_slot_area(inner), 4, 3);
@@ -2295,6 +2293,9 @@ fn draw_image(
             theme,
             selected.then_some(path),
         )),
+        crate::image::ImageReady::Resizing(_) => {
+            unreachable!("only previews retain a previous frame")
+        }
         crate::image::ImageReady::Loading => {
             // Not in cache yet — aspect unknown until decode finishes.
             let slot = letterbox_rect(area, 4, 3);

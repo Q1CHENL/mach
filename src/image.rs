@@ -16,9 +16,11 @@ use std::time::{Duration, Instant};
 use image::codecs::gif::GifDecoder;
 use image::imageops::FilterType;
 use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, Limits};
-use ratatui::layout::Size;
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Rect, Size};
+use ratatui::widgets::Widget;
 use ratatui_image::picker::{Picker, ProtocolType};
-use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::protocol::{Protocol, StatefulProtocol, StatefulProtocolType};
 use ratatui_image::{FontSize, Resize, ResizeEncodeRender};
 
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
@@ -547,11 +549,14 @@ struct ProtocolJob {
     protocol: StatefulProtocol,
     size: Size,
     result: Sender<ProtocolResult>,
+    clipping_source: Option<Arc<DynamicImage>>,
 }
 
 struct ProtocolResult {
     id: u64,
     protocol: StatefulProtocol,
+    size: Size,
+    clipped: Option<Protocol>,
     error: Option<String>,
 }
 
@@ -572,7 +577,21 @@ fn protocol_worker() -> &'static SyncSender<ProtocolJob> {
                         .last_encoding_result()
                         .and_then(Result::err)
                         .map(|error| error.to_string());
+                    // Sixel and iTerm2 cannot crop an encoded placement. Keep a
+                    // small cell image for the interval after the viewport shrinks.
+                    let clipped = job.clipping_source.and_then(|image| {
+                        let pixels = image.resize_exact(
+                            u32::from(job.size.width),
+                            u32::from(job.size.height) * 2,
+                            FilterType::Triangle,
+                        );
+                        ratatui_image::protocol::halfblocks::Halfblocks::new(pixels, job.size)
+                            .ok()
+                            .map(Protocol::Halfblocks)
+                    });
                     let _ = job.result.send(ProtocolResult {
+                        size: job.size,
+                        clipped,
                         id: job.id,
                         protocol: job.protocol,
                         error,
@@ -583,7 +602,34 @@ fn protocol_worker() -> &'static SyncSender<ProtocolJob> {
     })
 }
 
+/// The last completed preview, drawable without resizing or encoding.
+pub struct PreviewFrame {
+    protocol: StatefulProtocol,
+    pub size: Size,
+    clipped: Option<Protocol>,
+}
+
+impl PreviewFrame {
+    pub fn render(&mut self, area: Rect, buffer: &mut Buffer) {
+        if area.is_empty() {
+            return;
+        }
+        if (area.width < self.size.width || area.height < self.size.height)
+            && let Some(clipped) = &self.clipped
+        {
+            ratatui_image::Image::new(clipped)
+                .allow_clipping(true)
+                .render(area, buffer);
+        } else {
+            self.protocol.render(area, buffer);
+        }
+    }
+}
+
 struct PreparedProtocol {
+    previous: Option<PreviewFrame>,
+    encoded_size: Option<Size>,
+    clipped: Option<Protocol>,
     protocol: Option<StatefulProtocol>,
     pending_job: Option<u64>,
     size: Size,
@@ -594,9 +640,19 @@ impl PreparedProtocol {
     fn new(protocol: StatefulProtocol) -> Self {
         Self {
             protocol: Some(protocol),
+            previous: None,
+            encoded_size: None,
+            clipped: None,
             pending_job: None,
             size: Size::default(),
             error: None,
+        }
+    }
+
+    fn preparing(&mut self) -> ImageReady<'_> {
+        match self.previous.as_mut() {
+            Some(frame) => ImageReady::Resizing(frame),
+            None => ImageReady::Preparing(self.size),
         }
     }
 }
@@ -621,6 +677,8 @@ pub enum ImageReady<'a> {
     Loading,
     /// Decoded pixels are being resized and encoded for this cell area.
     Preparing(Size),
+    /// A new preview size is being prepared; the previous picture remains drawable.
+    Resizing(&'a mut PreviewFrame),
     Failed(String),
 }
 
@@ -898,6 +956,9 @@ impl ImageStore {
                 };
                 if prepared.pending_job == Some(result.id) {
                     prepared.protocol = Some(result.protocol);
+                    prepared.encoded_size = Some(result.size);
+                    prepared.clipped = result.clipped;
+                    prepared.previous = None;
                     prepared.pending_job = None;
                     prepared.error = result.error;
                     return;
@@ -1029,7 +1090,7 @@ impl ImageStore {
             return ImageReady::Failed(error.clone());
         }
         let Some(protocol) = prepared.protocol.as_ref() else {
-            return ImageReady::Preparing(prepared.size);
+            return prepared.preparing();
         };
         prepared.size = protocol.size_for(Resize::Scale(None), bounds);
         let Some(size) = protocol.needs_resize(&Resize::Scale(None), bounds) else {
@@ -1041,10 +1102,32 @@ impl ImageStore {
             );
         };
 
+        if preview && let Some(encoded_size) = prepared.encoded_size.take() {
+            prepared.previous = Some(PreviewFrame {
+                protocol: prepared
+                    .protocol
+                    .take()
+                    .expect("a completed protocol is available"),
+                size: encoded_size,
+                clipped: prepared.clipped.take(),
+            });
+            prepared.protocol = Some(
+                picker
+                    .as_mut()
+                    .expect("the completed preview has a picker")
+                    .new_resize_protocol((**image).clone()),
+            );
+        }
         let protocol = prepared
             .protocol
             .take()
             .expect("the protocol was available above");
+        let clipping_source = (preview
+            && matches!(
+                protocol.protocol_type(),
+                StatefulProtocolType::Sixel(_) | StatefulProtocolType::ITerm2(_)
+            ))
+        .then(|| Arc::clone(image));
         let id = *next_protocol_job;
         *next_protocol_job = next_protocol_job.wrapping_add(1).max(1);
         let job = ProtocolJob {
@@ -1052,6 +1135,7 @@ impl ImageStore {
             protocol,
             size,
             result: result_sender,
+            clipping_source,
         };
         match protocol_worker().try_send(job) {
             Ok(()) => {
@@ -1068,7 +1152,7 @@ impl ImageStore {
                 return ImageReady::Failed("image renderer stopped".into());
             }
         }
-        ImageReady::Preparing(prepared.size)
+        prepared.preparing()
     }
 
     /// Protocol for the current GIF frame (encode once per frame index).
@@ -1557,6 +1641,75 @@ mod tests {
             matches!(store.get_preview(&first, bounds), ImageReady::Ready(_)),
             "stepping to another picture must not drop a ready preview encoding"
         );
+    }
+
+    #[test]
+    fn resizing_a_ready_preview_keeps_a_drawable_picture() {
+        for protocol_type in [
+            ProtocolType::Halfblocks,
+            ProtocolType::Kitty,
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+        ] {
+            let mut store = store_with_an_image();
+            store
+                .picker
+                .as_mut()
+                .unwrap()
+                .set_protocol_type(protocol_type);
+            let path = Path::new("/tmp/x.png");
+            store.cache.get_mut(path).unwrap().as_mut().unwrap().image = Arc::new(
+                DynamicImage::ImageRgba8(image::RgbaImage::from_fn(4, 4, |_, y| {
+                    image::Rgba([255, (y * 60) as u8, 0, 255])
+                })),
+            );
+            let wait = |store: &mut ImageStore, bounds, first_load| {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    store.poll_pending();
+                    match store.get_preview(path, bounds) {
+                        ImageReady::Ready(_) => break,
+                        ImageReady::Resizing(_) => {}
+                        ImageReady::Preparing(_) if first_load => {}
+                        _ => panic!("a displayed preview must remain drawable during resize"),
+                    }
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            wait(&mut store, Size::new(20, 10), true);
+            for bounds in [Size::new(40, 20), Size::new(10, 5), Size::new(30, 15)] {
+                let ImageReady::Resizing(frame) = store.get_preview(path, bounds) else {
+                    panic!("resize must retain the previous picture for {protocol_type:?}");
+                };
+                let area = Rect::new(2, 2, bounds.width, bounds.height);
+                let mut buffer = Buffer::empty(Rect::new(0, 0, 50, 30));
+                frame.render(area, &mut buffer);
+                assert!(
+                    buffer
+                        .content
+                        .iter()
+                        .any(|cell| *cell != ratatui::buffer::Cell::default()),
+                    "{protocol_type:?}"
+                );
+                for y in 0..30 {
+                    for x in 0..50 {
+                        if !area.contains((x, y).into()) {
+                            assert_eq!(
+                                buffer[(x, y)].symbol(),
+                                " ",
+                                "{protocol_type:?} drew outside the viewport"
+                            );
+                        }
+                    }
+                }
+            }
+            wait(&mut store, Size::new(30, 15), false);
+            assert!(
+                store.pending.is_empty(),
+                "resize must not decode the file again"
+            );
+        }
     }
 
     #[test]

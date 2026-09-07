@@ -400,9 +400,6 @@ pub struct TaskForm {
     /// Which of the description's pictures the lightbox is showing, as an
     /// index into `description.images()`.
     preview_index: usize,
-    /// Last frame's lightbox, so a smaller picture can wipe the previous one
-    /// without dropping its encoding.
-    pub(crate) last_preview: Rect,
     /// Decoded GIF for preview, keyed by path (kept after close for fast reopen).
     pub gif: Option<(PathBuf, GifPlayback)>,
     /// Decoded GIFs that are not on screen. Stepping away parks the current
@@ -470,7 +467,6 @@ impl TaskForm {
             form_area: Rect::ZERO,
             preview: false,
             preview_index: 0,
-            last_preview: Rect::ZERO,
             gif: None,
             gif_ready: HashMap::new(),
             gif_pending: None,
@@ -962,7 +958,6 @@ impl TaskForm {
         self.areas.preview = Rect::ZERO;
         self.areas.preview_prev = Rect::ZERO;
         self.areas.preview_next = Rect::ZERO;
-        self.last_preview = Rect::ZERO;
         // Keep decoded GIFs so reopening or stepping back is instant.
     }
 
@@ -1075,7 +1070,6 @@ impl TaskForm {
         self.category_picker = None;
         self.label_picker = None;
         self.preview = false;
-        self.last_preview = Rect::ZERO;
         self.gif_pending = None;
         self.description.close_menu();
     }
