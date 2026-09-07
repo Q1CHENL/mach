@@ -15,12 +15,12 @@ pub const BANNER_WIDTH: u16 = 35;
 /// Update these alongside the package version when preparing a release.
 pub(crate) const WHATS_NEW: [(&str, &str); 2] = [
     (
-        "Shape your workspace",
-        "Pause briefly over or drag dividers to resize the category list and task preview.",
+        "Filter by label",
+        "Complete labels in search and pin several together to narrow the task list.",
     ),
     (
-        "Focused dialogs",
-        "Centered dialogs now dim the workspace beneath them so the active choice stands out.",
+        "Browse every picture",
+        "Step through a task's pictures in a fitted lightbox that stays visible while resizing.",
     ),
 ];
 
